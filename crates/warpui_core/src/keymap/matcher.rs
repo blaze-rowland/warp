@@ -26,6 +26,25 @@ pub struct Matcher {
     /// custom actions to key events during keybinding editing.
     default_keystroke_trigger_for_custom_action:
         Option<Box<dyn Fn(CustomTag) -> Option<Keystroke> + 'static>>,
+    /// Bindings whose keystrokes can never be claimed by a view (see
+    /// [`crate::View::claims_keystroke`]).
+    reserved: Vec<ReservedKeyBinding>,
+}
+
+/// A key binding the application reserves for itself.
+///
+/// A keystroke that resolves to a reserved binding always goes through normal keymap dispatch,
+/// even when a view in the focused responder chain would otherwise claim it via
+/// [`crate::View::claims_keystroke`]. Reserved bindings are resolved against the *current*
+/// keymap on every check, so rebinding a reserved action moves the reservation with it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReservedKeyBinding {
+    /// Every keystroke currently bound to the editable binding with this name.
+    Named(String),
+    /// The keystroke currently bound to this custom (e.g. platform menu) action.
+    CustomAction(CustomTag),
+    /// A literal keystroke, e.g. a user-configurable escape hatch.
+    Keystroke(Keystroke),
 }
 
 #[derive(Default)]
@@ -60,6 +79,7 @@ impl Matcher {
             binding_validators: vec![],
             custom_trigger_to_keystroke_fn: None,
             default_keystroke_trigger_for_custom_action: None,
+            reserved: Vec::new(),
         }
     }
 
@@ -301,6 +321,51 @@ impl Matcher {
     /// order they were added.
     pub fn get_bindings(&self) -> impl Iterator<Item = BindingLens<'_>> {
         self.keymap.bindings()
+    }
+
+    /// Replaces the set of reserved key bindings.
+    pub fn set_reserved_bindings(&mut self, reserved: Vec<ReservedKeyBinding>) {
+        self.reserved = reserved;
+    }
+
+    /// Returns whether `keystroke` resolves to any reserved binding.
+    ///
+    /// For multi-keystroke triggers, only the first keystroke is reserved, so a reserved chord
+    /// can always be started.
+    pub fn is_keystroke_reserved(&self, keystroke: &Keystroke) -> bool {
+        self.reserved.iter().any(|reserved| match reserved {
+            ReservedKeyBinding::Keystroke(reserved) => reserved == keystroke,
+            ReservedKeyBinding::Named(name) => self
+                .keymap
+                .editable_bindings()
+                .filter(|binding| binding.name == name)
+                .any(|binding| self.trigger_starts_with(binding.trigger, keystroke)),
+            ReservedKeyBinding::CustomAction(tag) => {
+                match self.default_binding_for_custom_action(*tag) {
+                    Some(binding) => self.trigger_starts_with(binding.trigger, keystroke),
+                    None => self
+                        .default_keystroke_trigger_for_custom_action(*tag)
+                        .is_some_and(|default| &default == keystroke),
+                }
+            }
+        })
+    }
+
+    /// Returns whether the first keystroke that fires `trigger` is `keystroke`, resolving custom
+    /// actions to their platform keystroke.
+    fn trigger_starts_with(&self, trigger: &Trigger, keystroke: &Keystroke) -> bool {
+        match trigger {
+            Trigger::Keystrokes(keystrokes) => keystrokes.first() == Some(keystroke),
+            Trigger::Custom(tag) => self
+                .default_keystroke_trigger_for_custom_action(*tag)
+                .is_some_and(|default| &default == keystroke),
+            Trigger::Standard(_) | Trigger::Empty => false,
+        }
+    }
+
+    /// Clears any pending multi-keystroke match for every view.
+    pub fn clear_pending(&mut self) {
+        self.pending.clear();
     }
 
     pub fn push_keystroke(

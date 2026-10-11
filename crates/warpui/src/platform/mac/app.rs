@@ -425,6 +425,35 @@ pub(crate) extern "C-unwind" fn warp_app_has_custom_action_for_keystroke(
     if has_binding { YES } else { NO }
 }
 
+/// Returns whether a view in `window`'s focused responder chain claims the keystroke in `event`
+/// (see `View::claims_keystroke`). The window asks this before routing a key equivalent to the
+/// menu bar, so a claimed key reaches the view instead of a menu item.
+#[unsafe(no_mangle)]
+pub(crate) extern "C-unwind" fn warp_app_is_keystroke_claimed_for_window(
+    this: &mut Object,
+    window_id: &mut Object,
+    event: id,
+) -> BOOL {
+    let app = unsafe { get_app(this) };
+    let window = unsafe { get_window_state(window_id) };
+    let warp_event = unsafe { super::event::from_native(event, None, false) };
+
+    let Some(Event::KeyDown {
+        keystroke,
+        is_composing,
+        ..
+    }) = warp_event
+    else {
+        return NO;
+    };
+    let claimed = app.callbacks.with_mutable_app_context(|ctx| {
+        ctx.claiming_view_for_keystroke(window.id(), &keystroke, is_composing)
+            .is_some()
+    });
+
+    if claimed { YES } else { NO }
+}
+
 #[unsafe(no_mangle)]
 pub(crate) extern "C-unwind" fn warp_app_disable_warning_modal(this: &mut Object) {
     let app = unsafe { get_app(this) };

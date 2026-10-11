@@ -249,6 +249,7 @@ pub trait AnyView {
         view_id: EntityId,
     );
     fn keymap_context(&self, app: &AppContext) -> keymap::Context;
+    fn claims_keystroke(&self, keystroke: &keymap::Keystroke, app: &AppContext) -> bool;
     fn active_cursor_position(
         &self,
         app: &mut AppContext,
@@ -360,6 +361,10 @@ where
 
     fn keymap_context(&self, app: &AppContext) -> keymap::Context {
         View::keymap_context(self, app)
+    }
+
+    fn claims_keystroke(&self, keystroke: &keymap::Keystroke, app: &AppContext) -> bool {
+        View::claims_keystroke(self, keystroke, app)
     }
 
     fn self_or_child_interacted_with(

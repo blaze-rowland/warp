@@ -561,7 +561,13 @@ void init_warp_nswindow(NSWindow<WarpWindowProtocol> *window, bool testMode, boo
 
         BOOL triggersCustomAction = warp_app_has_custom_action_for_keystroke(application, event);
 
-        if (keyBindingsDisabled || (keystrokeIsAssigned && !triggersCustomAction)) {
+        // If the focused view claims this raw keystroke, it must reach the view rather than a
+        // menu item bound to the same key equivalent. Reserved keystrokes are never claimed.
+        BOOL keystrokeIsClaimed = !keyBindingsDisabled && warp_app_is_keystroke_claimed_for_window(
+                                                              application, self, event);
+
+        if (keyBindingsDisabled || keystrokeIsClaimed ||
+            (keystrokeIsAssigned && !triggersCustomAction)) {
             if ([self.contentView keyDownImpl:event]) {
                 return YES;
             }

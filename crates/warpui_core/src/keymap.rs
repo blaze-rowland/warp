@@ -17,7 +17,7 @@ mod context;
 mod matcher;
 
 pub use context::{Context, ContextPredicate, macros};
-pub use matcher::{IsBindingValid, MatchResult, Matcher};
+pub use matcher::{IsBindingValid, MatchResult, Matcher, ReservedKeyBinding};
 
 use crate::platform::OperatingSystem;
 

@@ -142,6 +142,25 @@ pub trait View: Entity {
         ctx
     }
 
+    /// Lets this view claim a raw keystroke before the keymap sees it.
+    ///
+    /// For each `KeyDown`, this is asked of every view in the focused responder chain, starting
+    /// at the focused view and walking up through its ancestors. If any view returns `true`:
+    /// - the keystroke skips keymap dispatch (and, on macOS, menu key equivalents),
+    /// - any pending multi-keystroke match is reset, and
+    /// - the event is delivered as a plain `KeyDown` through the element tree, exactly as an
+    ///   unbound key would be.
+    ///
+    /// It is never asked for keystrokes the app reserved through
+    /// [`AppContext::set_reserved_key_bindings`], for keystrokes that arrive during IME
+    /// composition, or while key binding dispatch is disabled for the window (see
+    /// [`ViewContext::disable_key_bindings_dispatching`]).
+    ///
+    /// This runs on every keystroke, so it must be cheap.
+    fn claims_keystroke(&self, _keystroke: &keymap::Keystroke, _app: &AppContext) -> bool {
+        false
+    }
+
     /// Allows a view to hook into any interactions with it or its children.
     ///
     /// A valid interaction must be handled by the view or its children, and includes:

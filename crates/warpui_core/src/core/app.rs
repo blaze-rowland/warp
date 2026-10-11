@@ -39,7 +39,7 @@ use crate::fonts::{self, ExternalFontFamily, FallbackFontModel, RequestedFallbac
 use crate::image_cache::{self, ImageCache};
 use crate::keymap::{
     BindingLens, Context, CustomTag, DescriptionContext, EditableBinding, EditableBindingLens,
-    FixedBinding, IsBindingValid, Keystroke, MatchResult, Matcher, Trigger,
+    FixedBinding, IsBindingValid, Keystroke, MatchResult, Matcher, ReservedKeyBinding, Trigger,
 };
 use crate::modals::{
     AlertDialog, AlertDialogWithCallbacks, AppModalCallback, ModalId, PlatformModalResponseData,
@@ -1839,6 +1839,55 @@ impl AppContext {
         !self.disabled_key_bindings_windows.contains(&window_id)
     }
 
+    /// Replaces the set of key bindings that views can never claim (see
+    /// [`View::claims_keystroke`]).
+    ///
+    /// Use this for actions that must always stay reachable, such as a command palette, quit,
+    /// new window, settings, or an escape-hatch chord. Reservations are resolved against the
+    /// current keymap on every keystroke, so they follow user rebinding.
+    pub fn set_reserved_key_bindings<I>(&mut self, reserved: I)
+    where
+        I: IntoIterator<Item = ReservedKeyBinding>,
+    {
+        self.keystroke_matcher
+            .set_reserved_bindings(reserved.into_iter().collect());
+    }
+
+    /// Returns whether `keystroke` resolves to a reserved key binding.
+    pub fn is_keystroke_reserved(&self, keystroke: &Keystroke) -> bool {
+        self.keystroke_matcher.is_keystroke_reserved(keystroke)
+    }
+
+    /// Returns the view in the focused responder chain of `window_id` that claims `keystroke`
+    /// (see [`View::claims_keystroke`]), if any.
+    ///
+    /// Returns `None` without consulting any view when key binding dispatch is disabled for the
+    /// window, when `is_composing` is set (IME composition), or when the keystroke is reserved.
+    pub fn claiming_view_for_keystroke(
+        &self,
+        window_id: WindowId,
+        keystroke: &Keystroke,
+        is_composing: bool,
+    ) -> Option<EntityId> {
+        if is_composing
+            || !self.key_bindings_enabled(window_id)
+            || self.is_keystroke_reserved(keystroke)
+        {
+            return None;
+        }
+        let focused_view_id = self.focused_view_id(window_id)?;
+        let views = &self.windows.get(&window_id)?.views;
+        // The responder chain runs root-first, so walk it from the focused view upward.
+        self.view_ancestors(window_id, focused_view_id)
+            .into_iter()
+            .rev()
+            .find(|view_id| {
+                views
+                    .get(view_id)
+                    .is_some_and(|view| view.claims_keystroke(keystroke, self))
+            })
+    }
+
     /// Remove any custom trigger associated with a given action
     ///
     /// This will return the trigger to its default state (if any)
@@ -3565,14 +3614,27 @@ impl AppContext {
             } = &event
                 && let Some(focused_view_id) = self.focused_view_id(window_id)
             {
-                let responder_chain = self.view_ancestors(window_id, focused_view_id);
-                match self.dispatch_keystroke(window_id, &responder_chain, keystroke, *is_composing)
+                if let Some(claiming_view_id) =
+                    self.claiming_view_for_keystroke(window_id, keystroke, *is_composing)
                 {
-                    Ok(handled) => {
-                        keystroke_handled = handled;
-                    }
-                    Err(error) => {
-                        report_error!(error.context("error dispatching keystroke"));
+                    // A view claimed the raw keystroke: skip the keymap entirely and let the
+                    // event reach the element tree as an unbound `KeyDown` below.
+                    log::debug!("Keystroke {keystroke:?} claimed by view {claiming_view_id}");
+                    self.keystroke_matcher.clear_pending();
+                } else {
+                    let responder_chain = self.view_ancestors(window_id, focused_view_id);
+                    match self.dispatch_keystroke(
+                        window_id,
+                        &responder_chain,
+                        keystroke,
+                        *is_composing,
+                    ) {
+                        Ok(handled) => {
+                            keystroke_handled = handled;
+                        }
+                        Err(error) => {
+                            report_error!(error.context("error dispatching keystroke"));
+                        }
                     }
                 }
             }
@@ -5026,3 +5088,7 @@ impl AppContext {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "app_tests.rs"]
+mod tests;

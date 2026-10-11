@@ -127,6 +127,16 @@ impl StoredView {
         }
     }
 
+    /// See [`crate::View::claims_keystroke`]. TUI views never claim keystrokes; the claim hook
+    /// only runs on the GUI window-event path.
+    pub fn claims_keystroke(&self, keystroke: &keymap::Keystroke, app: &AppContext) -> bool {
+        match self {
+            StoredView::Gui(view) => view.claims_keystroke(keystroke, app),
+            #[cfg(feature = "tui")]
+            StoredView::Tui(_) => false,
+        }
+    }
+
     pub fn active_cursor_position(
         &self,
         app: &mut AppContext,
