@@ -33,3 +33,11 @@ fn cloud_agent_execution_config_is_dogfood_only_by_default() {
     assert!(!PREVIEW_FLAGS.contains(&FeatureFlag::CloudAgentExecutionConfig));
     assert!(!RELEASE_FLAGS.contains(&FeatureFlag::CloudAgentExecutionConfig));
 }
+
+#[test]
+fn tmux_control_mode_is_dogfood_only_by_default() {
+    assert!(DOGFOOD_FLAGS.contains(&FeatureFlag::TmuxControlMode));
+    for flags in [DEBUG_FLAGS, LOCAL_FLAGS, PREVIEW_FLAGS, RELEASE_FLAGS] {
+        assert!(!flags.contains(&FeatureFlag::TmuxControlMode));
+    }
+}

@@ -37,6 +37,7 @@ use crate::terminal::safe_mode_settings::SafeModeSettings;
 use crate::terminal::session_settings::{SessionSettings, SessionSettingsChangedEvent};
 use crate::terminal::settings::TerminalSettings;
 use crate::terminal::shared_session::settings::SharedSessionSettings;
+use crate::terminal::tmux::settings::TmuxSettings;
 use crate::terminal::warpify::settings::WarpifySettings;
 use crate::undo_close::UndoCloseSettings;
 use crate::window_settings::{WindowSettings, stage_legacy_background_backdrop};
@@ -93,6 +94,7 @@ pub fn register_all_settings(ctx: &mut AppContext) {
     AppEditorSettings::register(ctx);
     InputSettings::register(ctx);
     WarpifySettings::register(ctx);
+    TmuxSettings::register(ctx);
     AltScreenReporting::register(ctx);
     UndoCloseSettings::register(ctx);
     SshSettings::register(ctx);

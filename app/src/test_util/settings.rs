@@ -107,6 +107,7 @@ pub fn initialize_settings_for_tests_with_mode(
     app.update(|ctx| {
         WarpifySettings::register(ctx);
     });
+    crate::terminal::tmux::settings::TmuxSettings::register(app);
     SessionSettings::register(app);
     SshSettings::register(app);
     TabSettings::register(app);

@@ -69,6 +69,7 @@ use repo_metadata::repositories::DetectedRepositories;
 use sentry::protocol::{Attachment, AttachmentType};
 use serde_json;
 use session_sharing_protocol::common::SessionId as SharedSessionId;
+use strum::IntoEnumIterator;
 #[cfg(target_family = "wasm")]
 use url::Url;
 use warp_cli::agent::Harness;
@@ -423,6 +424,7 @@ use crate::terminal::settings::{SpacingMode, TerminalSettings};
 use crate::terminal::shared_session::SharedSessionSource;
 use crate::terminal::shared_session::{IsSharedSessionCreator, SharedSessionActionSource};
 use crate::terminal::shell::ShellType;
+use crate::terminal::tmux::settings::{TmuxSettings, TmuxToggle};
 #[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
 use crate::terminal::view::ambient_agent::AmbientAgentViewModel as HandoffAmbientAgentViewModel;
 use crate::terminal::view::ambient_agent::{AuthSecretFtuxView, AuthSecretFtuxViewEvent};
@@ -23305,6 +23307,14 @@ impl Workspace {
         }
         if *warpify_settings.enable_ssh_warpification.value() {
             context.set.insert(flags::SSH_WARPIFICATION_CONTEXT_FLAG);
+        }
+        if FeatureFlag::TmuxControlMode.is_enabled() {
+            let tmux_settings = TmuxSettings::as_ref(app);
+            for toggle in TmuxToggle::iter() {
+                if toggle.value(tmux_settings) {
+                    context.set.insert(toggle.context_flag());
+                }
+            }
         }
 
         if keys_settings.extra_meta_keys.left_alt {

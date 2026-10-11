@@ -31,6 +31,7 @@ use crate::appearance::Appearance;
 use crate::send_telemetry_from_ctx;
 use crate::server::telemetry::TelemetryEvent;
 use crate::settings::{ReuseExistingSshControlMaster, SshSettings};
+use crate::terminal::tmux::settings::{TmuxControlModeSetting, TmuxSettings, TmuxToggle};
 use crate::terminal::warpify::settings::{
     EnableSshWarpification, SshExtensionInstallMode, SshExtensionInstallModeSetting,
     WarpifySettings, WarpifySettingsChangedEvent,
@@ -60,7 +61,29 @@ pub fn init_actions_from_parent_view<T: Action + Clone>(
         ));
     }
 
+    if tmux_section_enabled(app) {
+        for toggle in TmuxToggle::iter() {
+            toggle_binding_pairs.push(ToggleSettingActionPair::new(
+                toggle.label(),
+                builder(SettingsAction::WarpifyPageToggle(
+                    WarpifyPageAction::ToggleTmuxSetting(toggle),
+                )),
+                context,
+                toggle.context_flag(),
+            ));
+        }
+    }
+
     ToggleSettingActionPair::add_toggle_setting_action_pairs_as_bindings(toggle_binding_pairs, app);
+}
+
+/// The tmux section and its palette toggles only exist when the feature flag is
+/// on and tmux control mode is supported on this platform.
+fn tmux_section_enabled(app: &AppContext) -> bool {
+    FeatureFlag::TmuxControlMode.is_enabled()
+        && TmuxSettings::as_ref(app)
+            .tmux_control_mode
+            .is_supported_on_current_platform()
 }
 
 const CONTENT_FONT_SIZE: f32 = 12.;
@@ -95,6 +118,7 @@ impl WarpifyPageView {
         let warpify_settings_handle = WarpifySettings::handle(ctx);
 
         ctx.observe(&warpify_settings_handle, Self::update_button_states);
+        ctx.subscribe_to_model(&TmuxSettings::handle(ctx), |_, _, _, ctx| ctx.notify());
         ctx.subscribe_to_model(&warpify_settings_handle, move |me, model, event, ctx| {
             me.update_button_states(model, ctx);
             if matches!(
@@ -156,6 +180,14 @@ impl WarpifyPageView {
                 vec![Box::new(SubshellsWidget::default())],
             ),
         ];
+
+        if tmux_section_enabled(ctx) {
+            categories.push(Category::with_header(
+                CategoryHeader::new("tmux")
+                    .with_subtitle("Run tmux sessions natively with Warp features in every pane."),
+                vec![Box::new(TmuxWidget::default())],
+            ));
+        }
 
         let warpify_settings = WarpifySettings::as_ref(ctx);
         if warpify_settings
@@ -375,6 +407,8 @@ pub enum WarpifyPageAction {
     ToggleReuseSshControlMaster,
     /// Set the SSH extension installation mode (always ask / always install / always skip).
     SetSshExtensionInstallMode(SshExtensionInstallMode),
+    /// Toggles one of the tmux control mode settings.
+    ToggleTmuxSetting(TmuxToggle),
     OpenUrl(String),
 }
 
@@ -444,6 +478,11 @@ impl TypedActionView for WarpifyPageView {
                         },
                         ctx
                     );
+                });
+            }
+            ToggleTmuxSetting(toggle) => {
+                TmuxSettings::handle(ctx).update(ctx, |tmux_settings, ctx| {
+                    report_if_error!(toggle.toggle(tmux_settings, ctx));
                 });
             }
             OpenUrl(url) => {
@@ -744,6 +783,65 @@ impl SettingsWidget for SSHWidget {
         );
 
         column.finish()
+    }
+}
+
+#[derive(Default)]
+struct TmuxWidget {
+    switch_states: [SwitchStateHandle; 4],
+    local_only_icon_tooltip_states: RefCell<HashMap<String, MouseStateHandle>>,
+}
+
+impl SettingsWidget for TmuxWidget {
+    type View = WarpifyPageView;
+
+    fn search_terms(&self) -> &str {
+        "tmux control mode native sessions panes key bindings warpify"
+    }
+
+    fn render(
+        &self,
+        _view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let mut column = Flex::column();
+        let ui_builder = appearance.ui_builder();
+        let tmux_settings = TmuxSettings::as_ref(app);
+        let master_on = TmuxToggle::ControlMode.value(tmux_settings);
+
+        for (toggle, switch_state) in TmuxToggle::iter().zip(self.switch_states.iter()) {
+            // The delta settings only matter while the master setting is on.
+            let interactive = toggle == TmuxToggle::ControlMode || master_on;
+            column.add_child(render_body_item::<WarpifyPageAction>(
+                toggle.label().to_owned(),
+                None,
+                LocalOnlyIconState::for_setting(
+                    toggle.storage_key(),
+                    TmuxControlModeSetting::sync_to_cloud(),
+                    &mut self.local_only_icon_tooltip_states.borrow_mut(),
+                    app,
+                ),
+                interactive.into(),
+                appearance,
+                ui_builder
+                    .switch(switch_state.clone())
+                    .check(toggle.value(tmux_settings))
+                    .with_disabled(!interactive)
+                    .build()
+                    .on_click(move |ctx, _, _| {
+                        if interactive {
+                            ctx.dispatch_typed_action(WarpifyPageAction::ToggleTmuxSetting(toggle));
+                        }
+                    })
+                    .finish(),
+                Some(toggle.page_description().to_owned()),
+            ));
+        }
+
+        Container::new(column.finish())
+            .with_margin_bottom(ITEM_VERTICAL_SPACING)
+            .finish()
     }
 }
 

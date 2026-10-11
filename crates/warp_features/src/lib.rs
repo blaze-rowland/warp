@@ -998,6 +998,12 @@ pub enum FeatureFlag {
     /// mirrors kept in the persistent build cache instead of cloning each one
     /// from the remote. Disabling it restores direct, network-only checkouts.
     GitMirrorCache,
+
+    /// Gates native tmux integration via tmux control mode (`tmux -CC`): tmux
+    /// windows and panes map to Warp tabs and panes. Also requires the
+    /// `terminal.tmux_control_mode` setting; with either off, Warp behaves as
+    /// it does today.
+    TmuxControlMode,
 }
 
 static FLAG_STATES: [AtomicBool; cardinality::<FeatureFlag>()] =
@@ -1078,6 +1084,7 @@ pub const DOGFOOD_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::LrcActivitySignal,
     FeatureFlag::StoredScreenshots,
     FeatureFlag::GitMirrorCache,
+    FeatureFlag::TmuxControlMode,
     FeatureFlag::CloudAgentExecutionConfig,
     FeatureFlag::FactoryDeferredRepositories,
 ];

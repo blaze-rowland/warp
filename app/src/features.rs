@@ -533,6 +533,8 @@ fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::StoredScreenshots,
         #[cfg(feature = "cloud_agent_shell_respawn")]
         FeatureFlag::CloudAgentShellRespawn,
+        #[cfg(feature = "tmux_control_mode")]
+        FeatureFlag::TmuxControlMode,
     ]);
 
     flags

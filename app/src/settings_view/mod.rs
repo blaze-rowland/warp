@@ -123,7 +123,7 @@ mod transfer_ownership_confirmation_modal;
 pub mod update_environment_form;
 mod warp_agent_page;
 mod warp_drive_page;
-mod warpify_page;
+pub(crate) mod warpify_page;
 
 pub(crate) use admin_actions::AdminActions;
 #[cfg(feature = "tui")]
@@ -508,6 +508,10 @@ pub mod flags {
     pub const FOCUS_REPORTING_CONTEXT_FLAG: &str = "Focus_Reporting";
     pub const SSH_REUSE_CONTROL_MASTER_CONTEXT_FLAG: &str = "SSH_Reuse_Control_Master";
     pub const SSH_WARPIFICATION_CONTEXT_FLAG: &str = "SSH_Warpification";
+    pub const TMUX_CONTROL_MODE_CONTEXT_FLAG: &str = "Tmux_Control_Mode";
+    pub const TMUX_AUTO_CONVERT_CONTEXT_FLAG: &str = "Tmux_Auto_Convert";
+    pub const TMUX_INTEGRATE_PANES_CONTEXT_FLAG: &str = "Tmux_Integrate_Panes";
+    pub const TMUX_BINDINGS_TAKE_PRECEDENCE_CONTEXT_FLAG: &str = "Tmux_Bindings_Take_Precedence";
     pub const NOTIFICATIONS_CONTEXT_FLAG: &str = "Notifications_Enabled";
     pub const LONG_RUNNING_NOTIFICATIONS_FLAG: &str = "Long_Running_Notifications";
     pub const AGENT_TASK_COMPLETED_NOTIFICATIONS_FLAG: &str = "Agent_Task_Completed_Notifications";

@@ -76,6 +76,7 @@ pub mod universal_developer_input;
 pub mod ssh;
 pub mod terminal_manager;
 mod terminal_size_element;
+pub mod tmux;
 pub mod view;
 pub mod warpify;
 mod waterfall_gap_element;
