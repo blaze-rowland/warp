@@ -1,0 +1,2 @@
+# Recorded and hand-built tmux -CC transcripts. Keep the bytes exact (CRLF, ESC).
+*.cc -text
