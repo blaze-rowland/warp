@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 
 use crate::SizeInfo;
+use crate::local_tty::tmux_gateway::TmuxRequest;
 
 /// Messages that may be sent to the `EventLoop`.
 #[derive(Debug)]
@@ -20,4 +21,8 @@ pub enum Message {
 
     /// Instruction to resize the PTY.
     Resize(SizeInfo),
+
+    /// A request for the tmux control-mode session running on this PTY, if any. Dropped when
+    /// no session is running.
+    Tmux(TmuxRequest),
 }

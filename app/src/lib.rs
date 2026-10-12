@@ -1526,6 +1526,9 @@ pub(crate) fn initialize_app(
     ctx.add_singleton_model(|_ctx| SettingsManager::default());
 
     let user_defaults_on_startup = settings::init(startup_toml_parse_error, ctx);
+    // Mirrors the tmux settings into every local PTY event loop, so it follows settings init.
+    #[cfg(feature = "local_tty")]
+    ctx.add_singleton_model(crate::terminal::tmux::gateway::TmuxGateways::new);
     timer.mark_interval_end("READ_USER_DEFAULTS_AND_INITIALIZE_SETTINGS");
 
     if FeatureFlag::UIZoom.is_enabled() {

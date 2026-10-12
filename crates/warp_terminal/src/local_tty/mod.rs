@@ -13,6 +13,7 @@ pub mod shell;
 pub mod spawner;
 #[cfg(unix)]
 pub mod terminal_attributes;
+pub mod tmux_gateway;
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]

@@ -28,6 +28,7 @@ use super::shell::{ShellStarter, ShellStarterSource};
 use super::spawner::{PtySpawnHooks, PtySpawnMode};
 #[cfg(unix)]
 use super::terminal_attributes::TerminalAttributesPoller;
+use super::tmux_gateway::GatewayLink;
 use super::{mio_channel, recorder};
 use crate::ai::aws_credentials::AwsCredentialRefresher as _;
 use crate::ai::blocklist::SerializedBlockListItem;
@@ -62,6 +63,7 @@ use crate::terminal::shared_session::{IsSharedSessionCreator, SharedSessionStatu
 use crate::terminal::shell::ShellName;
 use crate::terminal::shell_recovery::CloudShellRecoveryRequest;
 use crate::terminal::terminal_manager::BlockSpacing;
+use crate::terminal::tmux::gateway::{TmuxGateways, TmuxOriginId};
 use crate::terminal::warpify::settings::WarpifySettings;
 use crate::terminal::writeable_pty::pty_controller::{EventLoopSendError, EventLoopSender};
 use crate::terminal::writeable_pty::terminal_manager_util::{
@@ -149,6 +151,9 @@ pub struct TerminalManager<S> {
     sessions: ModelHandle<Sessions>,
     recovery_resources: Option<ShellRecoveryResources>,
     pending_shell_recovery: Option<PendingShellRecovery>,
+    /// The tmux gateway origin of the running event loop (KTD2). `None` before the shell starts
+    /// or when no gateways are registered.
+    tmux_origin: Option<TmuxOriginId>,
 }
 
 /// Shared inputs needed to construct a terminal surface for a local PTY.
@@ -516,6 +521,7 @@ impl<S> TerminalManager<S> {
             sessions: sessions.clone(),
             recovery_resources: None,
             pending_shell_recovery: None,
+            tmux_origin: None,
         };
 
         // Run surface-specific wiring after the manager exists, because this
@@ -709,6 +715,7 @@ impl<S> TerminalManager<S> {
             .lock()
             .set_pending_shell_launch_data(shell_launch_data.clone());
 
+        let tmux_link = self.link_tmux_origin(&restored_env, ctx);
         let pty = match self
             .enqueue_init_script(&replacement_starter, replacement_session_id)
             .context("failed to initialize replacement shell")
@@ -750,6 +757,7 @@ impl<S> TerminalManager<S> {
             event_loop_rx,
             model.clone(),
             resources.channel_event_proxy,
+            tmux_link,
         ));
         self.pending_shell_recovery = Some(PendingShellRecovery {
             restored_working_directory,
@@ -928,6 +936,7 @@ fn on_shell_determined<S: TerminalSurface>(
         model_events: model_events.clone(),
     });
     let model = manager.model();
+    let tmux_link = manager.link_tmux_origin(&env_vars, ctx);
     #[cfg(windows)]
     let event_loop_tx = manager.event_loop_tx.clone();
     let pty = match manager
@@ -971,6 +980,7 @@ fn on_shell_determined<S: TerminalSurface>(
         event_loop_rx,
         model.clone(),
         channel_event_proxy,
+        tmux_link,
     );
 
     manager.event_loop_handle = Some(event_loop_handle);
@@ -1120,15 +1130,44 @@ impl<S> TerminalManager<S> {
         )
     }
 
+    /// The tmux gateway origin of the running event loop, for the tmux workspace and pane backend.
+    #[allow(dead_code)]
+    pub(crate) fn tmux_origin(&self) -> Option<TmuxOriginId> {
+        self.tmux_origin
+    }
+
+    /// Links the next event loop to the tmux gateways, recording its origin. `env_vars` are the
+    /// shell's spawn environment.
+    fn link_tmux_origin(
+        &mut self,
+        env_vars: &HashMap<OsString, OsString>,
+        ctx: &mut ModelContext<Box<dyn TerminalManagerTrait>>,
+    ) -> Option<GatewayLink> {
+        self.tmux_origin = None;
+        if !ctx.has_singleton_model::<TmuxGateways>() {
+            return None;
+        }
+        let requests = self.event_loop_tx.clone();
+        let (origin, link) = TmuxGateways::handle(ctx).update(ctx, |gateways, _| {
+            gateways.link_for_new_origin(requests, env_vars)
+        });
+        self.tmux_origin = Some(origin);
+        Some(link)
+    }
+
     /// Start's the PTY event loop, returning a sender for the event loop and the event loop's join handle.
     fn start_pty_event_loop(
         pty: Pty,
         rx: mio_channel::Receiver<Message>,
         model: Arc<FairMutex<TerminalModel>>,
         channel_event_proxy: ChannelEventListener,
+        tmux_link: Option<GatewayLink>,
     ) -> JoinHandle<mio_channel::Receiver<Message>> {
         // Create the event loop and get a handle to the injector.
-        let event_loop = EventLoop::new(model, channel_event_proxy, pty, rx);
+        let mut event_loop = EventLoop::new(model, channel_event_proxy, pty, rx);
+        if let Some(link) = tmux_link {
+            event_loop = event_loop.with_tmux_gateway(link);
+        }
 
         // Spawn the event loop on a separate thread to interact with the PTY and write the data back
         // to the terminal.

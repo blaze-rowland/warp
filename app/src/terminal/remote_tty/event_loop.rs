@@ -157,7 +157,10 @@ impl EventLoop {
                             };
                         }
                         // TODO(alokedesai): Implement shutdown on the network backed PTY.
-                        EventLoopMessage::Shutdown | EventLoopMessage::ChildExited => {}
+                        // tmux control mode runs only on local PTYs.
+                        EventLoopMessage::Shutdown
+                        | EventLoopMessage::ChildExited
+                        | EventLoopMessage::Tmux(_) => {}
                     }
                 }
             })

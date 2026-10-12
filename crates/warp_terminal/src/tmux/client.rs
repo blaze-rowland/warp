@@ -408,6 +408,13 @@ impl ControlClient {
         &self.key_config
     }
 
+    /// `Some` once the control stream has ended (`%exit` and its string terminator were read) and
+    /// bytes are shell bytes again, holding trailing partial-DCS bytes the parser has not yet
+    /// returned. `None` while in control mode.
+    pub fn shell_pending(&self) -> Option<&[u8]> {
+        self.parser.shell_pending()
+    }
+
     /// Parses a transport read. Returns bytes outside control mode (before the DCS and after
     /// `%exit`), which belong to the shell.
     pub fn receive_bytes(&mut self, bytes: &[u8], now: Duration) -> Vec<u8> {

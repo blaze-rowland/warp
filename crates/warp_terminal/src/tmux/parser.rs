@@ -264,6 +264,15 @@ impl ControlModeParser {
         matches!(self.state, State::Control { .. })
     }
 
+    /// `Some` while looking for the DCS (before entry and after `%exit`), holding any trailing
+    /// partial-DCS bytes not yet returned as shell bytes.
+    pub fn shell_pending(&self) -> Option<&[u8]> {
+        match &self.state {
+            State::SeekingDcs { pending } => Some(pending),
+            _ => None,
+        }
+    }
+
     /// Consumes a chunk and returns control events only; shell bytes are discarded.
     pub fn push(&mut self, bytes: &[u8]) -> Vec<ControlEvent> {
         self.decode(bytes)
