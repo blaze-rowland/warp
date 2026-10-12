@@ -286,3 +286,18 @@ fn weak_origin_flags_share_state_until_the_origin_is_gone() {
     drop(flags);
     assert!(weak.upgrade().is_none());
 }
+
+#[test]
+fn a_test_pane_queue_delivers_in_order_and_closes_when_the_sender_drops() {
+    let (sender, queue) = test_pane_queue(PaneId(4));
+    assert_eq!(queue.pane_id(), PaneId(4));
+    sender.push(PaneChunk::Output(b"one".to_vec()));
+    sender.push(PaneChunk::Output(b"two".to_vec()));
+    assert_eq!(queue.queued_bytes(), 6);
+    assert_eq!(queue.try_recv(), Some(PaneChunk::Output(b"one".to_vec())));
+    drop(sender);
+    assert_eq!(queue.try_recv(), Some(PaneChunk::Output(b"two".to_vec())));
+    assert_eq!(queue.try_recv(), None);
+    assert!(queue.is_closed());
+    assert_eq!(queue.queued_bytes(), 0);
+}

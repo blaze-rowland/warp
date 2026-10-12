@@ -44,3 +44,11 @@ fn refresh_client_size_is_one_command() {
         "refresh-client -C 120x40\n"
     );
 }
+
+#[test]
+fn refresh_window_size_targets_one_window() {
+    assert_eq!(
+        refresh_client_window_size_command(WindowId(3), 200, 50),
+        "refresh-client -C @3:200x50\n"
+    );
+}

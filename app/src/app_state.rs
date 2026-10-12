@@ -19,6 +19,7 @@ use crate::settings_view::SettingsSection;
 use crate::settings_view::environments_page::EnvironmentsPage;
 use crate::tab::SelectedTabColor;
 use crate::terminal::ShellLaunchData;
+use crate::terminal::tmux::TmuxOriginId;
 use crate::themes::theme::AnsiColorIdentifier;
 use crate::workspace::WorkspaceRegistry;
 use crate::workspace::tab_group::TabGroupId;
@@ -153,6 +154,9 @@ pub enum LeafContents {
     NetworkLog,
     /// A new first-time user experience which prioritizes choosing a coding repository.
     GetStarted,
+    /// A pane of an attached tmux session, fed by tmux control mode. Never persisted: tmux owns
+    /// the session, and restoring it as a local shell would be wrong.
+    TmuxPane(TmuxPaneSnapshot),
 }
 
 #[cfg(feature = "local_fs")]
@@ -174,7 +178,9 @@ impl LeafContents {
             LeafContents::NetworkLog
             // Environment management panes are opened on-demand via workspace
             // actions and have no persistable state.
-            | LeafContents::EnvironmentManagement(_) => false,
+            | LeafContents::EnvironmentManagement(_)
+            // tmux panes belong to the tmux server; reattaching recreates them.
+            | LeafContents::TmuxPane(_) => false,
             LeafContents::Terminal(_)
             | LeafContents::Notebook(_)
             | LeafContents::AIDocument(_)
@@ -190,6 +196,15 @@ impl LeafContents {
             | LeafContents::GetStarted => true,
         }
     }
+}
+
+/// A tmux pane leaf: which session (by its origin PTY) and which pane it shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TmuxPaneSnapshot {
+    pub origin: TmuxOriginId,
+    pub pane_id: warp_terminal::tmux::PaneId,
+    /// `#{pane_current_command}` when the leaf was made; picks the pane's shell type.
+    pub current_command: Option<String>,
 }
 
 /// Snapshot of an ambient agent pane.

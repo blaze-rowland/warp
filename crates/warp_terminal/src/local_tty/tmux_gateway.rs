@@ -358,6 +358,26 @@ fn pane_queue(
     )
 }
 
+/// The writing end of a queue made by [`test_pane_queue`].
+#[cfg(any(test, feature = "test-util"))]
+pub struct TestPaneQueueSender(PaneQueueSender);
+
+#[cfg(any(test, feature = "test-util"))]
+impl TestPaneQueueSender {
+    /// Queues `chunk` as the gateway would. Dropping the sender closes the queue.
+    pub fn push(&self, chunk: PaneChunk) {
+        self.0.push(chunk);
+    }
+}
+
+/// A pane queue with no gateway behind it, for testing pane backends. Resume requests are
+/// dropped.
+#[cfg(any(test, feature = "test-util"))]
+pub fn test_pane_queue(pane_id: PaneId) -> (TestPaneQueueSender, PaneQueueReceiver) {
+    let (sender, receiver) = pane_queue(pane_id, PaneQueueLimits::default(), Arc::new(|_| {}));
+    (TestPaneQueueSender(sender), receiver)
+}
+
 /// Everything the event loop needs to run a gateway on one origin PTY.
 pub struct GatewayLink {
     pub switch: GatewaySwitch,

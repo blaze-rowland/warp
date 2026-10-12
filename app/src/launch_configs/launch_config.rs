@@ -256,7 +256,8 @@ impl TryFrom<PaneNodeSnapshot> for PaneTemplateType {
                 | LeafContents::NetworkLog
                 | LeafContents::AIDocument(_)
                 | LeafContents::EnvironmentManagement(_)
-                | LeafContents::AmbientAgent(_) => {
+                | LeafContents::AmbientAgent(_)
+                | LeafContents::TmuxPane(_) => {
                     // TODO: Handle AIDocument in launch config
                     Err(())
                 }

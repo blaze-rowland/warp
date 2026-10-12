@@ -73,7 +73,7 @@ use crate::app_state::CodePaneSnapShot;
 use crate::app_state::{
     self, AIFactPaneSnapshot, BranchSnapshot, EnvVarCollectionPaneSnapshot, LeafContents,
     LeafSnapshot, NotebookPaneSnapshot, PaneNodeSnapshot, PaneUuid, SettingsPaneSnapshot,
-    TerminalPaneSnapshot, WorkflowPaneSnapshot,
+    TerminalPaneSnapshot, TmuxPaneSnapshot, WorkflowPaneSnapshot,
 };
 use crate::appearance::Appearance;
 use crate::auth::AuthStateProvider;
@@ -143,6 +143,8 @@ use crate::terminal::shared_session::share_modal::{ShareSessionModal, ShareSessi
 use crate::terminal::shared_session::{
     self, IsSharedSessionCreator, SharedSessionActionSource, SharedSessionSource,
 };
+#[cfg(feature = "local_tty")]
+use crate::terminal::tmux::pane_manager::TmuxPaneTerminalManager;
 use crate::terminal::view::inline_banner::{
     ZeroStatePromptSuggestionTriggeredFrom, ZeroStatePromptSuggestionType,
 };
@@ -868,6 +870,12 @@ pub enum PaneDragDropLocation {
     PaneGroup(PaneId),
     Other,
 }
+
+/// A terminal pane's view and the manager behind it.
+type TerminalSession = (
+    ViewHandle<TerminalView>,
+    ModelHandle<Box<dyn TerminalManager>>,
+);
 
 pub struct PaneGroup {
     tips_completed: ModelHandle<TipsCompleted>,
@@ -2020,6 +2028,32 @@ impl PaneGroup {
                     };
                     Ok((PaneData::new(pane_id), focus))
                 }
+            }
+            LeafContents::TmuxPane(snapshot) => {
+                // tmux panes are never persisted; this builds them for a live tmux layout.
+                let uuid = Uuid::new_v4().as_bytes().to_vec();
+                let (terminal_view, terminal_manager) = PaneGroup::create_tmux_pane_session(
+                    snapshot,
+                    resources,
+                    view_size,
+                    model_event_sender.clone(),
+                    ctx,
+                )?;
+                let pane_data = TerminalPane::new(
+                    uuid,
+                    terminal_manager,
+                    terminal_view,
+                    model_event_sender,
+                    ctx,
+                );
+                let terminal_pane_id = pane_data.terminal_pane_id();
+                let pane_id = terminal_pane_id.into();
+                pane_contents.insert(pane_id, Box::new(pane_data));
+                let focus = InitialFocus {
+                    focused_pane: leaf.is_focused.then_some(pane_id),
+                    active_session: leaf.is_focused.then_some(terminal_pane_id),
+                };
+                Ok((PaneData::new(pane_id), focus))
             }
             LeafContents::EnvironmentManagement(_) => {
                 // Environment management panes are not restored from persistence.
@@ -6198,6 +6232,34 @@ impl PaneGroup {
         }
 
         (terminal_view, terminal_manager)
+    }
+
+    /// Creates the terminal for one tmux pane: the runtime counterpart of the compile-time
+    /// backend choice in [`Self::create_session`]. The pane is fed by its session's control
+    /// stream instead of a PTY of its own (KTD3).
+    fn create_tmux_pane_session(
+        snapshot: TmuxPaneSnapshot,
+        resources: TerminalViewResources,
+        initial_size: Vector2F,
+        model_event_sender: Option<SyncSender<ModelEvent>>,
+        ctx: &mut ViewContext<Self>,
+    ) -> anyhow::Result<TerminalSession> {
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "local_tty")] {
+                let init = TmuxPaneTerminalManager::create_model(
+                    snapshot,
+                    resources,
+                    initial_size,
+                    model_event_sender,
+                    ctx.window_id(),
+                    ctx,
+                );
+                Ok((init.view, init.manager))
+            } else {
+                let _ = (snapshot, resources, initial_size, model_event_sender, ctx);
+                Err(anyhow::anyhow!("tmux panes need a local PTY"))
+            }
+        }
     }
 
     /// `is_ambient_agent` controls whether the resulting [`TerminalView`] is

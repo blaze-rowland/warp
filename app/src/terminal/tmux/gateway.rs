@@ -24,11 +24,8 @@ use warp_terminal::tmux::{ClientConfig, ClientEvent, CommandReply, PaneId};
 use warp_terminal::writeable_pty::Message;
 use warpui::{Entity, ModelContext, SingletonEntity};
 
+pub use super::TmuxOriginId;
 use super::settings::TmuxSettings;
-
-/// Identifies one origin PTY event loop. A respawned shell gets a new id.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct TmuxOriginId(u64);
 
 /// What a gateway reported, on the main thread. Pane bytes are not here: take them with
 /// [`TmuxGateways::take_pane_queue`] after [`TmuxGatewayEvent::PaneQueueReady`].

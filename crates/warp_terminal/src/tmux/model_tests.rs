@@ -29,6 +29,7 @@ fn pane_row(id: u32, window: u32, active: bool) -> PaneRow {
         mode: None,
         width: 80,
         height: 24,
+        current_command: None,
     }
 }
 
@@ -81,6 +82,31 @@ fn parses_pane_rows_recorded_from_tmux_3_7c() {
     assert!(row.alternate_on);
     assert_eq!(row.mode.as_deref(), Some("copy-mode"));
     assert_eq!((row.width, row.height), (40, 12));
+}
+
+#[test]
+fn pane_rows_carry_the_current_command() {
+    let row = parse_pane_row(b"%2\t@1\t1\t0\t0\t80\t24\t\tfish").unwrap();
+    assert_eq!(row.current_command.as_deref(), Some("fish"));
+    assert_eq!(row.mode, None);
+
+    // Rows without the field (or with it empty) have no command.
+    let row = parse_pane_row(b"%2\t@1\t1\t0\t0\t80\t24\t").unwrap();
+    assert_eq!(row.current_command, None);
+    let row = parse_pane_row(b"%2\t@1\t1\t0\t0\t80\t24\t\t").unwrap();
+    assert_eq!(row.current_command, None);
+}
+
+#[test]
+fn replacing_panes_keeps_the_current_command() {
+    let mut model = SessionModel::default();
+    let mut row = pane_row(4, 1, true);
+    row.current_command = Some("fish".to_owned());
+    model.replace_panes(vec![row]);
+    assert_eq!(
+        model.pane(PaneId(4)).unwrap().current_command.as_deref(),
+        Some("fish")
+    );
 }
 
 #[test]

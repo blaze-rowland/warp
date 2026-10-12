@@ -4,7 +4,7 @@
 //! `%begin`/`%end` (or `%error`) block, so a reply correlator counts one expected reply per
 //! returned line.
 
-use super::parser::PaneId;
+use super::parser::{PaneId, WindowId};
 
 /// Bytes per `send-keys -H` command. Keeps each line well under tmux's command length limits.
 const SEND_KEYS_CHUNK_BYTES: usize = 128;
@@ -28,6 +28,16 @@ pub fn send_keys_command(pane_id: PaneId, bytes: &[u8]) -> Vec<String> {
 /// Sets the control client's size. One command line.
 pub fn refresh_client_size_command(columns: usize, rows: usize) -> String {
     format!("refresh-client -C {columns}x{rows}\n")
+}
+
+/// Sets the control client's size for one window only (`refresh-client -C @W:WxH`), so each
+/// window can match the Warp tab that shows it. One command line.
+pub fn refresh_client_window_size_command(
+    window_id: WindowId,
+    columns: usize,
+    rows: usize,
+) -> String {
+    format!("refresh-client -C {window_id}:{columns}x{rows}\n")
 }
 
 #[cfg(test)]

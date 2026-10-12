@@ -14,8 +14,9 @@ pub const LIST_WINDOWS_FORMAT: &str = "#{window_id}\t#{window_index}\t#{window_a
 #{window_layout}\t#{window_visible_layout}\t#{window_flags}\t#{window_name}";
 
 /// `list-panes -F` format matching [`parse_pane_row`].
+/// The current command is last because it is the only free-text field.
 pub const LIST_PANES_FORMAT: &str = "#{pane_id}\t#{window_id}\t#{pane_active}\t#{alternate_on}\t\
-#{pane_in_mode}\t#{pane_width}\t#{pane_height}\t#{pane_mode}";
+#{pane_in_mode}\t#{pane_width}\t#{pane_height}\t#{pane_mode}\t#{pane_current_command}";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TmuxSession {
@@ -43,6 +44,9 @@ pub struct TmuxPane {
     pub mode: Option<String>,
     pub width: u32,
     pub height: u32,
+    /// `#{pane_current_command}`: the pane's foreground program (`fish`, `vim`, ...), or `None`
+    /// when tmux did not report one.
+    pub current_command: Option<String>,
 }
 
 /// One row of a [`LIST_WINDOWS_FORMAT`] reply.
@@ -66,6 +70,7 @@ pub struct PaneRow {
     pub mode: Option<String>,
     pub width: u32,
     pub height: u32,
+    pub current_command: Option<String>,
 }
 
 /// A difference found when a `list-windows` reply replaces the window set.
@@ -114,7 +119,7 @@ pub fn parse_window_row(line: &[u8]) -> Option<WindowRow> {
 
 pub fn parse_pane_row(line: &[u8]) -> Option<PaneRow> {
     let line = String::from_utf8_lossy(line);
-    let mut fields = line.splitn(8, '\t');
+    let mut fields = line.splitn(9, '\t');
     let id = PaneId::parse(fields.next()?)?;
     let window_id = WindowId::parse(fields.next()?)?;
     let active = fields.next()? == "1";
@@ -124,6 +129,10 @@ pub fn parse_pane_row(line: &[u8]) -> Option<PaneRow> {
     let height = fields.next()?.parse().ok()?;
     let mode = fields.next()?;
     let mode = (in_mode || !mode.is_empty()).then(|| mode.to_owned());
+    let current_command = fields
+        .next()
+        .filter(|command| !command.is_empty())
+        .map(str::to_owned);
     Some(PaneRow {
         id,
         window_id,
@@ -132,6 +141,7 @@ pub fn parse_pane_row(line: &[u8]) -> Option<PaneRow> {
         mode,
         width,
         height,
+        current_command,
     })
 }
 
@@ -255,6 +265,7 @@ impl SessionModel {
                             mode: None,
                             width: leaf.width,
                             height: leaf.height,
+                            current_command: None,
                         },
                     );
                 }
@@ -342,6 +353,7 @@ impl SessionModel {
                     mode: row.mode,
                     width: row.width,
                     height: row.height,
+                    current_command: row.current_command,
                 },
             );
         }
