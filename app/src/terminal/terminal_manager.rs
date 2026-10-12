@@ -48,6 +48,18 @@ pub trait TerminalManager: Any {
     ) {
     }
 
+    /// The tmux gateway origin of a local PTY, which may be running a tmux control-mode session.
+    fn tmux_origin(&self) -> Option<crate::terminal::tmux::TmuxOriginId> {
+        None
+    }
+
+    /// The session origin and tmux pane this terminal shows, for a tmux pane.
+    fn tmux_pane(
+        &self,
+    ) -> Option<(crate::terminal::tmux::TmuxOriginId, warp_terminal::tmux::PaneId)> {
+        None
+    }
+
     /// Returns this [`TerminalManager`] as an [`Any`], to support downcasting.
     fn as_any(&self) -> &dyn Any;
 

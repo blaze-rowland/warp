@@ -104,6 +104,17 @@ pub enum PaneNodeSnapshot {
 }
 
 impl PaneNodeSnapshot {
+    /// Whether any leaf is a tmux pane. Tabs holding tmux panes are never persisted (KTD4).
+    pub fn has_tmux_panes(&self) -> bool {
+        match self {
+            PaneNodeSnapshot::Leaf(leaf) => matches!(leaf.contents, LeafContents::TmuxPane(_)),
+            PaneNodeSnapshot::Branch(branch) => branch
+                .children
+                .iter()
+                .any(|(_, child)| child.has_tmux_panes()),
+        }
+    }
+
     pub fn has_horizontal_split(&self) -> bool {
         match self {
             PaneNodeSnapshot::Leaf(_) => false,
@@ -365,6 +376,18 @@ pub enum SplitDirection {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PaneFlex(pub f32);
+
+/// The active tab index to save once the tabs flagged in `dropped` are left out. An active tab
+/// that is dropped (a tmux tab) hands off to the closest kept tab before it, which is the
+/// session's origin tab, saved as a normal visible tab (KTD4).
+pub fn persisted_active_index(dropped: &[bool], active: usize) -> usize {
+    let kept_before = |end: usize| dropped[..end].iter().filter(|d| !**d).count();
+    let active = active.min(dropped.len().saturating_sub(1));
+    match dropped.get(active) {
+        Some(false) => kept_before(active),
+        _ => kept_before(active).saturating_sub(1),
+    }
+}
 
 pub fn get_app_state(app: &AppContext) -> AppState {
     let active_window_id = app.windows().active_window();

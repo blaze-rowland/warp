@@ -1197,3 +1197,40 @@ impl ansi::Handler for RecordingTerminal {
         let _ = w1.write_all(b"<text_area_size_chars>");
     }
 }
+
+#[test]
+fn the_session_model_reaches_the_app_before_attached() {
+    let mut g = GatewayHarness::spawn(true);
+    g.attach();
+    let events = g.events.lock();
+    let model = events
+        .iter()
+        .position(|e| matches!(e, GatewayEvent::Model(model) if model.windows().count() == 1))
+        .expect("a model snapshot with the session's window");
+    let attached = events
+        .iter()
+        .position(|e| matches!(e, GatewayEvent::Client(ClientEvent::Attached { .. })))
+        .expect("attached");
+    assert!(model < attached, "{events:?}");
+}
+
+#[test]
+fn shutdown_while_attached_flushes_a_detach_first() {
+    let mut g = GatewayHarness::spawn(true);
+    g.attach();
+    g.answer();
+    // Everything written so far was answered; nothing else is pending.
+    let _ = g.h.take_written();
+    g.h.send(Message::Shutdown);
+    g.h.join();
+    // The control client's detach is the bare newline (KTD3, R25: quit and window close detach).
+    assert_eq!(g.h.take_written(), b"\n");
+}
+
+#[test]
+fn shutdown_without_a_session_writes_nothing() {
+    let mut g = GatewayHarness::spawn(true);
+    g.h.send(Message::Shutdown);
+    g.h.join();
+    assert!(g.h.take_written().is_empty());
+}

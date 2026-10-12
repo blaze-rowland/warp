@@ -29,6 +29,8 @@ pub struct SessionNavigationData {
     is_read_only: bool,
     /// The sharing status of the session.
     shared_session_status: SharedSessionStatus,
+    /// A tmux pane, or the origin of a running tmux session.
+    is_tmux: bool,
 }
 
 impl SessionNavigationData {
@@ -111,6 +113,7 @@ impl SessionNavigationData {
             is_read_only,
             window_id,
             shared_session_status,
+            is_tmux: false,
         }
     }
 
@@ -146,6 +149,18 @@ impl SessionNavigationData {
         self.shared_session_status.clone()
     }
 
+    /// Marks a tmux pane, or the origin of a running tmux session.
+    pub fn with_tmux(mut self, is_tmux: bool) -> Self {
+        self.is_tmux = is_tmux;
+        self
+    }
+
+    /// Whether this session is a tmux pane or a tmux session's origin. Quitting detaches these
+    /// rather than stopping their processes, so they never count as running processes (R25).
+    pub fn is_tmux(&self) -> bool {
+        self.is_tmux
+    }
+
     /// Fetches all sessions currently open in the app.
     pub fn all_sessions(app: &AppContext) -> impl Iterator<Item = SessionNavigationData> + '_ {
         app.window_ids()
@@ -175,6 +190,7 @@ impl<'a> RunningSessionSummary<'a> {
                     CommandContext::RunningCommand { .. } | CommandContext::RunningAIBlock { .. }
                 ) && !session.shared_session_status().is_viewer()
                     && !session.is_read_only()
+                    && !session.is_tmux()
             })
             .collect();
         Self { long_running_cmds }

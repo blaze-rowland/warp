@@ -370,6 +370,9 @@ pub struct TabData {
     pub in_multi_selection: bool,
     /// True when this tab is pinned to the front of the tab list.
     pub pinned: bool,
+    /// True while this tab is the origin of an attached tmux session: it stays in the tab list
+    /// but is not shown (R23, KTD4). Never persisted; a saved origin tab is a normal tab.
+    pub hidden_for_tmux: bool,
 }
 
 const TAB_COLOR_ICON_PATH: &str = "bundled/svg/ellipse.svg";
@@ -390,6 +393,7 @@ impl TabData {
             group_id: None,
             in_multi_selection: false,
             pinned: false,
+            hidden_for_tmux: false,
         }
     }
 
@@ -1045,6 +1049,10 @@ enum Indicator {
         conversation_status: Option<ConversationStatus>,
     },
     AmbientAgent,
+    /// The tab shows a tmux window (R28); the tooltip names the session and host.
+    Tmux {
+        tooltip: String,
+    },
 }
 
 impl From<TerminalViewState> for Indicator {
@@ -1214,6 +1222,8 @@ impl<'a> TabComponent<'a> {
             Indicator::UnsavedChanges
         } else if FeatureFlag::CreatingSharedSessions.is_enabled() && is_being_shared {
             Indicator::Shared
+        } else if let Some(tooltip) = tab.pane_group.as_ref(ctx).tmux_tooltip(ctx) {
+            Indicator::Tmux { tooltip }
         } else if !should_show_indicators {
             Indicator::None
         } else if are_inputs_synced {
@@ -1364,6 +1374,9 @@ impl<'a> TabComponent<'a> {
     ) -> Option<String> {
         if Self::is_agent_task_indicator(indicator) {
             return Self::get_agent_task_tooltip_message(tab, ctx);
+        }
+        if let Indicator::Tmux { tooltip } = indicator {
+            return Some(tooltip.clone());
         }
 
         // If we're not showing the conversation title in the tooltip,
@@ -1702,6 +1715,31 @@ impl<'a> TabComponent<'a> {
                     let icon_color = self.appearance.theme().nonactive_ui_text_color();
                     Some(Icon::Agent.to_warpui_icon(icon_color).finish())
                 }
+            }
+            Indicator::Tmux { tooltip } => {
+                let icon_color = internal_colors::neutral_5(self.appearance.theme());
+                let ui_builder = self.ui_builder.clone();
+                let tooltip = tooltip.clone();
+                let mouse_state = self.tab.indicator_hover_state.clone();
+                Some(
+                    Hoverable::new(mouse_state, move |state| {
+                        let mut stack = Stack::new()
+                            .with_child(Icon::Grid.to_warpui_icon(icon_color.into()).finish());
+                        if state.is_hovered() {
+                            stack.add_positioned_overlay_child(
+                                ui_builder.tool_tip(tooltip.clone()).build().finish(),
+                                OffsetPositioning::offset_from_parent(
+                                    vec2f(0., 3.),
+                                    ParentOffsetBounds::WindowByPosition,
+                                    ParentAnchor::BottomMiddle,
+                                    ChildAnchor::TopMiddle,
+                                ),
+                            );
+                        }
+                        stack.finish()
+                    })
+                    .finish(),
+                )
             }
             Indicator::AmbientAgent => {
                 // Always use the active tab font color for the ambient agent cloud icon, with a safe fallback.

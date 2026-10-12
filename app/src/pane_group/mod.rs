@@ -183,6 +183,7 @@ pub(crate) use child_agent::materialization::{
 };
 pub mod focus_state;
 pub mod pane;
+mod tmux_tab;
 pub mod tree;
 pub mod working_directories;
 use ambient_pane_restoration::AmbientRestoreKind;
@@ -210,6 +211,7 @@ pub use pane::{
     AnyPaneContent, BackingView, PaneConfiguration, PaneConfigurationEvent, PaneContent, PaneEvent,
     PaneHeaderAction, PaneHeaderCustomAction, PaneId, PaneView, TerminalPaneId,
 };
+pub use tmux_tab::TmuxTab;
 pub use tree::{Direction, PaneData, PaneFlex, PaneNode, SplitDirection};
 use warp_errors::report_error;
 pub use working_directories::{WorkingDirectoriesEvent, WorkingDirectoriesModel};
@@ -307,6 +309,8 @@ pub enum PaneGroupAction {
     ToggleMaximizePane,
     HandleFocusChange,
     FocusTerminalView(EntityId),
+    /// Reattach this tmux tab's disconnected session (R29's Disconnected banner).
+    TmuxReattach,
 }
 #[derive(PartialEq)]
 enum PaneRemovalReason {
@@ -490,6 +494,10 @@ pub fn init(app: &mut AppContext) {
 }
 
 pub enum Event {
+    /// The user asked to reattach a disconnected tmux session.
+    TmuxReattachRequested {
+        origin: crate::terminal::tmux::TmuxOriginId,
+    },
     AppStateChanged,
     Escape,
     Exited {
@@ -975,6 +983,9 @@ pub struct PaneGroup {
 
     /// Tab-level custom title set via the rename-tab flow.
     custom_title: Option<String>,
+
+    /// Set when this tab shows a tmux window (U7).
+    tmux_tab: Option<tmux_tab::TmuxTab>,
 }
 
 /// A cloud orchestration parent whose direct children (per the server's
@@ -3236,6 +3247,7 @@ impl PaneGroup {
             transitively_shared_child_panes: HashMap::new(),
             child_agent_origin: None,
             custom_title: None,
+            tmux_tab: None,
         };
 
         // Notify any restored panes that they belong to this pane group.
@@ -4399,6 +4411,10 @@ impl PaneGroup {
         pane_id: &PaneId,
         ctx: &mut ViewContext<Self>,
     ) -> Option<Box<dyn AnyPaneContent>> {
+        // tmux panes stay in their window's tab: tmux owns the layout (U7 step 6).
+        if self.is_tmux_tab() {
+            return None;
+        }
         // Clear any hidden pane entry since the pane is being permanently removed from this group.
         self.panes.remove_hidden_pane(*pane_id);
 
@@ -4503,6 +4519,11 @@ impl PaneGroup {
     /// Emits an event for the workspace to show a confirmation dialog if necessary, or closes immediately if not.
     /// If a dialog is opened, the workspace may call back into pane group to close the pane after the user confirms.
     pub fn close_pane_with_confirmation(&mut self, pane_id: PaneId, ctx: &mut ViewContext<Self>) {
+        // In a tmux tab, closing a split kills the tmux pane (R25); tmux's layout change removes
+        // it here. tmux panes never go on the undo-close stack.
+        if self.tmux_close_pane(pane_id, ctx) {
+            return;
+        }
         // Child agent panes are just hidden when closed, so skip the
         // "process running" warning—it doesn't apply.
         if self.is_child_agent_pane(pane_id) {
@@ -5181,6 +5202,24 @@ impl PaneGroup {
         event: &PaneEvent,
         ctx: &mut ViewContext<Self>,
     ) {
+        if self.is_tmux_tab() {
+            let direction = match event {
+                PaneEvent::SplitLeft(_) => Some(Direction::Left),
+                PaneEvent::SplitRight(_) => Some(Direction::Right),
+                PaneEvent::SplitUp(_) => Some(Direction::Up),
+                PaneEvent::SplitDown(_) => Some(Direction::Down),
+                _ => None,
+            };
+            if let Some(direction) = direction {
+                self.tmux_split(pane_id, direction, ctx);
+                return;
+            }
+            if matches!(event, PaneEvent::Close | PaneEvent::CloseAndFocus { .. })
+                && self.tmux_close_pane(pane_id, ctx)
+            {
+                return;
+            }
+        }
         match event {
             PaneEvent::Close => self.close_pane(pane_id, ctx),
             PaneEvent::CloseAndFocus { pane_to_focus } => {
@@ -6028,7 +6067,10 @@ impl PaneGroup {
     }
 
     pub fn end_resizing(&mut self, ctx: &mut ViewContext<Self>) {
-        self.dragged_border = None;
+        let was_resizing = self.dragged_border.take().is_some();
+        if was_resizing {
+            self.tmux_sync_divider_sizes(ctx);
+        }
         ctx.emit(Event::AppStateChanged);
     }
 
@@ -6039,6 +6081,7 @@ impl PaneGroup {
             -KEYBOARD_RESIZE_DELTA,
             ctx,
         );
+        self.tmux_sync_divider_sizes(ctx);
         ctx.notify();
         ctx.emit(Event::AppStateChanged);
     }
@@ -6050,6 +6093,7 @@ impl PaneGroup {
             KEYBOARD_RESIZE_DELTA,
             ctx,
         );
+        self.tmux_sync_divider_sizes(ctx);
         ctx.notify();
         ctx.emit(Event::AppStateChanged);
     }
@@ -6061,6 +6105,7 @@ impl PaneGroup {
             -KEYBOARD_RESIZE_DELTA,
             ctx,
         );
+        self.tmux_sync_divider_sizes(ctx);
         ctx.notify();
         ctx.emit(Event::AppStateChanged);
     }
@@ -6072,6 +6117,7 @@ impl PaneGroup {
             KEYBOARD_RESIZE_DELTA,
             ctx,
         );
+        self.tmux_sync_divider_sizes(ctx);
         ctx.notify();
         ctx.emit(Event::AppStateChanged);
     }
@@ -8276,6 +8322,10 @@ impl TypedActionView for PaneGroup {
     fn handle_action(&mut self, action: &Self::Action, ctx: &mut ViewContext<Self>) {
         use PaneGroupAction::*;
         match action {
+            Add(direction) if self.is_tmux_tab() => {
+                let base = self.focused_pane_id(ctx);
+                self.tmux_split(base, *direction, ctx);
+            }
             Add(direction) => {
                 let chosen_shell = {
                     match self.active_session_terminal_model(ctx) {
@@ -8306,6 +8356,8 @@ impl TypedActionView for PaneGroup {
             NavigateUp => self.navigate_pane_by_direction(Direction::Up, ctx),
             NavigateDown => self.navigate_pane_by_direction(Direction::Down, ctx),
             ToggleMaximizePane => self.toggle_maximize_pane(ctx),
+            // Moving panes inside a tmux tab would leave tmux's layout behind; tmux owns it.
+            Move { .. } if self.is_tmux_tab() => {}
             Move {
                 id,
                 target_pane_id,
@@ -8313,6 +8365,12 @@ impl TypedActionView for PaneGroup {
             } => self.move_pane(*id, *target_pane_id, *direction, ctx),
             HandleFocusChange => self.handle_focus_change(ctx),
             FocusTerminalView(terminal_view_id) => self.focus_terminal_view(*terminal_view_id, ctx),
+            TmuxReattach => {
+                if let Some(tab) = self.tmux_tab() {
+                    let origin = tab.origin;
+                    ctx.emit(Event::TmuxReattachRequested { origin });
+                }
+            }
         }
     }
 }
@@ -8358,12 +8416,14 @@ impl View for PaneGroup {
         // "circular view reference". The per-pane views (and their backing
         // terminal/editor views) are reached via the structural parent graph
         // and `PaneView::child_view_ids`.
-        vec![
+        let mut ids = vec![
             self.share_block_modal.id(),
             self.share_session_modal.id(),
             self.shared_session_role_change_modal.id(),
             self.user_default_shell_changed_banner.id(),
-        ]
+        ];
+        ids.extend(self.tmux_banner_ids());
+        ids
     }
 
     fn render(&self, app: &AppContext) -> Box<dyn Element> {
@@ -8379,6 +8439,9 @@ impl View for PaneGroup {
             == &BannerState::Open
         {
             column.add_child(ChildView::new(&self.user_default_shell_changed_banner).finish());
+        }
+        if let Some(banner) = self.render_tmux_banner(app) {
+            column.add_child(banner);
         }
 
         let main_content = if self.is_focused_pane_maximized(app) {

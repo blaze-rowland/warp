@@ -187,6 +187,10 @@ impl TerminalManager for TmuxPaneTerminalManager {
         self.model.clone()
     }
 
+    fn tmux_pane(&self) -> Option<(TmuxOriginId, PaneId)> {
+        Some((self.origin, self.pane_id))
+    }
+
     fn on_view_detached(&self, detach_type: DetachType, app: &mut AppContext) {
         // Hidden-for-close and moved panes may come back; keep draining for them. Closing
         // releases the view only. Killing the tmux pane is an explicit action (R25).

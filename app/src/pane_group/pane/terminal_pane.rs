@@ -235,6 +235,42 @@ impl TerminalPane {
             window_id,
             view.model.lock().shared_session_status().clone(),
         )
+        .with_tmux(self.is_tmux_backed(app))
+    }
+
+    /// Whether this pane shows a tmux pane, or is the origin of a running tmux session. Quitting
+    /// and closing windows detach those instead of stopping processes (R25).
+    pub fn is_tmux_backed(&self, app: &AppContext) -> bool {
+        let manager = self.terminal_manager(app);
+        let manager = manager.as_ref(app);
+        if manager.tmux_pane().is_some() {
+            return true;
+        }
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "local_tty")] {
+                use warpui::SingletonEntity as _;
+                manager.tmux_origin().is_some_and(|origin| {
+                    app.has_singleton_model::<crate::terminal::tmux::gateway::TmuxGateways>()
+                        && crate::terminal::tmux::gateway::TmuxGateways::as_ref(app)
+                            .is_in_session(origin)
+                })
+            } else {
+                false
+            }
+        }
+    }
+
+    /// The tmux pane this terminal shows, if any.
+    pub fn tmux_pane(
+        &self,
+        app: &AppContext,
+    ) -> Option<(crate::terminal::tmux::TmuxOriginId, warp_terminal::tmux::PaneId)> {
+        self.terminal_manager(app).as_ref(app).tmux_pane()
+    }
+
+    /// The tmux gateway origin of this terminal's PTY, if it has one.
+    pub fn tmux_origin(&self, app: &AppContext) -> Option<crate::terminal::tmux::TmuxOriginId> {
+        self.terminal_manager(app).as_ref(app).tmux_origin()
     }
 
     pub fn terminal_pane_id(&self) -> TerminalPaneId {
@@ -450,6 +486,14 @@ impl PaneContent for TerminalPane {
     }
 
     fn snapshot(&self, app: &AppContext) -> LeafContents {
+        // A tmux pane belongs to its tmux server and is never persisted (KTD4).
+        if let Some((origin, pane_id)) = self.terminal_manager(app).as_ref(app).tmux_pane() {
+            return LeafContents::TmuxPane(crate::app_state::TmuxPaneSnapshot {
+                origin,
+                pane_id,
+                current_command: None,
+            });
+        }
         let view = self.terminal_view(app).as_ref(app);
         let is_active = view.is_active_session(app);
 

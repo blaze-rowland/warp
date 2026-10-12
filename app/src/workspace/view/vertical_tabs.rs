@@ -1182,7 +1182,7 @@ impl VerticalTabsPanelState {
         app: &AppContext,
     ) -> Vec<usize> {
         if self.search_query.is_empty() {
-            return (0..tabs.len()).collect();
+            return (0..tabs.len()).filter(|i| !tabs[*i].hidden_for_tmux).collect();
         }
         let query_lower = self.search_query.to_lowercase();
         let matched_groups = matched_group_ids(tab_groups, &query_lower);
@@ -1195,6 +1195,7 @@ impl VerticalTabsPanelState {
         };
         tabs.iter()
             .enumerate()
+            .filter(|(_, tab)| !tab.hidden_for_tmux)
             .filter(|(tab_index, tab)| {
                 // A group-name match admits every member, regardless of its own text.
                 if tab_admitted_by_group_name(tab.group_id, &matched_groups) {
@@ -1795,6 +1796,8 @@ fn render_groups(
             .tabs
             .iter()
             .enumerate()
+            // A hidden tmux origin tab has no row (KTD4).
+            .filter(|(_, tab)| !tab.hidden_for_tmux)
             .map(|(tab_index, _)| (tab_index, None))
             .collect()
     } else {
@@ -1803,6 +1806,7 @@ fn render_groups(
             .tabs
             .iter()
             .enumerate()
+            .filter(|(_, tab)| !tab.hidden_for_tmux)
             .filter_map(|(tab_index, tab)| {
                 let pane_group = tab.pane_group.as_ref(app);
                 let visible_pane_ids = pane_group.visible_pane_ids();

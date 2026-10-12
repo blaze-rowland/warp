@@ -26,7 +26,7 @@ use instant::Instant;
 
 use crate::tmux::{
     CONTROL_MODE_DCS, ClientConfig, ClientEvent, ClientKey, CommandId, CommandReply, ControlClient,
-    PaneId, PaneSnapshot, Phase,
+    PaneId, PaneSnapshot, Phase, SessionModel,
 };
 
 /// CAN: aborts an escape sequence in the VT parser. Written to the origin model when a DCS
@@ -166,6 +166,10 @@ pub enum GatewayEvent {
     Refused(RefusalReason),
     /// An engine event. Pane bytes and command replies are delivered separately.
     Client(ClientEvent),
+    /// The engine's session model after a batch of events that changed it. Sent before those
+    /// events, so the app can build tabs from it when `Attached` arrives (the handshake emits no
+    /// window events).
+    Model(Box<SessionModel>),
     /// The first bytes for a pane arrived; read them from `queue`.
     PaneQueueOpened { queue: PaneQueueReceiver },
     /// The reply to a [`TmuxRequest::Command`].
@@ -590,7 +594,11 @@ impl Gateway {
             return;
         };
         let mut prune = false;
-        for event in session.client.take_events() {
+        let events = session.client.take_events();
+        if events.iter().any(changes_model) {
+            (self.sink)(GatewayEvent::Model(Box::new(session.client.model().clone())));
+        }
+        for event in events {
             match event {
                 ClientEvent::PaneOutput { pane_id, bytes } => {
                     Self::enqueue(
@@ -698,6 +706,23 @@ impl Gateway {
             (self.sink)(GatewayEvent::Ended);
         }
     }
+}
+
+/// Whether `event` reports a change to the session model the app mirrors.
+fn changes_model(event: &ClientEvent) -> bool {
+    matches!(
+        event,
+        ClientEvent::Attached { .. }
+            | ClientEvent::SessionChanged { .. }
+            | ClientEvent::SessionRenamed { .. }
+            | ClientEvent::WindowAdded { .. }
+            | ClientEvent::WindowClosed { .. }
+            | ClientEvent::WindowRenamed { .. }
+            | ClientEvent::LayoutChanged { .. }
+            | ClientEvent::ActiveWindowChanged { .. }
+            | ClientEvent::ActivePaneChanged { .. }
+            | ClientEvent::PaneModeChanged { .. }
+    )
 }
 
 /// Where the entry DCS sits in a read.

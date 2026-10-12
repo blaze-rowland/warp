@@ -1531,6 +1531,8 @@ pub(crate) fn initialize_app(
     ctx.add_singleton_model(crate::terminal::tmux::gateway::TmuxGateways::new);
     #[cfg(feature = "local_tty")]
     ctx.add_singleton_model(crate::terminal::tmux::pane_manager::TmuxWindowSizer::new);
+    #[cfg(feature = "local_tty")]
+    ctx.add_singleton_model(crate::terminal::tmux::workspace_sync::TmuxSessions::new);
     timer.mark_interval_end("READ_USER_DEFAULTS_AND_INITIALIZE_SETTINGS");
 
     if FeatureFlag::UIZoom.is_enabled() {
@@ -2735,6 +2737,12 @@ pub(crate) fn app_callbacks(
             );
         })),
         on_will_terminate: Some(Box::new(move |ctx| {
+            // Quitting detaches every tmux session without killing anything (R25). Each origin
+            // PTY also flushes a detach when its event loop shuts down.
+            #[cfg(feature = "local_tty")]
+            if ctx.has_singleton_model::<crate::terminal::tmux::gateway::TmuxGateways>() {
+                crate::terminal::tmux::gateway::TmuxGateways::as_ref(ctx).detach_all();
+            }
             NotebookManager::handle(ctx).update(ctx, |manager, ctx| {
                 // Notebooks are only saved periodically, so ensure that any pending changes have
                 // been sent to the writer thread before terminating.

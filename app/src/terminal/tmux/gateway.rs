@@ -20,7 +20,7 @@ use warp_terminal::local_tty::tmux_gateway::{
     GatewayEvent, GatewayLink, GatewaySwitch, OriginFlags, PaneQueueLimits, PaneQueueReceiver,
     RefusalReason, TmuxRequest, WeakOriginFlags,
 };
-use warp_terminal::tmux::{ClientConfig, ClientEvent, CommandReply, PaneId};
+use warp_terminal::tmux::{ClientConfig, ClientEvent, CommandReply, PaneId, SessionModel};
 use warp_terminal::writeable_pty::Message;
 use warpui::{Entity, ModelContext, SingletonEntity};
 
@@ -73,6 +73,10 @@ struct Origin {
     flags: WeakOriginFlags,
     requests: TmuxRequestSender,
     pane_queues: HashMap<PaneId, PaneQueueReceiver>,
+    /// The engine's session model as of its last report, while a session runs.
+    model: Option<SessionModel>,
+    /// Between `Starting` and `Ended`.
+    in_session: bool,
 }
 
 /// The app's end of every PTY's tmux gateway. See the module docs.
@@ -149,6 +153,8 @@ impl TmuxGateways {
                 flags: flags.downgrade(),
                 requests: TmuxRequestSender(requests),
                 pane_queues: HashMap::new(),
+                model: None,
+                in_session: false,
             },
         );
         let link = GatewayLink {
@@ -183,12 +189,60 @@ impl TmuxGateways {
         self.origins.get_mut(&origin)?.pane_queues.remove(&pane_id)
     }
 
+    /// The session model of `origin`'s running session, as the engine last reported it. Tabs are
+    /// built from it when [`ClientEvent::Attached`] arrives.
+    pub fn model(&self, origin: TmuxOriginId) -> Option<&SessionModel> {
+        self.origins.get(&origin)?.model.as_ref()
+    }
+
+    /// Whether a control-mode session runs on `origin`.
+    pub fn is_in_session(&self, origin: TmuxOriginId) -> bool {
+        self.origins
+            .get(&origin)
+            .is_some_and(|origin| origin.in_session)
+    }
+
+    /// Every origin with a running session.
+    pub fn origins_in_session(&self) -> Vec<TmuxOriginId> {
+        let mut origins: Vec<_> = self
+            .origins
+            .iter()
+            .filter(|(_, origin)| origin.in_session)
+            .map(|(id, _)| *id)
+            .collect();
+        origins.sort();
+        origins
+    }
+
+    /// Detaches every running session without killing anything (quit, R25; the master setting
+    /// turning off, R22).
+    pub fn detach_all(&self) {
+        for origin in self.origins.values().filter(|origin| origin.in_session) {
+            origin.requests.send(TmuxRequest::Detach);
+        }
+    }
+
     fn sync_switch(&mut self, ctx: &mut ModelContext<Self>) {
         let enabled = TmuxSettings::as_ref(ctx).control_mode_enabled();
         if enabled != self.switch.is_enabled() {
             log::info!("tmux: control mode gateways {}", on_off(enabled));
             self.switch.set_enabled(enabled);
+            if !enabled {
+                // Turning the feature off restores today's behavior: no native sessions.
+                self.detach_all();
+            }
         }
+    }
+
+    /// Delivers `event` as if `origin`'s gateway had sent it.
+    #[cfg(test)]
+    pub fn deliver_for_test(
+        &mut self,
+        origin: TmuxOriginId,
+        event: GatewayEvent,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        self.on_gateway_event(origin, event, ctx);
     }
 
     fn on_gateway_event(
@@ -200,11 +254,21 @@ impl TmuxGateways {
         let event = match event {
             GatewayEvent::Starting => {
                 log::info!("tmux: control mode starting on origin {origin:?}");
+                if let Some(entry) = self.origins.get_mut(&origin) {
+                    entry.in_session = true;
+                    entry.model = None;
+                }
                 TmuxGatewayEvent::Starting { origin }
             }
             GatewayEvent::Refused(reason) => {
                 log::info!("tmux: staying raw on origin {origin:?}: {reason}");
                 TmuxGatewayEvent::Refused { origin, reason }
+            }
+            GatewayEvent::Model(model) => {
+                if let Some(entry) = self.origins.get_mut(&origin) {
+                    entry.model = Some(*model);
+                }
+                return;
             }
             GatewayEvent::Client(event) => {
                 log::debug!("tmux: origin {origin:?}: {event:?}");
@@ -225,6 +289,8 @@ impl TmuxGateways {
                 log::info!("tmux: control mode ended on origin {origin:?}");
                 if let Some(entry) = self.origins.get_mut(&origin) {
                     entry.pane_queues.clear();
+                    entry.in_session = false;
+                    entry.model = None;
                 }
                 TmuxGatewayEvent::Ended { origin }
             }

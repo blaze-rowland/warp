@@ -106,3 +106,47 @@ fn test_code_pane_snapshot_with_multiple_tabs() {
     assert_eq!(tabs[2].path, None);
     assert!(matches!(source, Some(CodeSource::Link { .. })));
 }
+
+fn terminal_leaf() -> PaneNodeSnapshot {
+    PaneNodeSnapshot::Leaf(LeafSnapshot {
+        is_focused: true,
+        custom_vertical_tabs_title: None,
+        contents: LeafContents::NetworkLog,
+    })
+}
+
+fn tmux_leaf(pane: u32) -> PaneNodeSnapshot {
+    PaneNodeSnapshot::Leaf(LeafSnapshot {
+        is_focused: false,
+        custom_vertical_tabs_title: None,
+        contents: LeafContents::TmuxPane(TmuxPaneSnapshot {
+            origin: TmuxOriginId::new_for_test(1),
+            pane_id: warp_terminal::tmux::PaneId(pane),
+            current_command: None,
+        }),
+    })
+}
+
+#[test]
+fn tabs_with_tmux_panes_are_recognized() {
+    assert!(!terminal_leaf().has_tmux_panes());
+    assert!(tmux_leaf(1).has_tmux_panes());
+    let split = PaneNodeSnapshot::Branch(BranchSnapshot {
+        direction: SplitDirection::Horizontal,
+        children: vec![(PaneFlex(1.), tmux_leaf(1)), (PaneFlex(1.), tmux_leaf(2))],
+    });
+    assert!(split.has_tmux_panes());
+}
+
+#[test]
+fn saving_while_attached_keeps_the_origin_tab_active_in_place_of_tmux_tabs() {
+    // Tabs: plain, hidden origin, tmux window 0 (active), tmux window 1, plain.
+    let dropped = [false, false, true, true, false];
+    // The active tmux tab hands off to the origin, saved as a normal tab at index 1.
+    assert_eq!(persisted_active_index(&dropped, 2), 1);
+    assert_eq!(persisted_active_index(&dropped, 3), 1);
+    // Kept tabs shift left past the dropped ones.
+    assert_eq!(persisted_active_index(&dropped, 4), 2);
+    assert_eq!(persisted_active_index(&dropped, 0), 0);
+    assert_eq!(persisted_active_index(&[true], 0), 0);
+}

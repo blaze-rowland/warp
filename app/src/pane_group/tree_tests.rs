@@ -782,3 +782,36 @@ fn test_hide_multiple_child_agent_panes() {
     assert_eq!(tree.visible_pane_ids(), vec![panes[0], panes[1]]);
     assert!(tree.is_pane_hidden(&panes[2]));
 }
+
+#[test]
+fn branch_flexes_round_trip_and_replace_root_keeps_panes() {
+    let panes = [
+        PaneId::dummy_pane_id(),
+        PaneId::dummy_pane_id(),
+        PaneId::dummy_pane_id(),
+    ];
+    let mut data = PaneData::new(panes[0]);
+    data.split(panes[0], panes[1], Direction::Right);
+    data.split(panes[1], panes[2], Direction::Down);
+    assert_eq!(data.root.branch_flexes().len(), 2);
+
+    let flexes = vec![vec![1.5, 0.5], vec![0.25, 1.75]];
+    assert!(data.root.set_branch_flexes(&flexes));
+    assert_eq!(data.root.branch_flexes(), flexes);
+    // A shape mismatch changes nothing.
+    assert!(!data.root.set_branch_flexes(&[vec![1.0, 1.0]]));
+    assert_eq!(data.root.branch_flexes(), flexes);
+
+    // Swap the two columns by rebuilding the root from the same pane ids.
+    let swapped = PaneData::new_branch(
+        SplitDirection::Horizontal,
+        vec![
+            (PaneFlex(1.0), PaneNode::Leaf(panes[2])),
+            (PaneFlex(1.0), PaneNode::Leaf(panes[0])),
+        ],
+        2,
+    );
+    data.replace_root(swapped.root);
+    assert_eq!(data.pane_ids(), vec![panes[2], panes[0]]);
+    assert_eq!(data.len(), 2);
+}

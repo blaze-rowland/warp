@@ -1131,7 +1131,6 @@ impl<S> TerminalManager<S> {
     }
 
     /// The tmux gateway origin of the running event loop, for the tmux workspace and pane backend.
-    #[allow(dead_code)]
     pub(crate) fn tmux_origin(&self) -> Option<TmuxOriginId> {
         self.tmux_origin
     }

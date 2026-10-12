@@ -18,6 +18,8 @@ pub(crate) mod orchestration_launch_modal;
 pub(crate) mod right_panel;
 mod startup_directory;
 mod tab_grouping;
+#[cfg(feature = "local_tty")]
+mod tmux_tabs;
 #[cfg(test)]
 #[path = "view_tests.rs"]
 pub(crate) mod tests;
@@ -1566,6 +1568,17 @@ impl Workspace {
         if let Some(tab_index) = self.current_workspace_state.tab_being_renamed() {
             self.current_workspace_state.clear_tab_being_renamed();
             let title = self.tab_rename_editor.as_ref(ctx).buffer_text(ctx);
+            // Renaming a tmux tab renames its window; tmux's rename notice sets the title.
+            #[cfg(feature = "local_tty")]
+            if self.tabs[tab_index].pane_group.as_ref(ctx).is_tmux_tab() {
+                let changed = self.tabs[tab_index].pane_group.as_ref(ctx).display_title(ctx) != title;
+                if changed && !title.trim().is_empty() {
+                    self.tmux_rename_tab(tab_index, &title, ctx);
+                }
+                self.clear_tab_name_editor(ctx);
+                ctx.notify();
+                return;
+            }
             let tab = &self.tabs[tab_index];
             tab.pane_group.update(ctx, |view, ctx| {
                 // Only update the title if it was actually changed. Otherwise, lets assume
@@ -3615,6 +3628,8 @@ impl Workspace {
         // any) read from `GlobalResourceHandles`. Subsequent updates are
         // pushed by `subscribe_to_settings_errors` and `dismiss_workspace_banner`.
         ws.sync_settings_error_state_into_settings_pane(ctx);
+        #[cfg(feature = "local_tty")]
+        ws.subscribe_to_tmux_sessions(ctx);
 
         let weak_handle = ctx.handle();
         WorkspaceRegistry::handle(ctx).update(ctx, |registry, _| {
@@ -5364,6 +5379,28 @@ impl Workspace {
         self.tabs.len()
     }
 
+    /// cmd+T and `+` in a tmux tab create a tmux window instead of a local tab (R28).
+    fn tmux_new_window_in_active_tab(&mut self, ctx: &mut ViewContext<Self>) -> bool {
+        #[cfg(feature = "local_tty")]
+        return self.tmux_new_window(ctx);
+        #[cfg(not(feature = "local_tty"))]
+        {
+            let _ = ctx;
+            false
+        }
+    }
+
+    /// Which tabs are hidden tmux origin tabs, by tab index (KTD4).
+    pub(crate) fn hidden_tab_flags(&self) -> Vec<bool> {
+        self.tabs.iter().map(|tab| tab.hidden_for_tmux).collect()
+    }
+
+    /// `index`, or the closest visible tab when `index` is a hidden tmux origin tab.
+    pub(crate) fn visible_tab_index(&self, index: usize) -> usize {
+        crate::terminal::tmux::hidden_tabs::nearest_visible(&self.hidden_tab_flags(), index)
+            .unwrap_or(index)
+    }
+
     #[cfg(test)]
     pub fn tab_mru_order(&self) -> &[EntityId] {
         &self.tab_mru_order
@@ -5507,6 +5544,8 @@ impl Workspace {
     /// This function is meant to be used by other actions to perform the logic to update the
     /// view's state. It's not meant to be invoked directly by an action.
     pub fn activate_tab_internal(&mut self, index: usize, ctx: &mut ViewContext<Self>) {
+        // A hidden tmux origin tab is never shown; land on the closest visible tab instead.
+        let index = self.visible_tab_index(index);
         if index < self.tab_count() {
             // If the command palette is open when the tab is switched using a keybinding,
             // we want to close the palette so that we don't get into a state where the palette
@@ -6973,6 +7012,30 @@ impl Workspace {
         let shortcut_label = keybinding_name_to_display_string(NEW_TAB_BINDING_NAME, ctx);
         let reopen_closed_session_shortcut_label =
             keybinding_name_to_display_string("app:reopen_closed_session", ctx);
+
+        // 0. Inside a tmux tab, `+` and cmd+T make a tmux window; a plain local tab stays one
+        // click away (R28).
+        let in_tmux_tab = self
+            .tabs
+            .get(self.active_tab_index)
+            .is_some_and(|tab| tab.pane_group.as_ref(ctx).is_tmux_tab());
+        if in_tmux_tab {
+            menu_items.push(
+                MenuItemFields::new("New tmux window")
+                    .with_on_select_action(WorkspaceAction::AddDefaultTab)
+                    .with_icon(icons::Icon::Grid)
+                    .with_key_shortcut_label(shortcut_label.clone())
+                    .into_item(),
+            );
+            menu_items.push(
+                MenuItemFields::new("New local tab")
+                    .with_on_select_action(WorkspaceAction::AddTerminalTab {
+                        hide_homepage: false,
+                    })
+                    .with_icon(icons::Icon::Terminal)
+                    .into_item(),
+            );
+        }
 
         // 1. Agent (if AI enabled)
         if is_any_ai_enabled {
@@ -11905,10 +11968,20 @@ impl Workspace {
         } else {
             None
         };
+        // tmux tabs belong to the tmux server and are never saved; the hidden origin tab is
+        // saved as a normal visible tab, so relaunching restores a shell (KTD4).
+        let tmux_tabs: Vec<bool> = self
+            .tabs
+            .iter()
+            .map(|tab| tab.pane_group.as_ref(app).is_tmux_tab())
+            .collect();
+        let active_tab_index =
+            crate::app_state::persisted_active_index(&tmux_tabs, active_tab_index);
         let tabs: Vec<TabSnapshot> = self
             .tab_views()
             .enumerate()
             .filter(|(tab_index, _)| Some(*tab_index) != transferred_tab_index)
+            .filter(|(tab_index, _)| !tmux_tabs[*tab_index])
             .map(|(tab_index, pane_group_view)| {
                 let resizable_data = ResizableData::handle(app);
                 let modal_sizes = resizable_data.as_ref(app).get_all_handles(window_id);
@@ -12191,11 +12264,12 @@ impl Workspace {
 
     pub fn activate_prev_tab(&mut self, ctx: &mut ViewContext<Self>) {
         let index = if self.vertical_tabs_panel.search_query.is_empty() {
-            if self.active_tab_index > 0 {
-                self.active_tab_index - 1
-            } else {
-                self.tabs.len() - 1
-            }
+            crate::terminal::tmux::hidden_tabs::step_visible(
+                &self.hidden_tab_flags(),
+                self.active_tab_index,
+                false,
+            )
+            .unwrap_or(self.active_tab_index)
         } else {
             let matching = self.vertical_tabs_panel.matching_tab_indices(
                 &self.tabs,
@@ -12216,11 +12290,12 @@ impl Workspace {
 
     pub fn activate_next_tab(&mut self, ctx: &mut ViewContext<Self>) {
         let index = if self.vertical_tabs_panel.search_query.is_empty() {
-            if self.active_tab_index + 1 < self.tabs.len() {
-                self.active_tab_index + 1
-            } else {
-                0
-            }
+            crate::terminal::tmux::hidden_tabs::step_visible(
+                &self.hidden_tab_flags(),
+                self.active_tab_index,
+                true,
+            )
+            .unwrap_or(self.active_tab_index)
         } else {
             let matching = self.vertical_tabs_panel.matching_tab_indices(
                 &self.tabs,
@@ -12239,8 +12314,10 @@ impl Workspace {
     }
 
     pub fn activate_last_tab(&mut self, ctx: &mut ViewContext<Self>) {
-        if self.tabs.len() > 1 {
-            let target_index = self.tabs.len() - 1;
+        if self.tabs.len() > 1
+            && let Some(target_index) =
+                crate::terminal::tmux::hidden_tabs::last_visible(&self.hidden_tab_flags())
+        {
             self.activate_tab(target_index, ctx);
         }
     }
@@ -12409,7 +12486,31 @@ impl Workspace {
         add_to_undo_stack: bool,
         ctx: &mut ViewContext<Self>,
     ) -> bool {
-        let tab_indices_vec = tab_indices.collect_vec();
+        let mut tab_indices_vec = tab_indices.collect_vec();
+        // A hidden tmux origin tab is never closed by the user. A tmux tab closes by killing its
+        // window (R25), which removes the tab once tmux reports it.
+        tab_indices_vec.retain(|index| {
+            self.tabs
+                .get(*index)
+                .is_some_and(|tab| !tab.hidden_for_tmux)
+        });
+        #[cfg(feature = "local_tty")]
+        {
+            let tmux_tabs: Vec<usize> = tab_indices_vec
+                .iter()
+                .copied()
+                .filter(|index| self.tabs[*index].pane_group.as_ref(ctx).is_tmux_tab())
+                .collect();
+            if !tmux_tabs.is_empty() {
+                tab_indices_vec.retain(|index| !tmux_tabs.contains(index));
+                for index in tmux_tabs.into_iter().rev() {
+                    self.tmux_close_tab(index, ctx);
+                }
+                if tab_indices_vec.is_empty() {
+                    return false;
+                }
+            }
+        }
         // Check if there are any tabs that can't be closed without confirmation
         if !skip_confirmation && self.should_confirm_close_session(ctx) {
             for i in tab_indices_vec.iter() {
@@ -16345,8 +16446,21 @@ impl Workspace {
                 });
 
                 if let Some(tab_index) = tab {
+                    // tmux decides when a tmux tab or the hidden origin tab goes away: the origin
+                    // must survive its shell's exit while attached so the session's end lands
+                    // there (R24).
+                    let tab_data = &self.tabs[tab_index];
+                    if tab_data.hidden_for_tmux || tab_data.pane_group.as_ref(ctx).is_tmux_tab() {
+                        return;
+                    }
                     self.close_tab(tab_index, true, *add_to_undo_stack, ctx);
                 }
+            }
+            pane_group::Event::TmuxReattachRequested { origin } => {
+                #[cfg(feature = "local_tty")]
+                self.tmux_reattach(*origin, ctx);
+                #[cfg(not(feature = "local_tty"))]
+                let _ = origin;
             }
             pane_group::Event::PaneTitleUpdated => {
                 self.update_window_title(ctx);
@@ -20303,6 +20417,9 @@ impl Workspace {
             // instead, dragging the whole group rather than orphaning it.
             let is_sole_member = group_has_single_member(&self.tabs, group.id);
             for idx in member_range {
+                if self.tabs[idx].hidden_for_tmux {
+                    continue;
+                }
                 // Insertion divider before this member when a pane drop lands
                 // here (into the group at `idx`).
                 if show_before_indicator(self.hovered_tab_index, idx, Some(group.id)) {
@@ -24186,7 +24303,15 @@ impl TypedActionView for Workspace {
 
         match action {
             ActivateTab(index) => self.activate_tab(*index, ctx),
-            ActivateTabByNumber(num) => self.activate_tab(num.saturating_sub(1), ctx),
+            ActivateTabByNumber(num) => {
+                // cmd+N counts visible tabs only, so a hidden tmux origin tab is skipped.
+                if let Some(index) = crate::terminal::tmux::hidden_tabs::visible_to_raw(
+                    &self.hidden_tab_flags(),
+                    num.saturating_sub(1),
+                ) {
+                    self.activate_tab(index, ctx);
+                }
+            }
             SetTabShortcutModifierKey { key_code, pressed } => {
                 TabShortcutModifierState::handle(ctx).update(ctx, |state, ctx| {
                     state.set_key_held(*key_code, *pressed, ctx);
@@ -24351,6 +24476,7 @@ impl TypedActionView for Workspace {
                     self.unpin_tab_group(group_id, ctx);
                 }
             }
+            AddDefaultTab if self.tmux_new_window_in_active_tab(ctx) => {}
             AddDefaultTab => {
                 let effective_mode = AISettings::as_ref(ctx).default_session_mode(ctx);
                 match effective_mode {
@@ -28451,6 +28577,23 @@ impl Workspace {
             } else {
                 None
             };
+            // A hidden tmux origin tab takes no slot in the tab bar. Inside a group's run it
+            // keeps the run contiguous; the group skips it when rendering members.
+            if tab.hidden_for_tmux {
+                if let (
+                    Some(group_id),
+                    Some(TabBarSlot::Group {
+                        group_id: last_gid,
+                        run_len,
+                        ..
+                    }),
+                ) = (group_id, slots.last_mut())
+                    && *last_gid == group_id
+                {
+                    *run_len += 1;
+                }
+                continue;
+            }
             match group_id {
                 Some(group_id) => {
                     if let Some(TabBarSlot::Group {
@@ -28918,7 +29061,12 @@ impl Workspace {
         }
 
         let source_is_single_tab = self.tabs.len() == 1;
+        // tmux tabs stay in the window that holds their session (U7 step 6).
+        let tab_bound_to_tmux_session = self.tabs.get(current_index).is_some_and(|tab| {
+            tab.hidden_for_tmux || tab.pane_group.as_ref(ctx).is_tmux_tab()
+        }) || self.tabs.iter().any(|tab| tab.hidden_for_tmux) && source_is_single_tab;
         if (is_drag_outside_tab_bar || source_is_single_tab)
+            && !tab_bound_to_tmux_session
             && FeatureFlag::DragTabsToWindows.is_enabled()
         {
             let source_was_single_tab = source_is_single_tab;

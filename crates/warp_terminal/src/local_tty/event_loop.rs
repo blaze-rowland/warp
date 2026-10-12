@@ -10,13 +10,14 @@ use std::marker::Send;
 use std::ops::DerefMut;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use log::error;
 use mio::{self, Events, Interest};
 use parking_lot::{FairMutex, FairMutexGuard};
 
 use super::mio_channel::Receiver;
-use super::tmux_gateway::{Gateway, GatewayLink, Routed};
+use super::tmux_gateway::{Gateway, GatewayLink, Routed, TmuxRequest};
 use crate::event::{ExitReason, ObservedExitStatus};
 use crate::event_listener::ChannelEventListener;
 use crate::local_tty;
@@ -29,6 +30,9 @@ const READ_BUFFER_SIZE: usize = 0x4_0000;
 /// Max bytes to process from the PTY while holding the lock before giving
 /// someone else an opportunity to lock it.
 const MAX_LOCKED_READ: usize = 0x1_0000;
+
+/// How long a shutdown waits for a tmux detach line to reach the PTY.
+const SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_millis(250);
 
 pub const CHANNEL_TOKEN: mio::Token = mio::Token(0);
 pub const PTY_TOKEN: mio::Token = mio::Token(1);
@@ -180,6 +184,7 @@ where
             match msg {
                 Message::Input(input) => state.write_list.push_back(input),
                 Message::Shutdown => {
+                    self.detach_tmux_for_shutdown(state);
                     return ChannelResult::TerminateLoop {
                         child_exited: false,
                     };
@@ -194,6 +199,33 @@ where
         }
 
         ChannelResult::Continue
+    }
+
+    /// A shutdown (window close, quit, or dropping the origin pane) while a tmux session runs on
+    /// this PTY detaches the control client and flushes the detach line before the loop ends, so
+    /// the session keeps running (R25). Queued writes are otherwise dropped on shutdown.
+    fn detach_tmux_for_shutdown(&mut self, state: &mut State) {
+        let Some(gateway) = self.tmux_gateway.as_mut() else {
+            return;
+        };
+        if !gateway.in_session() {
+            return;
+        }
+        gateway.request(TmuxRequest::Detach, &mut state.write_list);
+        let deadline = instant::Instant::now() + SHUTDOWN_FLUSH_TIMEOUT;
+        while state.needs_write() && instant::Instant::now() < deadline {
+            let mut can_write = true;
+            if let Err(err) = self.pty_write(state, &mut can_write) {
+                log::warn!("tmux: could not flush the detach on shutdown: {err}");
+                return;
+            }
+            if !can_write {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+        if state.needs_write() {
+            log::warn!("tmux: the detach did not flush before shutdown");
+        }
     }
 
     /// Returns a `bool` indicating whether or not the event loop should continue running.

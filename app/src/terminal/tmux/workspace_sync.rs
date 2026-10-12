@@ -1,0 +1,680 @@
+//! tmux sessions as Warp tabs: the session registry, tagged tmux commands, and the pure planning
+//! the workspace uses to keep tabs in sync with a session (U7, KTD4, R23–R25, R28, R29).
+//!
+//! - [`TmuxSessions`] follows every gateway. It knows each session's name, host and status
+//!   (attached, not responding, disconnected), routes command replies to their callbacks, and
+//!   re-emits what workspaces need as [`TmuxSessionEvent`]s.
+//! - [`plan_window_sync`] diffs a session model against the tabs a workspace shows. Layouts within
+//!   a tab diff by pane id in [`super::layout_snapshot`].
+//! - The command builders here are the only place Warp actions become tmux commands. Only an
+//!   explicit close sends `kill-pane` or `kill-window` (R25, KTD3).
+
+use std::collections::HashMap;
+
+use warp_terminal::local_tty::tmux_gateway::TmuxRequest;
+use warp_terminal::tmux::{
+    ClientEvent, CommandReply, PaneId, SessionId, SessionModel, TmuxWindow, WindowId,
+};
+use warpui::{AppContext, Entity, ModelContext, SingletonEntity};
+
+pub use super::hidden_tabs::{
+    last_visible, nearest_visible, raw_to_visible, step_visible, visible_to_raw,
+};
+use super::TmuxOriginId;
+use super::gateway::{TmuxGatewayEvent, TmuxGateways};
+use super::pane_manager::WINDOW_SIZE_COMMAND_TAG;
+use crate::terminal::shell::ShellType;
+
+/// Longest tab title taken from a tmux window name.
+pub const MAX_TITLE_CHARS: usize = 120;
+
+// Window planning.
+
+/// A tab a workspace shows for one tmux window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenTab {
+    pub window_id: WindowId,
+    pub title: String,
+}
+
+/// One change that brings a workspace's tabs in line with a session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WindowOp {
+    /// Open a tab for a window that has a layout.
+    Open { window_id: WindowId, title: String },
+    /// The window is gone; remove its tab. tmux already closed it, so nothing is sent.
+    Close { window_id: WindowId },
+    /// Apply the window's current layout to its tab (a no-op when nothing changed).
+    Update { window_id: WindowId },
+    /// The window's name changed.
+    Rename { window_id: WindowId, title: String },
+}
+
+/// Diffs `model` against the tabs a workspace shows for it. Closes come first, then windows in
+/// tmux index order. Windows whose layout is not known yet wait for it.
+pub fn plan_window_sync(model: &SessionModel, open: &[OpenTab]) -> Vec<WindowOp> {
+    let mut ops: Vec<WindowOp> = open
+        .iter()
+        .filter(|tab| model.window(tab.window_id).is_none())
+        .map(|tab| WindowOp::Close {
+            window_id: tab.window_id,
+        })
+        .collect();
+    let mut windows: Vec<&TmuxWindow> = model.windows().collect();
+    windows.sort_by_key(|window| (window.index.unwrap_or(u32::MAX), window.id));
+    for window in windows {
+        let title = window_title(window);
+        match open.iter().find(|tab| tab.window_id == window.id) {
+            Some(tab) => {
+                ops.push(WindowOp::Update {
+                    window_id: window.id,
+                });
+                if tab.title != title {
+                    ops.push(WindowOp::Rename {
+                        window_id: window.id,
+                        title,
+                    });
+                }
+            }
+            None if window.layout.is_some() => ops.push(WindowOp::Open {
+                window_id: window.id,
+                title,
+            }),
+            None => {}
+        }
+    }
+    ops
+}
+
+/// Where a new window's tab goes among a session's tabs, given the tmux indices of the tabs
+/// already open in tab order: after every tab with a lower index.
+pub fn insertion_offset(open_indices: &[u32], new_index: u32) -> usize {
+    open_indices
+        .iter()
+        .filter(|index| **index < new_index)
+        .count()
+}
+
+// Titles and tooltips.
+
+/// A window name made safe for a tab title: control characters (C0, DEL and C1, which carry
+/// escape sequences) removed, trimmed and bounded.
+pub fn sanitize_title(raw: &str) -> String {
+    let cleaned: String = raw.chars().filter(|c| !c.is_control()).collect();
+    cleaned.trim().chars().take(MAX_TITLE_CHARS).collect()
+}
+
+/// A window's tab title: its sanitized name, or its index when the name is empty.
+pub fn window_title(window: &TmuxWindow) -> String {
+    let title = window
+        .name
+        .as_deref()
+        .map(sanitize_title)
+        .unwrap_or_default();
+    if !title.is_empty() {
+        return title;
+    }
+    window
+        .index
+        .map(|index| index.to_string())
+        .unwrap_or_else(|| "tmux".to_owned())
+}
+
+/// The tooltip on a tmux tab (R28).
+pub fn session_tooltip(session: &str, host: &str) -> String {
+    format!("tmux session {session} on {host}")
+}
+
+// Session end (R24).
+
+/// How a session ended, for the line the origin tab shows when it returns.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionEnd {
+    /// `%exit`, with tmux's reason when it gave one.
+    Exited(Option<String>),
+    /// tmux exited before attaching.
+    AttachFailed(Option<String>),
+    /// The transport or the reply stream broke.
+    Disconnected,
+}
+
+/// The line the origin tab shows when the session ends, naming the session and how it ended.
+pub fn end_line(session: &str, end: &SessionEnd) -> String {
+    match end {
+        SessionEnd::Exited(Some(reason)) => {
+            let reason = sanitize_title(reason);
+            if reason.contains("detached") {
+                format!("[detached from {session}]")
+            } else if reason.is_empty() {
+                format!("[exited from {session}]")
+            } else {
+                format!("[{reason}: {session}]")
+            }
+        }
+        SessionEnd::Exited(None) => format!("[exited from {session}]"),
+        SessionEnd::AttachFailed(Some(error)) => format!("[tmux: {}]", sanitize_title(error)),
+        SessionEnd::AttachFailed(None) => "[tmux: could not attach]".to_owned(),
+        SessionEnd::Disconnected => format!("[lost connection to {session}]"),
+    }
+}
+
+// Close confirmation (R25).
+
+/// Whether `command` (a `#{pane_current_command}`) is an idle shell, which closes without asking.
+pub fn is_idle_shell(command: Option<&str>) -> bool {
+    let Some(command) = command.map(str::trim).filter(|c| !c.is_empty()) else {
+        return true;
+    };
+    if ShellType::from_name(command).is_some() {
+        return true;
+    }
+    let name = command.trim_start_matches('-');
+    let name = name.rsplit('/').next().unwrap_or(name);
+    matches!(name, "sh" | "dash" | "ksh" | "mksh" | "tcsh" | "csh" | "nu" | "xonsh")
+}
+
+/// The commands other than idle shells in a `#{pane_current_command}` reply.
+pub fn busy_commands(reply: &CommandReply) -> Vec<String> {
+    if reply.error {
+        return Vec::new();
+    }
+    reply
+        .lines
+        .iter()
+        .map(|line| sanitize_title(&String::from_utf8_lossy(line)))
+        .filter(|command| !is_idle_shell(Some(command)))
+        .collect()
+}
+
+/// The confirmation text for killing panes running `commands`.
+pub fn close_confirmation_text(commands: &[String]) -> String {
+    let names = match commands {
+        [] => "A process".to_owned(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    };
+    let verb = if commands.len() > 1 { "are" } else { "is" };
+    let pronoun = if commands.len() > 1 { "They" } else { "It" };
+    format!("{names} {verb} still running. {pronoun} will be stopped.")
+}
+
+/// Asks before killing tmux panes or windows that run something (R25). `on_confirm` sends the
+/// kill; cancelling sends nothing.
+pub fn show_kill_confirmation(
+    title: &str,
+    text: String,
+    on_confirm: impl FnOnce(&mut AppContext) + 'static,
+    ctx: &mut AppContext,
+) {
+    use warpui::modals::{AlertDialogWithCallbacks, ModalButton};
+
+    let dialog = AlertDialogWithCallbacks::for_app(
+        title,
+        text,
+        vec![
+            ModalButton::for_app("Yes, close".to_owned(), on_confirm),
+            ModalButton::for_app("Cancel".to_owned(), |_| {}),
+        ],
+        |_| {},
+    );
+    if cfg!(target_os = "macos") {
+        ctx.show_native_platform_modal(dialog);
+        return;
+    }
+    let Some(window_id) = ctx.windows().active_window() else {
+        return;
+    };
+    if let Some(workspace) = ctx
+        .views_of_type::<crate::workspace::Workspace>(window_id)
+        .and_then(|workspaces| workspaces.first().cloned())
+    {
+        workspace.update(ctx, |workspace, ctx| workspace.show_native_modal(dialog, ctx));
+    }
+}
+
+// Command builders: Warp actions as tmux commands. U9 adds its launcher where panes and windows
+// are created (`split_window_command`, `new_window_command`).
+
+/// Where a Warp split puts the new pane relative to the target pane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SplitPlacement {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// Splits `target` the way a Warp split would, starting in the pane's directory.
+pub fn split_window_command(target: PaneId, placement: SplitPlacement) -> String {
+    let flags = match placement {
+        SplitPlacement::Right => "-h",
+        SplitPlacement::Left => "-h -b",
+        SplitPlacement::Down => "-v",
+        SplitPlacement::Up => "-v -b",
+    };
+    format!("split-window {flags} -t {target} -c '#{{pane_current_path}}'")
+}
+
+/// Kills a pane. Only an explicit close sends this (R25).
+pub fn kill_pane_command(pane_id: PaneId) -> String {
+    format!("kill-pane -t {pane_id}")
+}
+
+/// Kills a window. Only an explicit close sends this (R25).
+pub fn kill_window_command(window_id: WindowId) -> String {
+    format!("kill-window -t {window_id}")
+}
+
+/// A new window after `after` (the active tab's window), in its directory.
+pub fn new_window_command(after: Option<WindowId>) -> String {
+    match after {
+        Some(window_id) => format!("new-window -a -t {window_id} -c '#{{pane_current_path}}'"),
+        None => "new-window".to_owned(),
+    }
+}
+
+pub fn rename_window_command(window_id: WindowId, name: &str) -> String {
+    format!(
+        "rename-window -t {window_id} {}",
+        quote_argument(&sanitize_title(name))
+    )
+}
+
+pub fn select_window_command(window_id: WindowId) -> String {
+    format!("select-window -t {window_id}")
+}
+
+pub fn select_pane_command(pane_id: PaneId) -> String {
+    format!("select-pane -t {pane_id}")
+}
+
+/// Asks for the foreground command of every pane in a window.
+pub fn window_commands_query(window_id: WindowId) -> String {
+    format!("list-panes -t {window_id} -F '#{{pane_current_command}}'")
+}
+
+/// Asks for a pane's foreground command.
+pub fn pane_command_query(pane_id: PaneId) -> String {
+    format!("display-message -p -t {pane_id} '#{{pane_current_command}}'")
+}
+
+/// The shell command Reattach runs in the origin pane.
+pub fn reattach_command(session: &str) -> String {
+    format!(
+        "tmux -CC attach -t '{}'",
+        sanitize_title(session).replace('\'', "'\\''")
+    )
+}
+
+/// A double-quoted tmux command argument. `$` is escaped so no variable is expanded.
+fn quote_argument(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for c in value.chars() {
+        if matches!(c, '"' | '\\' | '$') {
+            quoted.push('\\');
+        }
+        quoted.push(c);
+    }
+    quoted.push('"');
+    quoted
+}
+
+// Duplicate sessions.
+
+/// What makes two attaches the same session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionKey {
+    pub host: String,
+    pub session_id: SessionId,
+    pub name: String,
+}
+
+/// Another origin already attached to the session `key` names.
+pub fn find_duplicate(
+    sessions: &[(TmuxOriginId, SessionKey)],
+    origin: TmuxOriginId,
+    key: &SessionKey,
+) -> Option<TmuxOriginId> {
+    sessions
+        .iter()
+        .find(|(other, other_key)| *other != origin && other_key == key)
+        .map(|(other, _)| *other)
+}
+
+// The session registry.
+
+/// Where a session is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionStatus {
+    /// The handshake is running.
+    Starting,
+    Attached,
+    /// A command has gone unanswered for 3 seconds (KTD13).
+    NotResponding,
+    /// The transport or reply stream broke; tabs stay, read-only, until reattached or closed.
+    Disconnected,
+}
+
+/// What the registry knows about one origin's session.
+#[derive(Clone, Debug)]
+pub struct SessionInfo {
+    pub name: String,
+    pub session_id: Option<SessionId>,
+    /// The host the session runs on, once the workspace reports it.
+    pub host: Option<String>,
+    pub status: SessionStatus,
+    end: Option<SessionEnd>,
+    /// This attach duplicated a session another origin already shows.
+    duplicate_of: Option<TmuxOriginId>,
+}
+
+impl SessionInfo {
+    fn new() -> Self {
+        Self {
+            name: String::new(),
+            session_id: None,
+            host: None,
+            status: SessionStatus::Starting,
+            end: None,
+            duplicate_of: None,
+        }
+    }
+
+    /// The tab tooltip (R28).
+    pub fn tooltip(&self) -> String {
+        session_tooltip(&self.name, self.host.as_deref().unwrap_or("this computer"))
+    }
+
+    pub fn is_duplicate(&self) -> bool {
+        self.duplicate_of.is_some()
+    }
+}
+
+/// What workspaces act on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TmuxSessionEvent {
+    /// The session attached (or switched sessions): build its tabs from the model.
+    Attached { origin: TmuxOriginId },
+    /// Windows were added, closed, renamed or re-laid out.
+    WindowsChanged { origin: TmuxOriginId },
+    ActiveWindowChanged {
+        origin: TmuxOriginId,
+        window_id: WindowId,
+    },
+    ActivePaneChanged {
+        origin: TmuxOriginId,
+        window_id: WindowId,
+        pane_id: PaneId,
+    },
+    /// Status, name or host changed: redraw banners and tooltips.
+    StatusChanged { origin: TmuxOriginId },
+    /// The session is over: remove its tabs and bring back the origin tab with `line`.
+    Ended {
+        origin: TmuxOriginId,
+        line: Option<String>,
+    },
+    /// Focus this already-attached session's tabs.
+    Focus { origin: TmuxOriginId },
+}
+
+/// Called with a tagged command's reply. It runs inside the registry's update, so it gets the
+/// registry to send follow-up commands with.
+pub type ReplyCallback =
+    Box<dyn FnOnce(&CommandReply, &mut TmuxSessions, &mut ModelContext<TmuxSessions>)>;
+
+/// Every tmux session in this Warp instance. See the module docs.
+pub struct TmuxSessions {
+    sessions: HashMap<TmuxOriginId, SessionInfo>,
+    pending: HashMap<(TmuxOriginId, u64), ReplyCallback>,
+    next_tag: u64,
+}
+
+impl Entity for TmuxSessions {
+    type Event = TmuxSessionEvent;
+}
+
+impl SingletonEntity for TmuxSessions {}
+
+impl TmuxSessions {
+    pub fn new(ctx: &mut ModelContext<Self>) -> Self {
+        ctx.subscribe_to_model(&TmuxGateways::handle(ctx), |me, _, event, ctx| {
+            me.on_gateway_event(event, ctx);
+        });
+        Self {
+            sessions: HashMap::new(),
+            pending: HashMap::new(),
+            next_tag: 1,
+        }
+    }
+
+    pub fn session(&self, origin: TmuxOriginId) -> Option<&SessionInfo> {
+        self.sessions.get(&origin)
+    }
+
+    pub fn status(&self, origin: TmuxOriginId) -> Option<SessionStatus> {
+        self.sessions.get(&origin).map(|session| session.status)
+    }
+
+    /// Sends one command line to `origin`'s session. `on_reply` runs once with its reply.
+    /// Returns the tag, or `None` when the origin is gone.
+    pub fn send_command(
+        &mut self,
+        origin: TmuxOriginId,
+        line: String,
+        on_reply: Option<ReplyCallback>,
+        ctx: &mut ModelContext<Self>,
+    ) -> Option<u64> {
+        let sender = TmuxGateways::as_ref(ctx).request_sender(origin)?;
+        let tag = self.next_tag;
+        self.next_tag += 1;
+        if self.next_tag == WINDOW_SIZE_COMMAND_TAG {
+            self.next_tag = 1;
+        }
+        if !sender.send(TmuxRequest::Command { tag, line }) {
+            return None;
+        }
+        if let Some(on_reply) = on_reply {
+            self.pending.insert((origin, tag), on_reply);
+        }
+        Some(tag)
+    }
+
+    /// Records the host a session runs on and checks whether another origin already shows the
+    /// same session. Returns that origin; the caller detaches this one and the registry asks
+    /// workspaces to focus the existing tabs.
+    pub fn register_host(
+        &mut self,
+        origin: TmuxOriginId,
+        host: String,
+        ctx: &mut ModelContext<Self>,
+    ) -> Option<TmuxOriginId> {
+        let session = self.sessions.get_mut(&origin)?;
+        session.host = Some(host.clone());
+        let key = SessionKey {
+            host,
+            session_id: session.session_id?,
+            name: session.name.clone(),
+        };
+        let others: Vec<(TmuxOriginId, SessionKey)> = self
+            .sessions
+            .iter()
+            .filter(|(_, other)| {
+                other.duplicate_of.is_none()
+                    && matches!(
+                        other.status,
+                        SessionStatus::Attached | SessionStatus::NotResponding
+                    )
+            })
+            .filter_map(|(other, info)| {
+                Some((
+                    *other,
+                    SessionKey {
+                        host: info.host.clone()?,
+                        session_id: info.session_id?,
+                        name: info.name.clone(),
+                    },
+                ))
+            })
+            .collect();
+        let duplicate = find_duplicate(&others, origin, &key);
+        if let Some(existing) = duplicate {
+            if let Some(session) = self.sessions.get_mut(&origin) {
+                session.duplicate_of = Some(existing);
+            }
+            ctx.emit(TmuxSessionEvent::Focus { origin: existing });
+        }
+        ctx.emit(TmuxSessionEvent::StatusChanged { origin });
+        duplicate
+    }
+
+    /// Sends a detach to `origin`'s session.
+    pub fn detach(&self, origin: TmuxOriginId, ctx: &AppContext) {
+        if let Some(sender) = TmuxGateways::as_ref(ctx).request_sender(origin) {
+            sender.send(TmuxRequest::Detach);
+        }
+    }
+
+    /// Forgets a disconnected session whose tabs were closed.
+    pub fn forget(&mut self, origin: TmuxOriginId) {
+        if self
+            .sessions
+            .get(&origin)
+            .is_some_and(|session| session.status == SessionStatus::Disconnected)
+        {
+            self.sessions.remove(&origin);
+        }
+    }
+
+    fn on_gateway_event(&mut self, event: &TmuxGatewayEvent, ctx: &mut ModelContext<Self>) {
+        match event {
+            TmuxGatewayEvent::Starting { origin } => {
+                let session = self.sessions.entry(*origin).or_insert_with(SessionInfo::new);
+                session.status = SessionStatus::Starting;
+                session.end = None;
+                session.duplicate_of = None;
+            }
+            TmuxGatewayEvent::Client { origin, event } => {
+                self.on_client_event(*origin, event, ctx);
+            }
+            TmuxGatewayEvent::CommandCompleted { origin, tag, reply } => {
+                if let Some(callback) = self.pending.remove(&(*origin, *tag)) {
+                    callback(reply, self, ctx);
+                }
+            }
+            TmuxGatewayEvent::Ended { origin } => self.on_ended(*origin, ctx),
+            TmuxGatewayEvent::Refused { .. } | TmuxGatewayEvent::PaneQueueReady { .. } => {}
+        }
+    }
+
+    fn on_client_event(
+        &mut self,
+        origin: TmuxOriginId,
+        event: &ClientEvent,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let Some(session) = self.sessions.get_mut(&origin) else {
+            return;
+        };
+        match event {
+            ClientEvent::Attached {
+                session_id,
+                session_name,
+            }
+            | ClientEvent::SessionChanged {
+                session_id,
+                name: session_name,
+            } => {
+                session.session_id = Some(*session_id);
+                session.name = sanitize_title(session_name);
+                session.status = SessionStatus::Attached;
+                session.end = None;
+                ctx.emit(TmuxSessionEvent::Attached { origin });
+            }
+            ClientEvent::SessionRenamed { name } => {
+                session.name = sanitize_title(name);
+                ctx.emit(TmuxSessionEvent::StatusChanged { origin });
+            }
+            ClientEvent::WindowAdded { .. }
+            | ClientEvent::WindowClosed { .. }
+            | ClientEvent::WindowRenamed { .. }
+            | ClientEvent::LayoutChanged { .. } => {
+                ctx.emit(TmuxSessionEvent::WindowsChanged { origin });
+            }
+            ClientEvent::ActiveWindowChanged { window_id } => {
+                ctx.emit(TmuxSessionEvent::ActiveWindowChanged {
+                    origin,
+                    window_id: *window_id,
+                });
+            }
+            ClientEvent::ActivePaneChanged { window_id, pane_id } => {
+                ctx.emit(TmuxSessionEvent::ActivePaneChanged {
+                    origin,
+                    window_id: *window_id,
+                    pane_id: *pane_id,
+                });
+            }
+            ClientEvent::NotResponding { .. } => {
+                if session.status == SessionStatus::Attached {
+                    session.status = SessionStatus::NotResponding;
+                    ctx.emit(TmuxSessionEvent::StatusChanged { origin });
+                }
+            }
+            ClientEvent::Responding => {
+                if session.status == SessionStatus::NotResponding {
+                    session.status = SessionStatus::Attached;
+                    ctx.emit(TmuxSessionEvent::StatusChanged { origin });
+                }
+            }
+            ClientEvent::Exited { reason } => {
+                session.end = Some(SessionEnd::Exited(reason.clone()));
+            }
+            ClientEvent::AttachFailed { error } => {
+                session.end = Some(SessionEnd::AttachFailed(error.clone()));
+            }
+            ClientEvent::TransportLost | ClientEvent::Desync { .. } => {
+                // Only an attached session has tabs to keep under a Disconnected banner.
+                if session.status == SessionStatus::Starting {
+                    session.end = Some(SessionEnd::Disconnected);
+                } else {
+                    session.status = SessionStatus::Disconnected;
+                    ctx.emit(TmuxSessionEvent::StatusChanged { origin });
+                }
+            }
+            ClientEvent::UnsupportedVersion { .. }
+            | ClientEvent::KeyConfigLoaded(_)
+            | ClientEvent::PaneSnapshot(_)
+            | ClientEvent::PaneOutput { .. }
+            | ClientEvent::PaneModeChanged { .. }
+            | ClientEvent::Message { .. }
+            | ClientEvent::ConfigError { .. }
+            | ClientEvent::CommandCompleted { .. }
+            | ClientEvent::ClientKeyDropped { .. } => {}
+        }
+    }
+
+    fn on_ended(&mut self, origin: TmuxOriginId, ctx: &mut ModelContext<Self>) {
+        self.pending.retain(|(o, _), _| *o != origin);
+        let Some(session) = self.sessions.get(&origin) else {
+            return;
+        };
+        if session.status == SessionStatus::Disconnected {
+            // The tabs stay under the Disconnected banner until Reattach or close.
+            ctx.emit(TmuxSessionEvent::StatusChanged { origin });
+            return;
+        }
+        let Some(session) = self.sessions.remove(&origin) else {
+            return;
+        };
+        let line = if session.duplicate_of.is_some() {
+            Some(format!("[{} is already open in another tab]", session.name))
+        } else {
+            session.end.as_ref().map(|end| end_line(&session.name, end))
+        };
+        ctx.emit(TmuxSessionEvent::Ended { origin, line });
+    }
+}
+
+#[cfg(test)]
+#[path = "workspace_sync_tests.rs"]
+mod tests;

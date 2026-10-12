@@ -468,6 +468,12 @@ impl PaneData {
         self.len += 1;
     }
 
+    /// Replaces the whole tree, keeping pane contents (a tmux layout restructure, KTD4).
+    pub fn replace_root(&mut self, root: PaneNode) {
+        self.len = root.pane_ids().len();
+        self.root = root;
+    }
+
     pub fn remove(&mut self, content: PaneId) -> bool {
         let successful_remove = self.root.remove(content);
 
@@ -611,6 +617,60 @@ impl PaneData {
 }
 
 impl PaneNode {
+    /// Each branch's child flexes, in depth-first order.
+    pub fn branch_flexes(&self) -> Vec<Vec<f32>> {
+        let mut out = Vec::new();
+        self.collect_branch_flexes(&mut out);
+        out
+    }
+
+    fn collect_branch_flexes(&self, out: &mut Vec<Vec<f32>>) {
+        if let PaneNode::Branch(branch) = self {
+            out.push(branch.nodes.iter().map(|(flex, _)| flex.0).collect());
+            for (_, child) in &branch.nodes {
+                child.collect_branch_flexes(out);
+            }
+        }
+    }
+
+    /// Sets each branch's child flexes from `flexes` (in [`Self::branch_flexes`] order). Returns
+    /// false, changing nothing, when the tree's shape does not match.
+    pub fn set_branch_flexes(&mut self, flexes: &[Vec<f32>]) -> bool {
+        let mut index = 0;
+        if !self.check_branch_shape(flexes, &mut index) || index != flexes.len() {
+            return false;
+        }
+        let mut index = 0;
+        self.apply_branch_flexes(flexes, &mut index);
+        true
+    }
+
+    fn check_branch_shape(&self, flexes: &[Vec<f32>], index: &mut usize) -> bool {
+        let PaneNode::Branch(branch) = self else {
+            return true;
+        };
+        let Some(branch_flexes) = flexes.get(*index) else {
+            return false;
+        };
+        *index += 1;
+        branch_flexes.len() == branch.nodes.len()
+            && branch
+                .nodes
+                .iter()
+                .all(|(_, child)| child.check_branch_shape(flexes, index))
+    }
+
+    fn apply_branch_flexes(&mut self, flexes: &[Vec<f32>], index: &mut usize) {
+        if let PaneNode::Branch(branch) = self {
+            let branch_flexes = &flexes[*index];
+            *index += 1;
+            for ((flex, child), value) in branch.nodes.iter_mut().zip(branch_flexes) {
+                *flex = PaneFlex(*value);
+                child.apply_branch_flexes(flexes, index);
+            }
+        }
+    }
+
     fn has_visible_children(&self, hidden_panes: &[HiddenPane]) -> bool {
         match self {
             PaneNode::Leaf(pane_id) => {

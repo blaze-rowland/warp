@@ -2223,6 +2223,10 @@ impl TerminalManagerTrait for TerminalManager<TerminalView> {
     fn model(&self) -> Arc<FairMutex<TerminalModel>> {
         self.model.clone()
     }
+
+    fn tmux_origin(&self) -> Option<crate::terminal::tmux::TmuxOriginId> {
+        TerminalManager::tmux_origin(self)
+    }
     fn recover_cloud_shell(
         &mut self,
         request: crate::terminal::shell_recovery::CloudShellRecoveryRequest,

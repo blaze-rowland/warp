@@ -4,7 +4,7 @@ use std::ffi::{OsStr, OsString};
 use settings::Setting;
 use warp_core::features::FeatureFlag;
 use warp_terminal::local_tty::mio_channel;
-use warp_terminal::local_tty::tmux_gateway::{Gateway, RefusalReason, TmuxRequest};
+use warp_terminal::local_tty::tmux_gateway::{Gateway, GatewayEvent, RefusalReason, TmuxRequest};
 use warp_terminal::tmux::ClientEvent;
 use warpui::{App, ModelHandle, SingletonEntity};
 
@@ -155,5 +155,58 @@ fn gateway_events_reach_subscribers_on_the_main_thread() {
             rx.try_recv(),
             Ok(warp_terminal::writeable_pty::Message::Tmux(_))
         ));
+    });
+}
+
+#[test]
+fn turning_the_master_setting_off_detaches_every_running_session() {
+    let _flag = FeatureFlag::TmuxControlMode.override_enabled(true);
+    App::test((), |mut app| async move {
+        let gateways = gateways(&mut app);
+        set_control_mode(&mut app, true);
+        let (tx, rx) = mio_channel::channel();
+        let (origin, _link) = gateways.update(&mut app, |g, _| g.link_for_new_origin(tx, &env("")));
+        let (idle_tx, idle_rx) = mio_channel::channel();
+        let _idle = gateways.update(&mut app, |g, _| g.link_for_new_origin(idle_tx, &env("")));
+        gateways.update(&mut app, |g, ctx| {
+            g.deliver_for_test(origin, GatewayEvent::Starting, ctx);
+        });
+        gateways.read(&app, |g, _| {
+            assert!(g.is_in_session(origin));
+            assert_eq!(g.origins_in_session(), vec![origin]);
+        });
+
+        set_control_mode(&mut app, false);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(warp_terminal::writeable_pty::Message::Tmux(TmuxRequest::Detach))
+        ));
+        // An origin without a session gets nothing.
+        assert!(idle_rx.try_recv().is_err());
+    });
+}
+
+#[test]
+fn the_session_model_is_kept_while_the_session_runs() {
+    let _flag = FeatureFlag::TmuxControlMode.override_enabled(true);
+    App::test((), |mut app| async move {
+        let gateways = gateways(&mut app);
+        let (tx, _rx) = mio_channel::channel();
+        let (origin, _link) = gateways.update(&mut app, |g, _| g.link_for_new_origin(tx, &env("")));
+        let mut model = warp_terminal::tmux::SessionModel::default();
+        model.set_session(warp_terminal::tmux::SessionId(0), "work".to_owned());
+        gateways.update(&mut app, |g, ctx| {
+            g.deliver_for_test(origin, GatewayEvent::Starting, ctx);
+            g.deliver_for_test(origin, GatewayEvent::Model(Box::new(model)), ctx);
+        });
+        gateways.read(&app, |g, _| {
+            let name = g.model(origin).and_then(|m| m.session()).map(|s| s.name.clone());
+            assert_eq!(name.as_deref(), Some("work"));
+        });
+        gateways.update(&mut app, |g, ctx| g.deliver_for_test(origin, GatewayEvent::Ended, ctx));
+        gateways.read(&app, |g, _| {
+            assert!(g.model(origin).is_none());
+            assert!(!g.is_in_session(origin));
+        });
     });
 }
