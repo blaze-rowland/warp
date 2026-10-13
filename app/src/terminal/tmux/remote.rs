@@ -57,9 +57,13 @@ impl OriginSession {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ServerLink {
     Connecting,
-    Connected { host_id: HostId },
+    Connected {
+        host_id: HostId,
+    },
     /// The connection dropped and the manager is retrying.
-    Reconnecting { host_id: HostId },
+    Reconnecting {
+        host_id: HostId,
+    },
     /// No remote server: the helper cannot run, setup was skipped, or retries ran out (R13).
     Unavailable,
 }

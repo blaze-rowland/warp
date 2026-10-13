@@ -2186,14 +2186,13 @@ fn render_tab_group_internal(
     // A tmux tab is one tmux window, so its window name is the title in every mode.
     let displayed_tab_title_override = if pane_group.is_tmux_tab() {
         pane_group.custom_title(app)
-    } else if in_tab_group && matches!(display_granularity, VerticalTabsDisplayGranularity::Panes)
-    {
-            None
-        } else {
-            (!uses_outer_group_container)
-                .then(|| pane_group.custom_title(app))
-                .flatten()
-        };
+    } else if in_tab_group && matches!(display_granularity, VerticalTabsDisplayGranularity::Panes) {
+        None
+    } else {
+        (!uses_outer_group_container)
+            .then(|| pane_group.custom_title(app))
+            .flatten()
+    };
     let is_menu_open_for_tab = workspace
         .show_tab_right_click_menu
         .is_some_and(|(idx, _)| idx == tab_index);

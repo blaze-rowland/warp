@@ -27,10 +27,10 @@ use warpui::{
 use super::TmuxOriginId;
 use super::gateway::{TmuxGatewayEvent, TmuxGateways};
 use super::integration::TmuxIntegration;
-use super::remote::TmuxRemoteHosts;
 use super::pane_event_loop::{
     DisconnectedSink, PaneRequestSink, TmuxPaneEventLoop, TmuxPaneEventLoopEvent,
 };
+use super::remote::TmuxRemoteHosts;
 use crate::ai::blocklist::InputConfig;
 use crate::app_state::TmuxPaneSnapshot;
 use crate::context_chips::prompt_type::PromptType;

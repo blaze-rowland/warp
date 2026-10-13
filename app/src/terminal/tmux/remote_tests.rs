@@ -6,15 +6,13 @@ use warp_terminal::tmux::PaneId;
 use warpui::{App, ModelHandle};
 
 use super::*;
+use crate::terminal::model::session::command_executor::ExecuteCommandOptions;
 use crate::terminal::model::session::command_executor::testing::TestCommandExecutor;
-use crate::terminal::model::session::command_executor::{
-    ExecuteCommandOptions,
-};
 use crate::terminal::model::session::{BootstrapSessionType, SessionInfo};
 use crate::terminal::shell::{Shell, ShellType};
 use crate::terminal::tmux::integration::{
-    BundleFile, LauncherBundle, NewPanePlan, PaneFacts, derive_session_id,
-    install_check_commands, install_upload_commands, new_pane_plan,
+    BundleFile, LauncherBundle, NewPanePlan, PaneFacts, derive_session_id, install_check_commands,
+    install_upload_commands, new_pane_plan,
 };
 
 const HOST: &str = "box";
@@ -72,13 +70,19 @@ fn add_pane(
         sessions.register_session_for_test(pane_session_info(session_id, hostname));
         sessions
     });
-    hosts.update(app, |hosts, ctx| hosts.register_pane(origin(), &sessions, ctx));
+    hosts.update(app, |hosts, ctx| {
+        hosts.register_pane(origin(), &sessions, ctx)
+    });
     sessions
 }
 
 fn pane_session(app: &App, sessions: &ModelHandle<Sessions>) -> Arc<Session> {
     sessions.read(app, |sessions, _| {
-        sessions.sessions().next().cloned().expect("pane has a session")
+        sessions
+            .sessions()
+            .next()
+            .cloned()
+            .expect("pane has a session")
     })
 }
 
@@ -432,17 +436,19 @@ fn initial_link_follows_the_managers_state() {
 #[test]
 fn origin_pairing_reads_only_remote_sessions() {
     let mut info = pane_session_info(ORIGIN_SESSION, HOST);
-    info.is_ssh_wrapper_session =
-        crate::terminal::model::session::IsSSHWrapperSession::Yes {
-            socket_path: PathBuf::from("/tmp/cm"),
-            external_control_master: false,
-        };
+    info.is_ssh_wrapper_session = crate::terminal::model::session::IsSSHWrapperSession::Yes {
+        socket_path: PathBuf::from("/tmp/cm"),
+        external_control_master: false,
+    };
     let remote = Session::new(info, Arc::new(TestCommandExecutor {}));
     assert_eq!(
         OriginSession::from_session(&remote),
         Some(origin_session(Some("/tmp/cm")))
     );
 
-    let local = Session::new(SessionInfo::new_for_test(), Arc::new(TestCommandExecutor {}));
+    let local = Session::new(
+        SessionInfo::new_for_test(),
+        Arc::new(TestCommandExecutor {}),
+    );
     assert_eq!(OriginSession::from_session(&local), None);
 }
