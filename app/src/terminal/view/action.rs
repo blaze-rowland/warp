@@ -202,6 +202,8 @@ pub enum TerminalAction {
     ClearSelectionsWhenShellMode,
     Close,
     ToggleMaximizePane,
+    /// R8's "Warpify this pane" on a tmux pane without shell integration (U9).
+    WarpifyTmuxPane,
     SplitRight(Option<AvailableShell>),
     SplitLeft(Option<AvailableShell>),
     SplitDown(Option<AvailableShell>),
@@ -566,6 +568,7 @@ impl fmt::Debug for TerminalAction {
             SplitDown(_) => f.write_str("SplitDown"),
             SplitUp(_) => f.write_str("SplitUp"),
             ToggleMaximizePane => f.write_str("ToggleMaximizeActivePane"),
+            WarpifyTmuxPane => f.write_str("WarpifyTmuxPane"),
             PromptContextMenu {
                 position_offset_from_prompt,
             } => write!(

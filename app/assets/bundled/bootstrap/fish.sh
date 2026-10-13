@@ -13,7 +13,10 @@ set -g fish_private_mode 1
 
 # Disable fish autosuggestions - because input goes through Warp's editor instead,
 # they are never actionable, and the extra output can cause problems.
-set -g fish_autosuggestion_enabled 0
+# In a tmux pane (marker-only mode) plain tmux clients still type into fish; keep them.
+if not set -q WARP_TMUX_MARKER_ONLY
+    set -g fish_autosuggestion_enabled 0
+end
 
 # Byte sequence used to signal the start of a DCS. ([0x1b, 0x50, 0x24] which
 # maps to <ESC>, P, $ in ASCII.)
@@ -300,6 +303,10 @@ end
 # the fish prompt functions (which we set to empty for Warp prompt) by calling warp_update_prompt_vars
 # to refresh the prompt. We force a repaint of the prompt to ensure the change is reflected immediately.
 function warp_change_prompt_modes_to_warp_prompt
+  # In a tmux pane (marker-only mode) the user's prompt stays: plain tmux clients see it.
+  if set -q WARP_TMUX_MARKER_ONLY
+    return
+  end
   set -x WARP_HONOR_PS1 "0"
 
   # Updates fish_prompt and fish_right_prompt to be empty.
@@ -748,6 +755,10 @@ end
 
 function clear
     warp_send_json_message "{\"hook\": \"Clear\", \"value\": {\"session_id\": $WARP_SESSION_ID}}"
+    # In a tmux pane (marker-only mode) plain tmux clients share the screen; clear it for them.
+    if set -q WARP_TMUX_MARKER_ONLY
+        command clear $argv
+    end
 end
 
 function warp_finish_update

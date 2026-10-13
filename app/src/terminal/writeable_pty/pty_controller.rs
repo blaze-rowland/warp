@@ -88,6 +88,11 @@ pub struct PtyController<T: EventLoopSender> {
     bootstrap_file: Option<TempBootstrapFile>,
     in_flight_native_completions_results_tx:
         Option<async_channel::Sender<(Vec<ShellCompletion>, Option<Span>)>>,
+    /// This controller writes to a tmux pane (U9). A pane's shell sources Warp's bootstrap
+    /// through the launcher, so a top-level `InitShell` writes nothing; only a subshell bootstrap
+    /// Warp itself typed the init command for gets the bootstrap body. The user's prompt mode is
+    /// left alone, since plain tmux clients see it.
+    is_tmux_pane: bool,
 }
 
 impl<T: EventLoopSender> PtyController<T> {
@@ -107,6 +112,9 @@ impl<T: EventLoopSender> PtyController<T> {
             ModelEvent::Handler(AnsiHandlerEvent::InitShell {
                 pending_session_info,
             }) => {
+                if me.is_tmux_pane && pending_session_info.subshell_info.is_none() {
+                    return;
+                }
                 me.initialize_shell(pending_session_info.as_ref(), ctx);
             }
             ModelEvent::Handler(AnsiHandlerEvent::Bootstrapped { is_subshell, .. }) => {
@@ -118,6 +126,7 @@ impl<T: EventLoopSender> PtyController<T> {
             ModelEvent::Handler(AnsiHandlerEvent::UnsetBracketedPaste) => {
                 me.is_bracketed_paste_enabled = false;
             }
+            ModelEvent::HonorPS1OutOfSync if me.is_tmux_pane => {}
             ModelEvent::HonorPS1OutOfSync => {
                 // We force re-sync the PS1 state of Warp settings with the shell's environment variable, $WARP_HONOR_PS1, via
                 // a bindkey (which triggers a shell function).
@@ -140,6 +149,12 @@ impl<T: EventLoopSender> PtyController<T> {
 
         ctx.subscribe_to_model(&line_editor_status, |me, _, event, ctx| {
             if let LineEditorStatusEvent::Active = event {
+                // A tmux pane may be shared with plain clients; asking the shell for its line
+                // buffer would take what they typed (U9, R10).
+                if me.is_tmux_pane {
+                    me.execute_next_queued_write(ctx);
+                    return;
+                }
                 let input_reporting_seq = me
                     .model_event_dispatcher
                     .as_ref(ctx)
@@ -186,7 +201,13 @@ impl<T: EventLoopSender> PtyController<T> {
             #[cfg(not(target_family = "wasm"))]
             bootstrap_file: None,
             in_flight_native_completions_results_tx: None,
+            is_tmux_pane: false,
         }
+    }
+
+    /// Marks this controller as writing to a tmux pane. See `is_tmux_pane`.
+    pub fn set_is_tmux_pane(&mut self) {
+        self.is_tmux_pane = true;
     }
 
     /// Sends bindkey to notify shell process to switch to PS1 logic for prompt

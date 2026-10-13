@@ -15,13 +15,14 @@ use super::{TabConfigsMenuOpenSource, Workspace};
 use crate::menu::{MenuItem, MenuItemFields};
 use crate::pane_group::{PaneGroup, PanesLayout};
 use crate::tab::TabData;
+use crate::terminal::TerminalView;
 use crate::terminal::model::session::command_executor::ExecuteCommandOptions;
 use crate::terminal::tmux::TmuxOriginId;
 use crate::terminal::tmux::gateway::TmuxGateways;
 use crate::terminal::tmux::layout_snapshot::{layout_to_snapshot, tab_layout};
 use crate::terminal::tmux::session_menu::{
     ATTACH_LABEL, ListOutcome, MenuEntry, NEW_SESSION_LABEL, TmuxMenuAction, attach_menu_entries,
-    command_for, list_outcome, list_sessions_command,
+    command_for_with_launcher, list_outcome, list_sessions_command,
 };
 use crate::terminal::tmux::settings::TmuxSettings;
 use crate::terminal::tmux::workspace_sync::{
@@ -421,8 +422,15 @@ impl Workspace {
         let Some((origin, window_id)) = self.tmux_tab_at(self.active_tab_index, ctx) else {
             return false;
         };
+        let launcher = crate::terminal::tmux::integration::TmuxIntegration::as_ref(ctx)
+            .launcher_path(origin, ctx);
         TmuxSessions::handle(ctx).update(ctx, |sessions, ctx| {
-            sessions.send_command(origin, new_window_command(Some(window_id)), None, ctx);
+            sessions.send_command(
+                origin,
+                new_window_command(Some(window_id), launcher.as_deref()),
+                None,
+                ctx,
+            );
         });
         true
     }
@@ -569,7 +577,18 @@ impl Workspace {
         let Some(target) = view.as_ref(ctx).tmux_menu_target(ctx) else {
             return;
         };
-        let Some(command) = command_for(&action, target.socket.as_ref(), !target.nested) else {
+        // A session created here starts its first pane through U9's launcher (KTD7).
+        let launcher = if target.session.is_local() {
+            TerminalView::local_tmux_launcher(ctx)
+        } else {
+            None
+        };
+        let Some(command) = command_for_with_launcher(
+            &action,
+            target.socket.as_ref(),
+            !target.nested,
+            launcher.as_deref(),
+        ) else {
             // Listing runs through the session's executor, so a Warpified SSH pane lists the
             // remote host's sessions without typing into the pane.
             let list = list_sessions_command(target.socket.as_ref());

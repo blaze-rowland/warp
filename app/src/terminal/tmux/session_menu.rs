@@ -170,9 +170,23 @@ pub fn command_for(
     socket: Option<&TmuxSocket>,
     control_mode: bool,
 ) -> Option<String> {
+    command_for_with_launcher(action, socket, control_mode, None)
+}
+
+/// [`command_for`], where a new session opened natively starts its first pane through U9's
+/// launcher at `launcher` (KTD7).
+pub fn command_for_with_launcher(
+    action: &TmuxMenuAction,
+    socket: Option<&TmuxSocket>,
+    control_mode: bool,
+    launcher: Option<&str>,
+) -> Option<String> {
     let tmux = tmux_prefix(socket, control_mode);
     match action {
-        TmuxMenuAction::NewSession => Some(format!("{tmux} new")),
+        TmuxMenuAction::NewSession => match launcher.filter(|_| control_mode) {
+            Some(launcher) => Some(format!("{tmux} new {}", shell_quote(launcher))),
+            None => Some(format!("{tmux} new")),
+        },
         TmuxMenuAction::Attach(name) => {
             // `=` makes tmux match the name exactly rather than as a prefix.
             Some(format!(

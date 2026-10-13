@@ -479,7 +479,9 @@ use crate::terminal::shared_session::{
 };
 use crate::terminal::shell_recovery::{CloudShellRecoveryRequest, recovered_command_output};
 use crate::terminal::tmux::TmuxOriginId;
-use crate::terminal::tmux::entry::{Entry as TmuxEntry, NESTED_NOTE, PaneTmuxState, plan_entry};
+use crate::terminal::tmux::entry::{
+    Entry as TmuxEntry, NESTED_NOTE, PaneTmuxState, plan_entry_with_launcher,
+};
 use crate::terminal::tmux::session_menu::TmuxMenuTarget;
 use crate::terminal::tmux::settings::TmuxSettings;
 use crate::terminal::view::block_onboarding::onboarding_prompt_block::OnboardingPromptBlock;
@@ -8850,6 +8852,9 @@ impl TerminalView {
         if model.is_read_only() {
             return false;
         }
+        if self.is_tmux_plain_terminal(model) {
+            return false;
+        }
         // Warp's own headless TUI (`warp_tui`) is itself an agent surface, so
         // suppress the outer agent input bar while it runs in this pane. Uses
         // the same command-based detection as the CLI agent footer (see
@@ -9604,6 +9609,9 @@ impl TerminalView {
 
     pub fn is_long_running(&self) -> bool {
         let model = self.model.lock();
+        if self.is_tmux_plain_terminal(&model) {
+            return !model.is_read_only();
+        }
         model
             .block_list()
             .active_block()
@@ -9737,6 +9745,9 @@ impl TerminalView {
     /// that are currently being driven by the agent.
     pub fn is_long_running_and_user_controlled(&self) -> bool {
         let model = self.model.lock();
+        if self.is_tmux_plain_terminal(&model) {
+            return !model.is_read_only();
+        }
         let active_block = model.block_list().active_block();
         active_block.is_active_and_long_running()
             && !active_block.is_agent_driving_command()
@@ -9860,6 +9871,11 @@ impl TerminalView {
     fn should_write_typed_chars_to_pty(&self, ctx: &mut ViewContext<Self>) -> bool {
         // Lock the model once and hold it throughout the function
         let model = self.model.lock();
+
+        // A tmux pane without shell integration is a plain terminal: every key goes to the pane.
+        if self.is_tmux_plain_terminal(&model) {
+            return !model.is_read_only();
+        }
 
         // If the active block hasn't started yet, we don't want to write to the pty.
         // Note that we check block started and NOT block.is_long_running(), because
@@ -16876,10 +16892,17 @@ impl TerminalView {
         }
 
         let nested = tmux_env || self.tmux.is_tmux_pane;
-        let entry = plan_entry(
+        // A session created here starts its first pane through U9's launcher (KTD7).
+        let launcher = if session.is_local() {
+            Self::local_tmux_launcher(ctx)
+        } else {
+            None
+        };
+        let entry = plan_entry_with_launcher(
             &event.command,
             |name| session.alias_value(name).map(str::to_owned),
             nested,
+            launcher.as_deref(),
         );
         match entry {
             TmuxEntry::Convert { command, socket }
@@ -16896,6 +16919,24 @@ impl TerminalView {
             TmuxEntry::Nested | TmuxEntry::Unchanged => {}
         }
         event
+    }
+
+    /// The launcher installed on this machine for tmux sessions Warp creates here (U9).
+    pub fn local_tmux_launcher(ctx: &mut AppContext) -> Option<String> {
+        #[cfg(feature = "local_tty")]
+        {
+            use crate::terminal::tmux::integration::TmuxIntegration;
+            if !ctx.has_singleton_model::<TmuxIntegration>() {
+                return None;
+            }
+            TmuxIntegration::handle(ctx)
+                .update(ctx, |integration, ctx| integration.local_launcher(ctx))
+        }
+        #[cfg(not(feature = "local_tty"))]
+        {
+            let _ = ctx;
+            None
+        }
     }
 
     /// Tells the gateway whether this pane's shell runs inside tmux, from the environment of the
@@ -16926,10 +16967,59 @@ impl TerminalView {
         ctx.notify();
     }
 
-    /// Marks this view as showing a tmux pane: tmux typed here is nested, and the session menu
-    /// does not run commands here.
-    pub fn mark_as_tmux_pane(&mut self) {
+    /// Marks this view as showing tmux pane `pane_id`: tmux typed here is nested, the session
+    /// menu does not run commands here, and until the pane's shell is integrated the view is a
+    /// plain terminal (U9).
+    pub fn mark_as_tmux_pane(
+        &mut self,
+        origin: crate::terminal::tmux::TmuxOriginId,
+        pane_id: warp_terminal::tmux::PaneId,
+    ) {
         self.tmux.is_tmux_pane = true;
+        self.tmux.tmux_pane = Some((origin, pane_id));
+    }
+
+    /// Whether this view is a tmux pane in plain-terminal mode: no input editor, keys straight to
+    /// the pane, output in the grid. Holds until the pane's shell is integrated (U9).
+    fn is_tmux_plain_terminal(&self, model: &TerminalModel) -> bool {
+        use crate::terminal::tmux::integration::{PaneInputMode, pane_input_mode};
+        pane_input_mode(self.tmux.is_tmux_pane, model.block_list().is_bootstrapped())
+            == PaneInputMode::PlainTerminal
+    }
+
+    /// Records whether R8's "Warpify this pane" applies to this pane, and why not if disabled.
+    pub fn set_tmux_warpify(
+        &mut self,
+        warpify: Option<crate::terminal::tmux::integration::WarpifyAvailability>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.tmux.warpify = warpify;
+        ctx.notify();
+    }
+
+    /// Types Warp's init-subshell command into this tmux pane: the typed path when Warp is the
+    /// pane's only client, or a confirmed "Warpify this pane" (U9, KTD7).
+    pub fn tmux_type_init(&mut self, shell_type: ShellType, ctx: &mut ViewContext<Self>) {
+        if !self.tmux.is_tmux_pane || self.model.lock().block_list().is_bootstrapped() {
+            return;
+        }
+        self.tmux.warpify = None;
+        self.write_init_subshell_bytes_to_pty(Some(shell_type), ctx);
+        ctx.notify();
+    }
+
+    /// Runs R8's "Warpify this pane": rechecks the pane and asks before typing into it.
+    fn warpify_tmux_pane(&mut self, ctx: &mut ViewContext<Self>) {
+        #[cfg(feature = "local_tty")]
+        if let Some((origin, pane_id)) = self.tmux.tmux_pane {
+            use crate::terminal::tmux::integration::TmuxIntegration;
+            let view = ctx.handle();
+            TmuxIntegration::handle(ctx).update(ctx, |integration, ctx| {
+                integration.warpify(origin, pane_id, view, ctx);
+            });
+        }
+        #[cfg(not(feature = "local_tty"))]
+        let _ = ctx;
     }
 
     /// Where the session menu lists and opens sessions: this pane's active session, unless the
@@ -18339,6 +18429,23 @@ impl TerminalView {
         ctx: &mut ViewContext<Self>,
     ) -> Vec<MenuItem<TerminalAction>> {
         let mut items = vec![];
+
+        // R8: a tmux pane whose shell is not integrated offers "Warpify this pane", disabled with
+        // the reason when the pane does not run a shell at its prompt (U9).
+        if let Some(warpify) = &self.tmux.warpify
+            && self.is_tmux_plain_terminal(&self.model.lock())
+        {
+            use crate::terminal::tmux::integration::WarpifyAvailability;
+            let item = MenuItemFields::new("Warpify this pane")
+                .with_on_select_action(TerminalAction::WarpifyTmuxPane);
+            let item = match warpify {
+                WarpifyAvailability::Available(_) => item,
+                WarpifyAvailability::Unavailable(reason) => {
+                    item.with_disabled(true).with_tooltip(reason.clone())
+                }
+            };
+            items.push(item.into_item());
+        }
 
         if ContextFlag::CreateNewSession.is_enabled() {
             items.extend(vec![
@@ -22139,13 +22246,17 @@ impl TerminalView {
 
             let has_bootstrapped = model.block_list().is_bootstrapping_precmd_done();
 
-            let has_active_user_terminal_command = block_list.active_block().is_active_and_long_running()
+            // A tmux pane without shell integration is a plain terminal and keeps focus (U9).
+            let is_tmux_plain_terminal =
+                self.is_tmux_plain_terminal(&model) && !model.is_read_only();
+            let has_active_user_terminal_command = is_tmux_plain_terminal
+                || (block_list.active_block().is_active_and_long_running()
                 && !block_list.active_block().is_agent_in_control()
                 // The only case where terminal can take focus _while_ input is visible is
                 // pre-bootstrap, for example when oh-my-zsh prompts you to update -- at this point
                 // the input is visible but you should still be able to click into the block for the
                 // oh-my-zsh prompt and send input directly to the pty.
-                && (!is_input_visible || !has_bootstrapped);
+                && (!is_input_visible || !has_bootstrapped));
 
             let is_shell_mode = !self.ai_input_model.as_ref(ctx).is_ai_input_enabled();
             let are_blocks_selected = !self.selected_blocks.is_empty();
@@ -27873,6 +27984,7 @@ impl TypedActionView for TerminalView {
             | AltSelect(_)
             | AltMouseAction(_)
             | ToggleMaximizePane
+            | WarpifyTmuxPane
             | PromptContextMenu { .. }
             | OpenInputContextMenu { .. }
             | InputContextMenuItem(_)
@@ -28186,6 +28298,7 @@ impl TypedActionView for TerminalView {
                 ctx.emit(Event::Pane(PaneEvent::SplitUp(chosen_shell.to_owned())))
             }
             ToggleMaximizePane => ctx.emit(Event::Pane(PaneEvent::ToggleMaximized)),
+            WarpifyTmuxPane => self.warpify_tmux_pane(ctx),
             PromptContextMenu {
                 position_offset_from_prompt,
             } => self.show_prompt_context_menu(*position_offset_from_prompt, ctx),

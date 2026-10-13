@@ -16,7 +16,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_channel::Receiver;
-use parking_lot::FairMutex;
+use instant::Instant;
+use parking_lot::{FairMutex, Mutex};
 use warp_terminal::local_tty::tmux_gateway::{PaneChunk, PaneQueueReceiver, TmuxRequest};
 use warp_terminal::tmux::{PaneId, SnapshotKind};
 use warpui::{Entity, ModelContext};
@@ -77,6 +78,8 @@ pub struct TmuxPaneEventLoop {
     draining: bool,
     /// A queue the gateway opened before the current one finished draining.
     next_queue: Option<PaneQueueReceiver>,
+    /// When the pane last printed anything; shell integration waits for a new pane to go idle.
+    last_output: Arc<Mutex<Option<Instant>>>,
 }
 
 impl Entity for TmuxPaneEventLoop {
@@ -110,7 +113,13 @@ impl TmuxPaneEventLoop {
             release_rx,
             draining: false,
             next_queue: None,
+            last_output: Arc::default(),
         }
+    }
+
+    /// When the pane last printed anything, updated as its output is parsed.
+    pub fn last_output(&self) -> Arc<Mutex<Option<Instant>>> {
+        self.last_output.clone()
     }
 
     /// Whether the view let go of this pane. Nothing more is parsed or sent once it has.
@@ -142,6 +151,7 @@ impl TmuxPaneEventLoop {
             self.requests.clone(),
             self.released.clone(),
             self.release_rx.clone(),
+            self.last_output.clone(),
         );
         let _ = ctx.spawn(drain, |me, end, ctx| {
             me.draining = false;
@@ -209,6 +219,7 @@ async fn drain(
     requests: Arc<dyn PaneRequestSink>,
     released: Arc<AtomicBool>,
     release_rx: Receiver<()>,
+    last_output: Arc<Mutex<Option<Instant>>>,
 ) -> DrainEnd {
     enum Next {
         Chunk(PaneChunk),
@@ -242,6 +253,7 @@ async fn drain(
             return DrainEnd::Released;
         }
         let replies = apply_chunk(&mut parser, &model, chunk);
+        *last_output.lock() = Some(Instant::now());
         channel_event_listener.send_wakeup_event();
         // The model is unlocked again before anything is sent.
         if !replies.is_empty() && !released.load(Ordering::Acquire) {

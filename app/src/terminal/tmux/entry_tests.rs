@@ -239,3 +239,43 @@ fn sockets_render_as_global_flags_for_other_commands() {
     assert_eq!(TmuxSocket::name("my sock").global_flags(), "-L 'my sock'");
     assert_eq!(TmuxSocket::name("it's").global_flags(), r"-L 'it'\''s'");
 }
+
+const LAUNCHER: &str = "/home/me/.cache/warp/tmux/0123456789abcdef/warp-shell.sh";
+
+fn converted_with_launcher(command: &str) -> String {
+    match plan_entry_with_launcher(command, no_aliases, false, Some(LAUNCHER)) {
+        Entry::Convert { command, .. } => command,
+        other => panic!("{command:?} did not convert: {other:?}"),
+    }
+}
+
+/// U9: a session Warp creates starts its first pane through the launcher.
+#[test]
+fn a_new_session_starts_through_the_launcher() {
+    assert_eq!(
+        converted_with_launcher("tmux"),
+        format!("tmux -CC new-session {LAUNCHER}")
+    );
+    assert_eq!(
+        converted_with_launcher("tmux new -s work"),
+        format!("tmux -CC new -s work {LAUNCHER}")
+    );
+    assert_eq!(
+        converted_with_launcher("tmux -L sock new-session"),
+        format!("tmux -CC -L sock new-session {LAUNCHER}")
+    );
+}
+
+#[test]
+fn a_session_with_its_own_command_or_an_attach_keeps_it() {
+    assert_eq!(converted_with_launcher("tmux new vim"), "tmux -CC new vim");
+    assert_eq!(
+        converted_with_launcher("tmux new -s w -- htop"),
+        "tmux -CC new -s w -- htop"
+    );
+    assert_eq!(converted_with_launcher("tmux a"), "tmux -CC a");
+    assert_eq!(
+        plan_entry_with_launcher("tmux new", no_aliases, false, None),
+        plan("tmux new")
+    );
+}

@@ -65,6 +65,17 @@ pub fn plan_entry(
     alias_value: impl Fn(&str) -> Option<String>,
     nested: bool,
 ) -> Entry {
+    plan_entry_with_launcher(command, alias_value, nested, None)
+}
+
+/// [`plan_entry`], where a converted command that creates a session without a shell-command of
+/// its own starts its first pane through U9's launcher at `launcher` (KTD7).
+pub fn plan_entry_with_launcher(
+    command: &str,
+    alias_value: impl Fn(&str) -> Option<String>,
+    nested: bool,
+    launcher: Option<&str>,
+) -> Entry {
     let Some(words) = lex_simple_command(command) else {
         return Entry::Unchanged;
     };
@@ -91,10 +102,22 @@ pub fn plan_entry(
     match invocation {
         Invocation::ControlMode { socket } => Entry::ControlMode { socket },
         Invocation::OpensSession { .. } if nested => Entry::Nested,
-        Invocation::OpensSession { argv0_end, socket } => Entry::Convert {
-            command: format!("{} -CC{}", &source[..argv0_end], &source[argv0_end..]),
+        Invocation::OpensSession {
+            argv0_end,
             socket,
-        },
+            launcher_slot,
+        } => {
+            let mut command = format!("{} -CC{}", &source[..argv0_end], &source[argv0_end..]);
+            if let (Some(slot), Some(launcher)) = (launcher_slot, launcher) {
+                command = format!(
+                    "{}{}{}",
+                    command.trim_end(),
+                    slot.prefix(),
+                    shell_quote(launcher)
+                );
+            }
+            Entry::Convert { command, socket }
+        }
     }
 }
 
@@ -122,6 +145,11 @@ pub struct PaneTmuxState {
     pub origin: Option<TmuxOriginId>,
     /// The pane shows a tmux pane, so tmux typed here is nested.
     pub is_tmux_pane: bool,
+    /// The tmux pane this pane shows.
+    pub tmux_pane: Option<(TmuxOriginId, warp_terminal::tmux::PaneId)>,
+    /// R8's "Warpify this pane", once the pane is known to need it: offered, or disabled with
+    /// the reason.
+    pub warpify: Option<super::integration::WarpifyAvailability>,
     /// The socket the pane last opened tmux with; the session menu reuses it.
     pub socket: Option<TmuxSocket>,
     /// A note to write when the next command's block starts.
@@ -154,10 +182,30 @@ enum Invocation {
         /// Byte offset just past argv[0], where `-CC` goes.
         argv0_end: usize,
         socket: Option<TmuxSocket>,
+        /// Where a launcher can go: the command creates a session with no shell-command.
+        launcher_slot: Option<LauncherSlot>,
     },
     ControlMode {
         socket: Option<TmuxSocket>,
     },
+}
+
+/// How a launcher is added to a command that creates a session.
+#[derive(Clone, Copy)]
+enum LauncherSlot {
+    /// `tmux` alone: add `new-session` and the launcher.
+    NewSession,
+    /// `tmux new` without a shell-command: add the launcher.
+    ShellCommand,
+}
+
+impl LauncherSlot {
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::NewSession => " new-session ",
+            Self::ShellCommand => " ",
+        }
+    }
 }
 
 /// tmux's global flags that take no argument and leave the client attachable.
@@ -212,16 +260,45 @@ fn parse_invocation(source: &str, words: &[Word]) -> Option<Invocation> {
         return Some(Invocation::ControlMode { socket });
     }
 
-    let opens_session = match words.get(index).map(|word| word.text.as_str()) {
-        None => true,
-        Some("attach" | "attach-session" | "a" | "at") => true,
-        Some("new" | "new-session") => !new_session_is_detached(&words[index + 1..]),
-        Some(_) => false,
+    let (opens_session, launcher_slot) = match words.get(index).map(|word| word.text.as_str()) {
+        None => (true, Some(LauncherSlot::NewSession)),
+        Some("attach" | "attach-session" | "a" | "at") => (true, None),
+        Some("new" | "new-session") => {
+            let args = &words[index + 1..];
+            let slot = (!new_session_has_command(args)).then_some(LauncherSlot::ShellCommand);
+            (!new_session_is_detached(args), slot)
+        }
+        Some(_) => (false, None),
     };
     opens_session.then_some(Invocation::OpensSession {
         argv0_end: argv0.end,
         socket,
+        launcher_slot,
     })
+}
+
+/// Whether `new-session`'s arguments end with a shell-command (or another tmux command), so
+/// nothing may be appended.
+fn new_session_has_command(args: &[Word]) -> bool {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let text = arg.text.as_str();
+        if text == "--" {
+            return args.next().is_some();
+        }
+        let Some(flags) = text.strip_prefix('-').filter(|flags| !flags.is_empty()) else {
+            return true;
+        };
+        for (offset, flag) in flags.char_indices() {
+            if NEW_SESSION_OPTIONS.contains(flag) {
+                if offset + flag.len_utf8() == flags.len() {
+                    args.next();
+                }
+                break;
+            }
+        }
+    }
+    false
 }
 
 fn new_session_is_detached(args: &[Word]) -> bool {

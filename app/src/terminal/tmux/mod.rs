@@ -4,6 +4,7 @@ pub mod entry;
 #[cfg(feature = "local_tty")]
 pub mod gateway;
 pub mod hidden_tabs;
+pub mod integration;
 #[cfg(feature = "local_tty")]
 pub mod key_capture;
 pub mod key_tables;

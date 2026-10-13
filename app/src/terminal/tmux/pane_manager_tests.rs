@@ -671,3 +671,115 @@ fn a_queue_reopened_while_the_old_one_drains_is_kept() {
         );
     });
 }
+
+// Shell integration (U9).
+
+fn init_subshell_shell() -> Vec<u8> {
+    hook(&format!(
+        r#"{{"hook":"InitShell","value":{{"session_id":{SESSION},"shell":"bash","hostname":"localhost","is_subshell":true}}}}"#
+    ))
+}
+
+/// What the launcher prints while a pane starts, before its first prompt: `InitShell` (it
+/// sourced the bootstrap itself), the bootstrap's own prompt hooks, `Bootstrapped`, then the
+/// first prompt.
+fn launcher_startup(pane: &Harness) {
+    pane.output(init_shell());
+    pane.output(command_finished());
+    pane.output(precmd());
+    pane.output(bootstrapped());
+    pane.output(command_finished());
+    pane.output(precmd());
+}
+
+#[test]
+fn warp_writes_nothing_to_a_launcher_pane_before_its_first_prompt() {
+    App::test((), |mut app| async move {
+        let pane = harness(&mut app, ShellType::Bash);
+        launcher_startup(&pane);
+        assert_eventually!(
+            pane.model.lock().block_list().is_bootstrapped(),
+            "the launcher's hooks integrate the pane"
+        );
+        // Give any write the InitShell or Bootstrapped events would cause time to arrive.
+        warpui::r#async::Timer::after(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            pane.pane_inputs(),
+            Vec::<Vec<u8>>::new(),
+            "no bootstrap script, prompt switch or other bytes"
+        );
+    });
+}
+
+#[test]
+fn the_typed_path_still_gets_the_bootstrap_body() {
+    App::test((), |mut app| async move {
+        let pane = harness(&mut app, ShellType::Bash);
+        // Warp typed the init-subshell command; the shell answers with a subshell InitShell.
+        pane.output(init_subshell_shell());
+        assert_eventually!(
+            !pane.pane_inputs().is_empty(),
+            "Warp writes the bootstrap body after a subshell InitShell"
+        );
+    });
+}
+
+#[test]
+fn a_forged_hook_printed_by_a_program_produces_no_block() {
+    App::test((), |mut app| async move {
+        let pane = harness(&mut app, ShellType::Bash);
+        // `cat` of a file holding Warp hooks with an id nobody registered.
+        let forged = |json: &str| hook(&json.replace(&SESSION.to_string(), "99999"));
+        pane.output(forged(&format!(
+            r#"{{"hook":"InitShell","value":{{"session_id":{SESSION},"shell":"bash","hostname":"x"}}}}"#
+        )));
+        pane.output(forged(&format!(
+            r#"{{"hook":"Bootstrapped","value":{{"session_id":{SESSION},"shell":"bash","histfile":"","home_dir":"/","path":"/bin","aliases":"","abbreviations":"","function_names":"","env_var_names":"","builtins":"","keywords":"","shell_version":"5"}}}}"#
+        )));
+        pane.output(forged(&format!(
+            r#"{{"hook":"Precmd","value":{{"pwd":"/tmp","session_id":{SESSION}}}}}"#
+        )));
+        pane.output(b"after the forged hooks\r\n");
+        assert_eventually!(
+            pane.text().contains("after the forged hooks"),
+            "plain output still arrives"
+        );
+        let model = pane.model.lock();
+        assert!(
+            !model.block_list().is_bootstrapped(),
+            "no integration from a forged hook"
+        );
+        assert!(model.pending_session_id().is_none());
+    });
+}
+
+/// Covers F1: a launcher pane bootstrapped before Warp attached shows its screen as plain output
+/// and gets blocks from its next prompt, when it announces itself again; nothing is typed.
+#[test]
+fn a_launcher_pane_from_before_attach_gets_blocks_from_its_next_prompt() {
+    App::test((), |mut app| async move {
+        let pane = harness(&mut app, ShellType::Bash);
+        pane.push(PaneChunk::Snapshot(PaneSnapshot {
+            pane_id: PANE,
+            kind: SnapshotKind::Seed,
+            lines: vec![b"u9b> make".to_vec(), b"done".to_vec(), b"u9b> ".to_vec()],
+            cursor: Some((5, 2)),
+        }));
+        assert_eventually!(pane.text().contains("done"), "the seeded screen shows");
+        assert!(!pane.model.lock().block_list().is_bootstrapped());
+
+        // The user runs a command; at the next prompt the launcher reannounces.
+        pane.output(b"ls\r\nfile.txt\r\n");
+        pane.output(command_finished());
+        pane.output(init_shell());
+        pane.output(bootstrapped());
+        pane.output(command_finished());
+        pane.output(precmd());
+        assert_eventually!(
+            pane.model.lock().block_list().is_bootstrapped(),
+            "blocks from the next prompt"
+        );
+        warpui::r#async::Timer::after(std::time::Duration::from_millis(100)).await;
+        assert_eq!(pane.pane_inputs(), Vec::<Vec<u8>>::new(), "nothing typed");
+    });
+}

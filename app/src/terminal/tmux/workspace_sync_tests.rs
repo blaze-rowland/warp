@@ -262,30 +262,56 @@ fn only_processes_other_than_an_idle_shell_need_confirmation() {
 // Command builders.
 
 #[test]
+fn panes_warp_creates_start_through_the_installed_launcher() {
+    let launcher = Some("/home/me/.cache/warp/tmux/0123456789abcdef/warp-shell.sh");
+    assert_eq!(
+        split_window_command(PaneId(4), SplitPlacement::Right, launcher),
+        "split-window -h -t %4 -c '#{pane_current_path}' \
+         '/home/me/.cache/warp/tmux/0123456789abcdef/warp-shell.sh'"
+    );
+    assert_eq!(
+        new_window_command(Some(WindowId(2)), launcher),
+        "new-window -a -t @2 -c '#{pane_current_path}' \
+         '/home/me/.cache/warp/tmux/0123456789abcdef/warp-shell.sh'"
+    );
+}
+
+/// When the launcher install failed, Warp's split starts tmux's default shell (and the pane
+/// then follows the typed path's conditions, see `integration_tests`).
+#[test]
+fn without_a_launcher_warp_splits_start_the_default_shell() {
+    assert_eq!(
+        split_window_command(PaneId(4), SplitPlacement::Down, None),
+        "split-window -v -t %4 -c '#{pane_current_path}'"
+    );
+    assert_eq!(new_window_command(None, None), "new-window");
+}
+
+#[test]
 fn warp_actions_become_tmux_commands() {
     assert_eq!(
-        split_window_command(PaneId(4), SplitPlacement::Right),
+        split_window_command(PaneId(4), SplitPlacement::Right, None),
         "split-window -h -t %4 -c '#{pane_current_path}'"
     );
     assert_eq!(
-        split_window_command(PaneId(4), SplitPlacement::Left),
+        split_window_command(PaneId(4), SplitPlacement::Left, None),
         "split-window -h -b -t %4 -c '#{pane_current_path}'"
     );
     assert_eq!(
-        split_window_command(PaneId(4), SplitPlacement::Down),
+        split_window_command(PaneId(4), SplitPlacement::Down, None),
         "split-window -v -t %4 -c '#{pane_current_path}'"
     );
     assert_eq!(
-        split_window_command(PaneId(4), SplitPlacement::Up),
+        split_window_command(PaneId(4), SplitPlacement::Up, None),
         "split-window -v -b -t %4 -c '#{pane_current_path}'"
     );
     assert_eq!(kill_pane_command(PaneId(4)), "kill-pane -t %4");
     assert_eq!(kill_window_command(WindowId(2)), "kill-window -t @2");
     assert_eq!(
-        new_window_command(Some(WindowId(2))),
+        new_window_command(Some(WindowId(2)), None),
         "new-window -a -t @2 -c '#{pane_current_path}'"
     );
-    assert_eq!(new_window_command(None), "new-window");
+    assert_eq!(new_window_command(None, None), "new-window");
     assert_eq!(
         rename_window_command(WindowId(2), "a \"b\" $HOME\\x;\n"),
         "rename-window -t @2 \"a \\\"b\\\" \\$HOME\\\\x;\""

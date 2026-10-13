@@ -773,6 +773,10 @@ if [[ -z $WARP_BOOTSTRAPPED ]]; then
 
   function clear() {
       warp_send_json_message "{\"hook\": \"Clear\", \"value\": {\"session_id\": $WARP_SESSION_ID}}"
+      # In a tmux pane (marker-only mode) plain tmux clients share the screen; clear it for them.
+      if [[ -n $WARP_TMUX_MARKER_ONLY ]]; then
+        command clear "$@"
+      fi
   }
 
   function warp_finish_update {
@@ -1025,6 +1029,10 @@ if [[ -z $WARP_BOOTSTRAPPED ]]; then
   # in unsetting the PROMPT variables to avoid a double prompt. Resets the prompt, forcing
   # a re-print.
   function warp_change_prompt_modes_to_warp_prompt() {
+    # In a tmux pane (marker-only mode) the user's prompt stays: plain tmux clients see it.
+    if [[ -n $WARP_TMUX_MARKER_ONLY ]]; then
+      return
+    fi
     WARP_HONOR_PS1=0
 
     warp_update_prompt_vars
@@ -1466,7 +1474,9 @@ esac
   # Unset the prompt environment variable: Warp doesn't render the user's default prompt.
   # We explicitly unset this for performance optimizations and so that the we can read the
   # command directly from the command grid without having to parse the prompt.
-  export CONDA_CHANGEPS1=false
+  if [[ -z $WARP_TMUX_MARKER_ONLY ]]; then
+    export CONDA_CHANGEPS1=false
+  fi
 
   warp_update_prompt_vars
 

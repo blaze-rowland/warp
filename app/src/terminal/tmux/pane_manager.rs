@@ -26,6 +26,7 @@ use warpui::{
 
 use super::TmuxOriginId;
 use super::gateway::{TmuxGatewayEvent, TmuxGateways};
+use super::integration::TmuxIntegration;
 use super::pane_event_loop::{
     DisconnectedSink, PaneRequestSink, TmuxPaneEventLoop, TmuxPaneEventLoopEvent,
 };
@@ -121,7 +122,6 @@ impl TmuxPaneTerminalManager {
             ctx,
         );
         connect_resizes(origin, pane_id, &backend.event_loop, ctx);
-        connect_queue(origin, pane_id, &backend.event_loop, ctx);
 
         let prompt_type =
             ctx.add_model(|ctx| PromptType::new_dynamic_from_sessions(sessions.clone(), ctx));
@@ -148,7 +148,30 @@ impl TmuxPaneTerminalManager {
             )
         });
 
-        view.update(ctx, |view, _| view.mark_as_tmux_pane());
+        view.update(ctx, |view, _| view.mark_as_tmux_pane(origin, pane_id));
+
+        // The pane's output is parsed only once its session id is registered (U9, KTD8).
+        let queue_event_loop = backend.event_loop.clone();
+        let connect: Box<dyn FnOnce(&mut AppContext)> =
+            Box::new(move |ctx| connect_queue(origin, pane_id, &queue_event_loop, ctx));
+        if ctx.has_singleton_model::<TmuxIntegration>() {
+            let last_output = backend.event_loop.as_ref(ctx).last_output();
+            let integration_model = model.clone();
+            let weak_view = view.downgrade();
+            TmuxIntegration::handle(ctx).update(ctx, |integration, ctx| {
+                integration.pane_created(
+                    origin,
+                    pane_id,
+                    &integration_model,
+                    weak_view,
+                    last_output,
+                    connect,
+                    ctx,
+                );
+            });
+        } else {
+            connect(ctx);
+        }
 
         wire_up_pty_controller_with_surface(
             &backend.pty_controller,
@@ -200,6 +223,12 @@ impl TerminalManager for TmuxPaneTerminalManager {
             self.event_loop.update(app, |event_loop, ctx| {
                 event_loop.handle_message(Message::Shutdown, ctx);
             });
+            if app.has_singleton_model::<TmuxIntegration>() {
+                let (origin, pane_id) = (self.origin, self.pane_id);
+                TmuxIntegration::handle(app).update(app, |integration, _| {
+                    integration.pane_dropped(origin, pane_id);
+                });
+            }
         }
     }
 
@@ -298,6 +327,9 @@ pub(super) fn wire_pane_backend(
         model,
         ctx,
     );
+    // The pane's shell sources Warp's bootstrap itself, or Warp typed the init command; Warp
+    // never writes the bootstrap into a pane on its own (KTD7).
+    pty_controller.update(ctx, |pty_controller, _| pty_controller.set_is_tmux_pane());
     PaneBackend {
         model_events,
         pty_controller,

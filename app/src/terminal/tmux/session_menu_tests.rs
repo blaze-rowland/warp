@@ -157,3 +157,18 @@ fn menu_commands_are_not_rewritten_again() {
         crate::terminal::tmux::entry::Entry::ControlMode { .. }
     ));
 }
+
+/// U9: the menu's new session starts its first pane through the launcher.
+#[test]
+fn a_new_session_from_the_menu_starts_through_the_launcher() {
+    let launcher = "/home/me/.cache/warp/tmux/0123456789abcdef/warp-shell.sh";
+    assert_eq!(
+        command_for_with_launcher(&TmuxMenuAction::NewSession, None, true, Some(launcher)),
+        Some(format!("tmux -CC new {launcher}"))
+    );
+    // A nested pane runs tmux raw; it gets no launcher.
+    assert_eq!(
+        command_for_with_launcher(&TmuxMenuAction::NewSession, None, false, Some(launcher)),
+        Some("tmux new".to_owned())
+    );
+}

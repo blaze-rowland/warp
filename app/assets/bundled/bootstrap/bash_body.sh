@@ -1115,6 +1115,10 @@ if [ -z "$WARP_BOOTSTRAPPED" ]; then
     # Note that we use an "empty block" workaround to achieve instant prompt switching in bash, 
     # since there is no built-in methods to repaint the prompt, unlike Zsh/fish.
     function warp_change_prompt_modes_to_warp_prompt() {
+      # In a tmux pane (marker-only mode) the user's prompt stays: plain tmux clients see it.
+      if [[ -n "$WARP_TMUX_MARKER_ONLY" ]]; then
+        return
+      fi
       WARP_HONOR_PS1="0"
 
       warp_update_prompt_vars
@@ -1127,6 +1131,10 @@ if [ -z "$WARP_BOOTSTRAPPED" ]; then
             warp_send_hook_via_kv_pairs_end
         else
             warp_send_json_message "{\"hook\": \"Clear\", \"value\": {\"session_id\": $WARP_SESSION_ID}}"
+        fi
+        # In a tmux pane (marker-only mode) plain tmux clients share the screen; clear it for them.
+        if [[ -n "$WARP_TMUX_MARKER_ONLY" ]]; then
+            command clear "$@"
         fi
     }
 

@@ -1,0 +1,11 @@
+# Warp's tmux launcher points ZDOTDIR here so this file runs first. Put the user's ZDOTDIR back,
+# then run Warp's marker-only integration, which sources the user's startup files itself.
+if [[ -n ${WARP_TMUX_ZDOTDIR+x} ]]; then
+  ZDOTDIR=$WARP_TMUX_ZDOTDIR
+  unset WARP_TMUX_ZDOTDIR
+else
+  unset ZDOTDIR
+fi
+source "$WARP_TMUX_DIR/init.zsh"
+# The integration already sourced the remaining startup files.
+unsetopt rcs

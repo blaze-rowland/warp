@@ -217,13 +217,25 @@ pub fn show_kill_confirmation(
     on_confirm: impl FnOnce(&mut AppContext) + 'static,
     ctx: &mut AppContext,
 ) {
+    show_confirmation(title, text, "Yes, close", on_confirm, ctx);
+}
+
+/// Shows a native confirmation with `confirm_label` and Cancel. `on_confirm` runs only when the
+/// user confirms.
+pub fn show_confirmation(
+    title: &str,
+    text: String,
+    confirm_label: &str,
+    on_confirm: impl FnOnce(&mut AppContext) + 'static,
+    ctx: &mut AppContext,
+) {
     use warpui::modals::{AlertDialogWithCallbacks, ModalButton};
 
     let dialog = AlertDialogWithCallbacks::for_app(
         title,
         text,
         vec![
-            ModalButton::for_app("Yes, close".to_owned(), on_confirm),
+            ModalButton::for_app(confirm_label.to_owned(), on_confirm),
             ModalButton::for_app("Cancel".to_owned(), |_| {}),
         ],
         |_| {},
@@ -245,8 +257,8 @@ pub fn show_kill_confirmation(
     }
 }
 
-// Command builders: Warp actions as tmux commands. U9 adds its launcher where panes and windows
-// are created (`split_window_command`, `new_window_command`).
+// Command builders: Warp actions as tmux commands. Panes and windows Warp creates start through
+// U9's launcher when it is installed (`launcher`); otherwise they start tmux's default shell.
 
 /// Where a Warp split puts the new pane relative to the target pane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -257,15 +269,34 @@ pub enum SplitPlacement {
     Down,
 }
 
-/// Splits `target` the way a Warp split would, starting in the pane's directory.
-pub fn split_window_command(target: PaneId, placement: SplitPlacement) -> String {
+/// Splits `target` the way a Warp split would, starting in the pane's directory, through the
+/// launcher at `launcher` when there is one.
+pub fn split_window_command(
+    target: PaneId,
+    placement: SplitPlacement,
+    launcher: Option<&str>,
+) -> String {
     let flags = match placement {
         SplitPlacement::Right => "-h",
         SplitPlacement::Left => "-h -b",
         SplitPlacement::Down => "-v",
         SplitPlacement::Up => "-v -b",
     };
-    format!("split-window {flags} -t {target} -c '#{{pane_current_path}}'")
+    with_launcher(
+        format!("split-window {flags} -t {target} -c '#{{pane_current_path}}'"),
+        launcher,
+    )
+}
+
+/// Appends the launcher as the new pane's shell-command.
+fn with_launcher(command: String, launcher: Option<&str>) -> String {
+    match launcher {
+        Some(launcher) => format!(
+            "{command} {}",
+            super::integration::launcher_shell_command(launcher)
+        ),
+        None => command,
+    }
 }
 
 /// Kills a pane. Only an explicit close sends this (R25).
@@ -278,12 +309,14 @@ pub fn kill_window_command(window_id: WindowId) -> String {
     format!("kill-window -t {window_id}")
 }
 
-/// A new window after `after` (the active tab's window), in its directory.
-pub fn new_window_command(after: Option<WindowId>) -> String {
-    match after {
+/// A new window after `after` (the active tab's window), in its directory, through the launcher
+/// at `launcher` when there is one.
+pub fn new_window_command(after: Option<WindowId>, launcher: Option<&str>) -> String {
+    let command = match after {
         Some(window_id) => format!("new-window -a -t {window_id} -c '#{{pane_current_path}}'"),
         None => "new-window".to_owned(),
-    }
+    };
+    with_launcher(command, launcher)
 }
 
 pub fn rename_window_command(window_id: WindowId, name: &str) -> String {

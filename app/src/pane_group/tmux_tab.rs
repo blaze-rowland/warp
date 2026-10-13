@@ -403,8 +403,15 @@ impl PaneGroup {
                 Direction::Up => SplitPlacement::Up,
                 Direction::Down => SplitPlacement::Down,
             };
+            let launcher = crate::terminal::tmux::integration::TmuxIntegration::as_ref(ctx)
+                .launcher_path(origin, ctx);
             TmuxSessions::handle(ctx).update(ctx, |sessions, ctx| {
-                sessions.send_command(origin, split_window_command(target, placement), None, ctx);
+                sessions.send_command(
+                    origin,
+                    split_window_command(target, placement, launcher.as_deref()),
+                    None,
+                    ctx,
+                );
             });
         }
         #[cfg(not(feature = "local_tty"))]
