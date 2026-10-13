@@ -18,7 +18,7 @@ execution: code
 - **Target repo:** the user's fork of `warpdotdev/warp`. All file paths in this plan are relative to that repo's root. Move this plan into the fork's `docs/plans/` once it is cloned.
 - **Product authority:** This Product Contract, then the Planning Contract's KTDs on mechanism. Upstream spec PR #14864 is adopted as the baseline, and the deltas recorded here override it.
 - **Execution profile:** Deep, phased (Phases A–F under Implementation Units). Each unit lands as its own commit behind the feature flag, so the fork stays usable daily throughout.
-- **Stop conditions:** Stop and ask if U1 shows the fork cannot be built or run locally. Stop and ask if evidence shows tmux 3.4's key evaluation cannot honor bindings from a control client (KTD5). Stop and ask after U14's popup experiment (Outstanding Questions). Do not change product behavior in the Product Contract without the user.
+- **Stop conditions:** Stop and ask if U1 shows the fork cannot be built or run locally. Stop and ask if evidence shows tmux 3.4's key evaluation cannot honor bindings from a control client (KTD5). Do not change product behavior in the Product Contract without the user.
 - **Who finishes:** The user, or `ce-work` on the user's behalf, in the user's fork. Upstream submission is a separate, user-initiated step (U15 prepares it; nothing is pushed upstream automatically).
 - **Open blockers:** None block planning. Whether a self-built client can use Warp's hosted AI is an untested assumption that U1 checks.
 
@@ -49,7 +49,7 @@ Upstream knows about this. The tracking issue is #8492 (originally #42, from 202
 - **tmux bindings beat Warp shortcuts inside tmux tabs.** Governs R18, R19. (session-settled: user-approved — chosen over Warp-wins-with-tmux-fallback and over prefix-only: root-table bindings like vim-tmux-navigator's `ctrl+h/j/k/l` must work)
 - **Converted sessions open in the current window and the origin tab hides.** Governs R23, R24. (session-settled: user-approved — chosen over a dedicated window per session and over the origin tab becoming window 1: keeps the user in one window and gives detach an obvious place to land)
 - **Quit and window-close detach; tab and pane close kill.** Governs R25. (session-settled: user-approved — chosen over "everything detaches" and "ask each time": quitting must never destroy sessions, while cmd+W keeps meaning "close this")
-- **tmux prompts, menus and popups render natively, popups included.** Governs R26. (session-settled: user-approved — chosen over "prompts now, popups later" and "block and notify only": popup-driven plugins are part of the user's tmux workflow)
+- **tmux prompts, menus and popups render natively, popups included — script-opened popups too.** Governs R26, R30. (session-settled: user-approved — chosen over "prompts now, popups later" and "block and notify only": popup-driven plugins are part of the user's tmux workflow)
 - **Warp never types into a shared pane on its own.** While a plain client is attached, panes Warp did not create rely on the plugin or R8's action. Governs R7, R10. (session-settled: user-approved — chosen over always typing the setup command and over plugin-only: typed setup echoes to every attached client, but zero-setup coverage should stay when Warp is alone)
 - **tmux tabs are marked, and new-tab stays in tmux.** Governs R28. (session-settled: user-approved — chosen over a marker with plain new tabs and over no marker: sessions on several hosts must be distinguishable, and new tabs inside tmux should be tmux windows)
 - **Notices have fixed surfaces.** Governs R29. (session-settled: user-approved — chosen over toasts for everything and over leaving it to implementation: persistent states and long key lists need surfaces that stay visible)
@@ -94,6 +94,7 @@ Upstream knows about this. The tracking issue is #8492 (originally #42, from 202
 - R18. Inside a tmux-backed tab, any key bound in the attached server's key tables goes to tmux handling, even when Warp or Warp's input editor also uses it. Keys tmux does not bind go to Warp. Exception: Warp's reserved actions (command palette, quit, new window, settings, and a configurable escape-hatch chord) and IME composition always stay with Warp.
 - R19. The first time a user's tmux bindings shadow Warp shortcuts or editor keys, Warp shows a one-time notice listing the shadowed keys and stating that reserved keys (R18) always stay with Warp.
 - R20. Pane navigation over SSH that depends on the remote server (R16) stays usable on a typical home or office connection, and Warp shows feedback while a binding is in flight.
+- R30. Popups opened by scripts and plugins (tmux-fzf, `fzf-tmux -p`) open as floating Warp panes and block their caller until they close, as in plain tmux. A popup tmux opens invisibly on Warp's connection never swallows keys or hangs unnoticed: Warp offers to close it and says why. (session-settled: user-approved — chosen over a safety net only: popup-driven plugins are part of the user's workflow; a tmux 3.7c experiment showed script popups open hidden on control clients, block their caller and capture keys sent with `send-keys -K`)
 - R27. On a tmux server older than 3.4, sessions still render natively, but tmux bindings are not honored on that server and Warp says so once per server.
 
 **Session lifecycle**
@@ -174,10 +175,6 @@ Upstream knows about this. The tracking issue is #8492 (originally #42, from 202
 
 None remain. The planning questions this contract raised are answered by KTD1–KTD13 in the Planning Contract.
 
-**Returns to the user during implementation**
-
-- Do script-opened popups (tmux-fzf's `run-shell` → `fzf-tmux -p` → `display-popup`) stay in R26's scope? U14 begins with an experiment on tmux 3.7c that records what tmux does with such a popup when Warp's control client is the only client, then brings the result to the user before the popup work proceeds. Until then, R26 is committed only for interactive UI bound directly to a key.
-
 ### Sources / Research
 
 - Upstream spec: PR #14864, `specs/GH8492/product.md` and `specs/GH8492/tech.md`.
@@ -207,6 +204,7 @@ None remain. The planning questions this contract raised are answered by KTD1–
 - KTD10. **tmux interactive UI is intercepted before it reaches tmux.** Before routing a key through `send-keys -K`, Warp looks up its bound command (from the KTD5 mirror). If that command is `confirm-before`, `command-prompt`, `display-menu`, `display-popup`, `choose-tree`/`choose-session` or `display-panes`, Warp renders it natively and sends the resulting command over the control channel. tmux expands formats (`display-message -p`), so Warp never hand-parses tmux quoting. For a popup, Warp runs its command in a temporary tmux window and shows that pane as a floating Warp pane, closing it on exit. `%message` becomes a toast, and `%pane-mode-changed` into copy or choose mode shows a "tmux mode — press q" overlay so the pane never looks frozen. Implements R26.
 - KTD11. **The continuum autosave stand-in lives in the client.** On attach, Warp reads `@continuum-save-interval` and the resurrect save script path. If both are present, Warp runs the save with `run-shell -b` on that interval while it is attached, skipping when a plain client is also attached (that client's status line already drives continuum). Implements R5. The control client never draws a status line, so continuum's own trigger never fires.
 - KTD12. **The gateway thread splits bytes and never parses panes.** The entry detector and control parser run on raw reads before `pty_read` takes the origin model's lock (`crates/warp_terminal/src/local_tty/event_loop.rs`). Pane payloads go to a bounded queue per pane, parsed on a background executor. A queue past its high-water mark sends `refresh-client -A '%N:pause'` and resyncs on resume, in addition to tmux's time-based `pause-after`. One busy pane then cannot delay replies or other panes.
+- KTD14. **Script-opened popups are intercepted by a `tmux` wrapper on PATH.** A tmux 3.7c experiment showed `display-popup`/`popup` from a script targets the most recently active client; on a control client it runs hidden, blocks the caller, and captures keys sent through `send-keys -K`; no notification, format or hook reveals it. Warp puts a small `tmux` wrapper first on PATH in tmux panes and in `set-environment -g PATH` (so `run-shell` jobs see it). The wrapper turns `popup`/`display-popup` into `new-window -d "<cmd>; tmux wait-for -S <ch>"` plus `tmux wait-for <ch>`, passes the exit status through, and `exec`s the real tmux for everything else; Warp shows that window as a floating pane (KTD10). `command-alias` overrides were rejected: they lose the blocking behavior and break fzf-tmux. Safety net for scripts calling tmux by absolute path: Warp watches for a popup-like child (e.g. fzf) under the server with no visible pane and offers "Close hidden popup" (`display-popup -C -c <client>`), with a toast explaining it.
 - KTD13. **The control channel has health checks.** At most four `send-keys -K` commands are unacknowledged at once, and the rest wait client-side. A queued key older than 1 s is dropped only when it is a root-table key whose mirrored command is pane or window navigation (`select-pane`, `select-window`, or `if-shell` wrapping them), per R20. Keys sent while the client is in a non-root table or a pane mode are never dropped. Any command unanswered after 3 seconds shows a "tmux not responding" banner on the session's tabs, which covers a binding stuck in a synchronous `if-shell` or `run-shell`. A parser desync drops the session to Disconnected with Reattach and keeps the raw bytes in a debug log instead of feeding garbage to panes. Gateway EOF signals the control core, which marks every tab Disconnected. Server-wide hooks Warp installs (`after-bind-key`) carry a Warp tag, and every attach clears stale tagged hooks left by a crashed Warp.
 
 ### High-Level Technical Design
@@ -846,7 +844,7 @@ flowchart TB
 
 **Goal:** tmux prompts, menus, pickers, popups and messages render natively, and nothing leaves a hidden prompt waiting.
 
-**Requirements:** R26. AE9. KTD10.
+**Requirements:** R26, R30. AE9. KTD10, KTD14.
 
 **Dependencies:** U8, U13.
 
@@ -855,7 +853,7 @@ flowchart TB
 - Test: `app/src/terminal/tmux/native_ui_tests.rs`, `app/src/terminal/tmux/popup_tests.rs`
 
 **Approach:**
-1. First, run the script-opened popup experiment (Outstanding Questions) and stop for the user's decision before building popup support.
+1. Build the KTD14 PATH wrapper and safety net, installed alongside the U9 launcher.
 2. Classify the bound command from the mirror before routing.
 3. Native rendering per command:
    - `confirm-before`: Warp confirm dialog, then send the inner command.
@@ -885,6 +883,8 @@ flowchart TB
 - A command-prompt that reaches tmux unintercepted is cancelled by the watchdog, a toast names it, and later keys still work.
 - `prefix w` shows sessions with their windows and panes, and choosing a pane in another window focuses it.
 - Esc on a native confirm sends nothing and returns focus to the previous pane.
+- A script running `fzf-tmux -p` opens a floating Warp pane, blocks until a selection, and returns the selection (live test).
+- A popup started by calling tmux by absolute path is detected as hidden and offered for closing, and keys sent meanwhile are not swallowed.
 
 **Verification:** AE9 passes live against local tmux with tmux-fzf installed.
 
@@ -935,7 +935,7 @@ Flag-off parity is a gate for every unit: with `terminal.tmux_control_mode` off,
 
 ## Definition of Done
 
-- Every R1–R29 is implemented or explicitly degraded as the contract states, and every AE1–AE10 has a passing test or a recorded manual check.
+- Every R1–R30 is implemented or explicitly degraded as the contract states, and every AE1–AE10 has a passing test or a recorded manual check.
 - F1, F2 and F3 work in the dev build, locally and against an SSH host.
 - The Verification Contract gates pass.
 - With the master flag off, behavior is identical to master.
