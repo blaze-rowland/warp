@@ -58,6 +58,9 @@ pub enum TmuxGatewayEvent {
     Ended { origin: TmuxOriginId },
 }
 
+/// The tag on commands sent just before a detach. Nothing waits for their replies.
+pub const DETACH_COMMAND_TAG: u64 = u64::MAX - 1;
+
 /// Sends requests to one origin's gateway through its PTY event loop.
 #[derive(Clone)]
 pub struct TmuxRequestSender(mio_channel::Sender<Message>);
@@ -77,6 +80,8 @@ struct Origin {
     model: Option<SessionModel>,
     /// Between `Starting` and `Ended`.
     in_session: bool,
+    /// Sent before a detach, e.g. to remove the key router's hooks (U13, KTD13).
+    detach_commands: Vec<String>,
 }
 
 /// The app's end of every PTY's tmux gateway. See the module docs.
@@ -155,6 +160,7 @@ impl TmuxGateways {
                 pane_queues: HashMap::new(),
                 model: None,
                 in_session: false,
+                detach_commands: Vec::new(),
             },
         );
         let link = GatewayLink {
@@ -218,8 +224,33 @@ impl TmuxGateways {
     /// turning off, R22).
     pub fn detach_all(&self) {
         for origin in self.origins.values().filter(|origin| origin.in_session) {
-            origin.requests.send(TmuxRequest::Detach);
+            Self::detach_origin(origin);
         }
+    }
+
+    /// Detaches `origin`'s session, after the commands registered with
+    /// [`Self::set_detach_commands`].
+    pub fn detach(&self, origin: TmuxOriginId) {
+        if let Some(origin) = self.origins.get(&origin) {
+            Self::detach_origin(origin);
+        }
+    }
+
+    /// Commands to send just before `origin` detaches, replacing earlier ones.
+    pub fn set_detach_commands(&mut self, origin: TmuxOriginId, commands: Vec<String>) {
+        if let Some(origin) = self.origins.get_mut(&origin) {
+            origin.detach_commands = commands;
+        }
+    }
+
+    fn detach_origin(origin: &Origin) {
+        for line in &origin.detach_commands {
+            origin.requests.send(TmuxRequest::Command {
+                tag: DETACH_COMMAND_TAG,
+                line: line.clone(),
+            });
+        }
+        origin.requests.send(TmuxRequest::Detach);
     }
 
     fn sync_switch(&mut self, ctx: &mut ModelContext<Self>) {
@@ -291,6 +322,7 @@ impl TmuxGateways {
                     entry.pane_queues.clear();
                     entry.in_session = false;
                     entry.model = None;
+                    entry.detach_commands.clear();
                 }
                 TmuxGatewayEvent::Ended { origin }
             }

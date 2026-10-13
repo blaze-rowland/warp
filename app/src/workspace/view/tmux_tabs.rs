@@ -11,19 +11,27 @@ use std::sync::Arc;
 use warp_terminal::tmux::{SessionModel, WindowId};
 use warpui::{SingletonEntity as _, ViewContext, ViewHandle};
 
-use super::Workspace;
+use super::{TabConfigsMenuOpenSource, Workspace};
+use crate::menu::{MenuItem, MenuItemFields};
 use crate::pane_group::{PaneGroup, PanesLayout};
 use crate::tab::TabData;
-use crate::terminal::model::ansi::Processor;
+use crate::terminal::model::session::command_executor::ExecuteCommandOptions;
 use crate::terminal::tmux::TmuxOriginId;
 use crate::terminal::tmux::gateway::TmuxGateways;
 use crate::terminal::tmux::layout_snapshot::{layout_to_snapshot, tab_layout};
+use crate::terminal::tmux::session_menu::{
+    ATTACH_LABEL, ListOutcome, MenuEntry, NEW_SESSION_LABEL, TmuxMenuAction, attach_menu_entries,
+    command_for, list_outcome, list_sessions_command,
+};
+use crate::terminal::tmux::settings::TmuxSettings;
 use crate::terminal::tmux::workspace_sync::{
     OpenTab, SessionStatus, TmuxSessionEvent, TmuxSessions, WindowOp, busy_commands,
-    close_confirmation_text, insertion_offset, kill_window_command,
-    new_window_command, plan_window_sync, reattach_command, rename_window_command,
-    show_kill_confirmation, window_commands_query,
+    close_confirmation_text, insertion_offset, kill_window_command, new_window_command,
+    plan_window_sync, reattach_command, rename_window_command, show_kill_confirmation,
+    window_commands_query,
 };
+use crate::ui_components::icons;
+use crate::workspace::action::WorkspaceAction;
 
 impl Workspace {
     /// Follows tmux sessions whose origin tab is in this workspace.
@@ -51,7 +59,8 @@ impl Workspace {
                     .get(self.active_tab_index)
                     .and_then(|tab| tab.pane_group.as_ref(ctx).tmux_tab().map(|t| t.origin))
                     == Some(*origin);
-                if active_is_session && let Some(index) = self.tmux_tab_index(*origin, *window_id, ctx)
+                if active_is_session
+                    && let Some(index) = self.tmux_tab_index(*origin, *window_id, ctx)
                 {
                     self.activate_tab(index, ctx);
                 }
@@ -63,7 +72,9 @@ impl Workspace {
             } => {
                 if let Some(index) = self.tmux_tab_index(*origin, *window_id, ctx) {
                     let pane_group = self.tabs[index].pane_group.clone();
-                    pane_group.update(ctx, |pane_group, ctx| pane_group.focus_tmux_pane(*pane_id, ctx));
+                    pane_group.update(ctx, |pane_group, ctx| {
+                        pane_group.focus_tmux_pane(*pane_id, ctx)
+                    });
                 }
             }
             TmuxSessionEvent::StatusChanged { .. } => ctx.notify(),
@@ -71,6 +82,9 @@ impl Workspace {
                 self.end_tmux_session(*origin, line.as_deref(), ctx)
             }
             TmuxSessionEvent::Focus { origin } => self.focus_tmux_session(*origin, ctx),
+            TmuxSessionEvent::Notice { origin, line } => {
+                self.write_tmux_origin_line(*origin, line, ctx)
+            }
         }
     }
 
@@ -99,7 +113,11 @@ impl Workspace {
     }
 
     /// `origin`'s tmux tabs in tab order, with the window each shows.
-    fn tmux_tabs_of(&self, origin: TmuxOriginId, ctx: &ViewContext<Self>) -> Vec<(usize, WindowId)> {
+    fn tmux_tabs_of(
+        &self,
+        origin: TmuxOriginId,
+        ctx: &ViewContext<Self>,
+    ) -> Vec<(usize, WindowId)> {
         self.tabs
             .iter()
             .enumerate()
@@ -136,8 +154,9 @@ impl Workspace {
             })
             .filter(|host| !host.is_empty())
             .unwrap_or_else(|| "this computer".to_owned());
-        let duplicate = TmuxSessions::handle(ctx)
-            .update(ctx, |sessions, ctx| sessions.register_host(origin, host, ctx));
+        let duplicate = TmuxSessions::handle(ctx).update(ctx, |sessions, ctx| {
+            sessions.register_host(origin, host, ctx)
+        });
         if duplicate.is_some() {
             // Step 5: the session is already open here; its tabs get focus and this attach
             // detaches without opening a second set of tabs.
@@ -149,7 +168,12 @@ impl Workspace {
 
     /// Brings `origin`'s tabs in line with its session model (KTD4). On attach the first tab
     /// takes the origin tab's place and the origin tab hides (R23).
-    fn sync_tmux_session(&mut self, origin: TmuxOriginId, attaching: bool, ctx: &mut ViewContext<Self>) {
+    fn sync_tmux_session(
+        &mut self,
+        origin: TmuxOriginId,
+        attaching: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
         let Some(model) = TmuxGateways::as_ref(ctx).model(origin).cloned() else {
             return;
         };
@@ -207,7 +231,8 @@ impl Workspace {
                 WindowOp::Rename { window_id, title } => {
                     if let Some(index) = self.tmux_tab_index(origin, window_id, ctx) {
                         let pane_group = self.tabs[index].pane_group.clone();
-                        pane_group.update(ctx, |pane_group, ctx| pane_group.set_tmux_title(title, ctx));
+                        pane_group
+                            .update(ctx, |pane_group, ctx| pane_group.set_tmux_title(title, ctx));
                     }
                 }
                 WindowOp::Open { window_id, title } => {
@@ -227,7 +252,11 @@ impl Workspace {
             let target = model
                 .active_window()
                 .and_then(|window_id| self.tmux_tab_index(origin, window_id, ctx))
-                .or_else(|| self.tmux_tabs_of(origin, ctx).first().map(|(index, _)| *index));
+                .or_else(|| {
+                    self.tmux_tabs_of(origin, ctx)
+                        .first()
+                        .map(|(index, _)| *index)
+                });
             if let Some(index) = target {
                 self.activate_tab(index, ctx);
             }
@@ -276,7 +305,9 @@ impl Workspace {
             commands.get(&pane).cloned()
         });
         let tips_completed = self.tips_completed.clone();
-        let banner = self.user_default_shell_unsupported_banner_model_handle.clone();
+        let banner = self
+            .user_default_shell_unsupported_banner_model_handle
+            .clone();
         let server_api = self.server_api.clone();
         let model_event_sender = self.model_event_sender.clone();
         let pane_group: ViewHandle<PaneGroup> = ctx.add_typed_action_view(|ctx| {
@@ -300,7 +331,8 @@ impl Workspace {
         tab.group_id = self.tabs[origin_index].group_id;
         let insert_at = insert_at.min(self.tabs.len());
         self.tabs.insert(insert_at, tab);
-        self.tab_mru_order.push(self.tabs[insert_at].pane_group.id());
+        self.tab_mru_order
+            .push(self.tabs[insert_at].pane_group.id());
         if insert_at <= self.active_tab_index && self.tabs.len() > 1 {
             self.active_tab_index += 1;
         }
@@ -308,7 +340,12 @@ impl Workspace {
 
     /// The session ended: its tabs go away and the origin tab comes back where it was, with a
     /// line naming the session and how it ended (R24).
-    fn end_tmux_session(&mut self, origin: TmuxOriginId, line: Option<&str>, ctx: &mut ViewContext<Self>) {
+    fn end_tmux_session(
+        &mut self,
+        origin: TmuxOriginId,
+        line: Option<&str>,
+        ctx: &mut ViewContext<Self>,
+    ) {
         let Some(origin_index) = self.tmux_origin_tab_index(origin, ctx) else {
             return;
         };
@@ -323,26 +360,33 @@ impl Workspace {
         for (index, _) in self.tmux_tabs_of(origin, ctx).into_iter().rev() {
             self.remove_tab(index, false, true, ctx);
         }
-        if let Some(line) = line
-            && let Some(origin_index) = self.tmux_origin_tab_index(origin, ctx)
-            && let Some(view) = self.tabs[origin_index]
-                .pane_group
-                .as_ref(ctx)
-                .tmux_origin_view(origin, ctx)
-        {
-            let model = view.as_ref(ctx).model.clone();
-            let mut parser = Processor::new();
-            parser.parse_bytes(
-                &mut *model.lock(),
-                format!("{line}\r\n").as_bytes(),
-                &mut std::io::sink(),
-            );
-            ctx.notify();
+        if let Some(line) = line {
+            self.write_tmux_origin_line(origin, line, ctx);
         }
         if was_in_session && let Some(origin_index) = self.tmux_origin_tab_index(origin, ctx) {
             self.activate_tab(origin_index, ctx);
         }
         ctx.notify();
+    }
+
+    /// Writes `line` into the origin pane as terminal output (R24, R29).
+    fn write_tmux_origin_line(
+        &mut self,
+        origin: TmuxOriginId,
+        line: &str,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(origin_index) = self.tmux_origin_tab_index(origin, ctx) else {
+            return;
+        };
+        let Some(view) = self.tabs[origin_index]
+            .pane_group
+            .as_ref(ctx)
+            .tmux_origin_view(origin, ctx)
+        else {
+            return;
+        };
+        view.update(ctx, |view, ctx| view.write_tmux_note(line, ctx));
     }
 
     /// Focuses an already-attached session's tabs (step 5).
@@ -363,7 +407,11 @@ impl Workspace {
     }
 
     /// The tmux tab at `index`'s session and window.
-    fn tmux_tab_at(&self, index: usize, ctx: &ViewContext<Self>) -> Option<(TmuxOriginId, WindowId)> {
+    fn tmux_tab_at(
+        &self,
+        index: usize,
+        ctx: &ViewContext<Self>,
+    ) -> Option<(TmuxOriginId, WindowId)> {
         let tab = self.tabs.get(index)?.pane_group.as_ref(ctx).tmux_tab()?;
         Some((tab.origin, tab.window_id))
     }
@@ -436,7 +484,12 @@ impl Workspace {
 
     /// Renaming a tmux tab renames its window; `%window-renamed` updates the title. Returns
     /// false for other tabs.
-    pub(super) fn tmux_rename_tab(&mut self, index: usize, name: &str, ctx: &mut ViewContext<Self>) -> bool {
+    pub(super) fn tmux_rename_tab(
+        &mut self,
+        index: usize,
+        name: &str,
+        ctx: &mut ViewContext<Self>,
+    ) -> bool {
         let Some((origin, window_id)) = self.tmux_tab_at(index, ctx) else {
             return false;
         };
@@ -466,7 +519,105 @@ impl Workspace {
             return;
         };
         let command = reattach_command(&name);
-        view.update(ctx, |view, ctx| view.execute_command_or_set_pending(&command, ctx));
+        view.update(ctx, |view, ctx| {
+            view.execute_command_or_set_pending(&command, ctx)
+        });
+    }
+}
+
+// The session menu (R2).
+impl Workspace {
+    /// New and Attach for the new-session menu, while control mode is on and the active pane can
+    /// run them (not a tmux pane).
+    pub(super) fn tmux_new_session_menu_items(
+        &self,
+        ctx: &mut ViewContext<Self>,
+    ) -> Option<Vec<MenuItem<WorkspaceAction>>> {
+        if !TmuxSettings::as_ref(ctx).control_mode_enabled() {
+            return None;
+        }
+        self.active_session_view(ctx)?
+            .as_ref(ctx)
+            .tmux_menu_target(ctx)?;
+        Some(vec![
+            MenuItemFields::new(NEW_SESSION_LABEL)
+                .with_on_select_action(WorkspaceAction::TmuxSessionMenu(TmuxMenuAction::NewSession))
+                .with_icon(icons::Icon::Terminal)
+                .into_item(),
+            MenuItemFields::new(ATTACH_LABEL)
+                .with_on_select_action(WorkspaceAction::TmuxSessionMenu(
+                    TmuxMenuAction::ListSessions,
+                ))
+                .with_icon(icons::Icon::Terminal)
+                .into_item(),
+        ])
+    }
+
+    /// Runs a session menu entry against the active pane: lists its host's sessions, or runs the
+    /// chosen tmux command in it.
+    pub(super) fn handle_tmux_menu_action(
+        &mut self,
+        action: TmuxMenuAction,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if !TmuxSettings::as_ref(ctx).control_mode_enabled() {
+            return;
+        }
+        let Some(view) = self.active_session_view(ctx) else {
+            return;
+        };
+        let Some(target) = view.as_ref(ctx).tmux_menu_target(ctx) else {
+            return;
+        };
+        let Some(command) = command_for(&action, target.socket.as_ref(), !target.nested) else {
+            // Listing runs through the session's executor, so a Warpified SSH pane lists the
+            // remote host's sessions without typing into the pane.
+            let list = list_sessions_command(target.socket.as_ref());
+            let session = target.session;
+            let _ = ctx.spawn(
+                async move {
+                    session
+                        .execute_command(&list, None, None, ExecuteCommandOptions::default())
+                        .await
+                },
+                |me, result, ctx| {
+                    let outcome = match result {
+                        Ok(output) => list_outcome(
+                            output.success(),
+                            &String::from_utf8_lossy(&output.stdout),
+                            &String::from_utf8_lossy(&output.stderr),
+                        ),
+                        Err(error) => ListOutcome::Failed(error.to_string()),
+                    };
+                    me.open_tmux_attach_menu(&outcome, ctx);
+                },
+            );
+            return;
+        };
+        view.update(ctx, |view, ctx| {
+            view.execute_command_or_set_pending(&command, ctx)
+        });
+    }
+
+    fn open_tmux_attach_menu(&mut self, outcome: &ListOutcome, ctx: &mut ViewContext<Self>) {
+        let items = attach_menu_entries(outcome)
+            .into_iter()
+            .map(|entry| match entry {
+                MenuEntry::Item {
+                    label,
+                    action: Some(action),
+                } => MenuItemFields::new(label)
+                    .with_on_select_action(WorkspaceAction::TmuxSessionMenu(action))
+                    .into_item(),
+                MenuEntry::Item {
+                    label,
+                    action: None,
+                } => MenuItemFields::new(label).with_disabled(true).into_item(),
+                MenuEntry::Separator => MenuItem::Separator,
+            })
+            .collect();
+        let anchor = self.keyboard_new_session_menu_anchor(ctx);
+        self.open_new_session_menu_with(anchor, items, TabConfigsMenuOpenSource::Pointer, ctx);
     }
 }
 

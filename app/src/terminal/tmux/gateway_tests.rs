@@ -179,7 +179,9 @@ fn turning_the_master_setting_off_detaches_every_running_session() {
         set_control_mode(&mut app, false);
         assert!(matches!(
             rx.try_recv(),
-            Ok(warp_terminal::writeable_pty::Message::Tmux(TmuxRequest::Detach))
+            Ok(warp_terminal::writeable_pty::Message::Tmux(
+                TmuxRequest::Detach
+            ))
         ));
         // An origin without a session gets nothing.
         assert!(idle_rx.try_recv().is_err());
@@ -200,10 +202,15 @@ fn the_session_model_is_kept_while_the_session_runs() {
             g.deliver_for_test(origin, GatewayEvent::Model(Box::new(model)), ctx);
         });
         gateways.read(&app, |g, _| {
-            let name = g.model(origin).and_then(|m| m.session()).map(|s| s.name.clone());
+            let name = g
+                .model(origin)
+                .and_then(|m| m.session())
+                .map(|s| s.name.clone());
             assert_eq!(name.as_deref(), Some("work"));
         });
-        gateways.update(&mut app, |g, ctx| g.deliver_for_test(origin, GatewayEvent::Ended, ctx));
+        gateways.update(&mut app, |g, ctx| {
+            g.deliver_for_test(origin, GatewayEvent::Ended, ctx)
+        });
         gateways.read(&app, |g, _| {
             assert!(g.model(origin).is_none());
             assert!(!g.is_in_session(origin));

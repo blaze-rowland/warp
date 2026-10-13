@@ -1533,6 +1533,10 @@ pub(crate) fn initialize_app(
     ctx.add_singleton_model(crate::terminal::tmux::pane_manager::TmuxWindowSizer::new);
     #[cfg(feature = "local_tty")]
     ctx.add_singleton_model(crate::terminal::tmux::workspace_sync::TmuxSessions::new);
+    #[cfg(feature = "local_tty")]
+    ctx.add_singleton_model(crate::terminal::tmux::keys::TmuxKeyRouter::new);
+    #[cfg(feature = "local_tty")]
+    crate::terminal::tmux::key_capture::init(ctx);
     timer.mark_interval_end("READ_USER_DEFAULTS_AND_INITIALIZE_SETTINGS");
 
     if FeatureFlag::UIZoom.is_enabled() {

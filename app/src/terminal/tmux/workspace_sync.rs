@@ -11,17 +11,17 @@
 
 use std::collections::HashMap;
 
-use warp_terminal::local_tty::tmux_gateway::TmuxRequest;
+use warp_terminal::local_tty::tmux_gateway::{RefusalReason, TmuxRequest};
 use warp_terminal::tmux::{
     ClientEvent, CommandReply, PaneId, SessionId, SessionModel, TmuxWindow, WindowId,
 };
 use warpui::{AppContext, Entity, ModelContext, SingletonEntity};
 
+use super::TmuxOriginId;
+use super::gateway::{TmuxGatewayEvent, TmuxGateways};
 pub use super::hidden_tabs::{
     last_visible, nearest_visible, raw_to_visible, step_visible, visible_to_raw,
 };
-use super::TmuxOriginId;
-use super::gateway::{TmuxGatewayEvent, TmuxGateways};
 use super::pane_manager::WINDOW_SIZE_COMMAND_TAG;
 use crate::terminal::shell::ShellType;
 
@@ -136,6 +136,8 @@ pub enum SessionEnd {
     AttachFailed(Option<String>),
     /// The transport or the reply stream broke.
     Disconnected,
+    /// The gateway refused the session (R6), with the reason.
+    Refused(String),
 }
 
 /// The line the origin tab shows when the session ends, naming the session and how it ended.
@@ -155,7 +157,13 @@ pub fn end_line(session: &str, end: &SessionEnd) -> String {
         SessionEnd::AttachFailed(Some(error)) => format!("[tmux: {}]", sanitize_title(error)),
         SessionEnd::AttachFailed(None) => "[tmux: could not attach]".to_owned(),
         SessionEnd::Disconnected => format!("[lost connection to {session}]"),
+        SessionEnd::Refused(reason) => format!("[tmux: {reason}]"),
     }
+}
+
+/// The line the origin pane shows when a control-mode entry stays raw (R6, R29).
+pub fn refusal_line(reason: &RefusalReason) -> String {
+    end_line("", &SessionEnd::Refused(reason.to_string()))
 }
 
 // Close confirmation (R25).
@@ -170,7 +178,10 @@ pub fn is_idle_shell(command: Option<&str>) -> bool {
     }
     let name = command.trim_start_matches('-');
     let name = name.rsplit('/').next().unwrap_or(name);
-    matches!(name, "sh" | "dash" | "ksh" | "mksh" | "tcsh" | "csh" | "nu" | "xonsh")
+    matches!(
+        name,
+        "sh" | "dash" | "ksh" | "mksh" | "tcsh" | "csh" | "nu" | "xonsh"
+    )
 }
 
 /// The commands other than idle shells in a `#{pane_current_command}` reply.
@@ -228,7 +239,9 @@ pub fn show_kill_confirmation(
         .views_of_type::<crate::workspace::Workspace>(window_id)
         .and_then(|workspaces| workspaces.first().cloned())
     {
-        workspace.update(ctx, |workspace, ctx| workspace.show_native_modal(dialog, ctx));
+        workspace.update(ctx, |workspace, ctx| {
+            workspace.show_native_modal(dialog, ctx)
+        });
     }
 }
 
@@ -416,6 +429,8 @@ pub enum TmuxSessionEvent {
     },
     /// Focus this already-attached session's tabs.
     Focus { origin: TmuxOriginId },
+    /// Show `line` in the origin pane; no session started (R6, R29).
+    Notice { origin: TmuxOriginId, line: String },
 }
 
 /// Called with a tagged command's reply. It runs inside the registry's update, so it gets the
@@ -466,6 +481,25 @@ impl TmuxSessions {
         ctx: &mut ModelContext<Self>,
     ) -> Option<u64> {
         let sender = TmuxGateways::as_ref(ctx).request_sender(origin)?;
+        // A `source-file` may rebind keys; refresh the key mirror once it ran (R17).
+        let on_reply = if super::key_tables::is_source_file_command(&line)
+            && ctx.has_singleton_model::<super::keys::TmuxKeyRouter>()
+        {
+            let inner = on_reply;
+            Some(Box::new(
+                move |reply: &CommandReply,
+                      sessions: &mut TmuxSessions,
+                      ctx: &mut ModelContext<TmuxSessions>| {
+                    super::keys::TmuxKeyRouter::handle(ctx)
+                        .update(ctx, |router, ctx| router.refresh(origin, ctx));
+                    if let Some(inner) = inner {
+                        inner(reply, sessions, ctx);
+                    }
+                },
+            ) as ReplyCallback)
+        } else {
+            on_reply
+        };
         let tag = self.next_tag;
         self.next_tag += 1;
         if self.next_tag == WINDOW_SIZE_COMMAND_TAG {
@@ -530,9 +564,7 @@ impl TmuxSessions {
 
     /// Sends a detach to `origin`'s session.
     pub fn detach(&self, origin: TmuxOriginId, ctx: &AppContext) {
-        if let Some(sender) = TmuxGateways::as_ref(ctx).request_sender(origin) {
-            sender.send(TmuxRequest::Detach);
-        }
+        TmuxGateways::as_ref(ctx).detach(origin);
     }
 
     /// Forgets a disconnected session whose tabs were closed.
@@ -549,7 +581,10 @@ impl TmuxSessions {
     fn on_gateway_event(&mut self, event: &TmuxGatewayEvent, ctx: &mut ModelContext<Self>) {
         match event {
             TmuxGatewayEvent::Starting { origin } => {
-                let session = self.sessions.entry(*origin).or_insert_with(SessionInfo::new);
+                let session = self
+                    .sessions
+                    .entry(*origin)
+                    .or_insert_with(SessionInfo::new);
                 session.status = SessionStatus::Starting;
                 session.end = None;
                 session.duplicate_of = None;
@@ -563,7 +598,17 @@ impl TmuxSessions {
                 }
             }
             TmuxGatewayEvent::Ended { origin } => self.on_ended(*origin, ctx),
-            TmuxGatewayEvent::Refused { .. } | TmuxGatewayEvent::PaneQueueReady { .. } => {}
+            TmuxGatewayEvent::Refused { origin, reason } => {
+                match self.sessions.get_mut(origin) {
+                    // A refused handshake detaches; its end line gives the reason, not "detached".
+                    Some(session) => session.end = Some(SessionEnd::Refused(reason.to_string())),
+                    None => ctx.emit(TmuxSessionEvent::Notice {
+                        origin: *origin,
+                        line: refusal_line(reason),
+                    }),
+                }
+            }
+            TmuxGatewayEvent::PaneQueueReady { .. } => {}
         }
     }
 
@@ -626,6 +671,8 @@ impl TmuxSessions {
                     ctx.emit(TmuxSessionEvent::StatusChanged { origin });
                 }
             }
+            ClientEvent::Exited { .. } | ClientEvent::AttachFailed { .. }
+                if matches!(session.end, Some(SessionEnd::Refused(_))) => {}
             ClientEvent::Exited { reason } => {
                 session.end = Some(SessionEnd::Exited(reason.clone()));
             }
@@ -649,6 +696,7 @@ impl TmuxSessions {
             | ClientEvent::Message { .. }
             | ClientEvent::ConfigError { .. }
             | ClientEvent::CommandCompleted { .. }
+            | ClientEvent::ClientKeyAcknowledged
             | ClientEvent::ClientKeyDropped { .. } => {}
         }
     }

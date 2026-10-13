@@ -13,7 +13,8 @@ pub mod version;
 
 pub use client::{
     ClientConfig, ClientEvent, ClientKey, CommandError, CommandId, ControlClient, KeyBinding,
-    KeyClass, KeyConfig, PaneSnapshot, Phase, SnapshotKind,
+    KeyClass, KeyConfig, LIST_KEYS_FORMAT, PaneSnapshot, Phase, SnapshotKind,
+    parse_key_binding_line, quote_argument,
 };
 pub use encode::{
     refresh_client_size_command, refresh_client_window_size_command, send_keys_command,

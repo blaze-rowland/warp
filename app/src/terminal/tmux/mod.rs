@@ -1,13 +1,20 @@
 //! Native tmux integration via tmux control mode (`tmux -CC`).
 
+pub mod entry;
 #[cfg(feature = "local_tty")]
 pub mod gateway;
 pub mod hidden_tabs;
+#[cfg(feature = "local_tty")]
+pub mod key_capture;
+pub mod key_tables;
+#[cfg(feature = "local_tty")]
+pub mod keys;
 pub mod layout_snapshot;
 #[cfg(feature = "local_tty")]
 pub mod pane_event_loop;
 #[cfg(feature = "local_tty")]
 pub mod pane_manager;
+pub mod session_menu;
 pub mod settings;
 #[cfg(feature = "local_tty")]
 pub mod workspace_sync;

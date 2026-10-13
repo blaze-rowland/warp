@@ -214,14 +214,16 @@ fn a_disabled_gateway_is_not_engaged_and_passes_everything_through() {
 }
 
 #[test]
-fn entry_writes_the_version_query_and_splits_shell_bytes() {
+fn entry_splits_shell_bytes_and_writes_the_version_query_once_the_attach_succeeds() {
     let (mut gateway, events) = gateway(true);
     let mut writes = VecDeque::new();
     assert_eq!(
-        gateway.route(b"prompt\x1bP1000p%sessions-changed\n", &mut writes),
+        gateway.route(b"prompt\x1bP1000p%begin 1 280 0\n", &mut writes),
         Routed::Split(b"prompt".to_vec())
     );
     assert!(gateway.in_session());
+    assert!(writes.is_empty());
+    gateway.route(b"%end 1 280 0\n%sessions-changed\n", &mut writes);
     assert_eq!(
         writes.pop_front().as_deref(),
         Some(b"display-message -p '#{version}\t#{client_name}'\n".as_slice())

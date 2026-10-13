@@ -1182,7 +1182,9 @@ impl VerticalTabsPanelState {
         app: &AppContext,
     ) -> Vec<usize> {
         if self.search_query.is_empty() {
-            return (0..tabs.len()).filter(|i| !tabs[*i].hidden_for_tmux).collect();
+            return (0..tabs.len())
+                .filter(|i| !tabs[*i].hidden_for_tmux)
+                .collect();
         }
         let query_lower = self.search_query.to_lowercase();
         let matched_groups = matched_group_ids(tab_groups, &query_lower);

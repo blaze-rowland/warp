@@ -18,11 +18,11 @@ pub(crate) mod orchestration_launch_modal;
 pub(crate) mod right_panel;
 mod startup_directory;
 mod tab_grouping;
-#[cfg(feature = "local_tty")]
-mod tmux_tabs;
 #[cfg(test)]
 #[path = "view_tests.rs"]
 pub(crate) mod tests;
+#[cfg(feature = "local_tty")]
+mod tmux_tabs;
 mod vertical_tabs;
 #[cfg(target_family = "wasm")]
 mod wasm_view;
@@ -1571,7 +1571,11 @@ impl Workspace {
             // Renaming a tmux tab renames its window; tmux's rename notice sets the title.
             #[cfg(feature = "local_tty")]
             if self.tabs[tab_index].pane_group.as_ref(ctx).is_tmux_tab() {
-                let changed = self.tabs[tab_index].pane_group.as_ref(ctx).display_title(ctx) != title;
+                let changed = self.tabs[tab_index]
+                    .pane_group
+                    .as_ref(ctx)
+                    .display_title(ctx)
+                    != title;
                 if changed && !title.trim().is_empty() {
                     self.tmux_rename_tab(tab_index, &title, ctx);
                 }
@@ -7210,6 +7214,12 @@ impl Workspace {
             );
         }
 
+        #[cfg(feature = "local_tty")]
+        if let Some(tmux_items) = self.tmux_new_session_menu_items(ctx) {
+            menu_items.push(MenuItem::Separator);
+            menu_items.extend(tmux_items);
+        }
+
         menu_items.push(MenuItem::Separator);
         menu_items.push(
             MenuItemFields::new("Reopen closed session")
@@ -7229,6 +7239,17 @@ impl Workspace {
         ctx: &mut ViewContext<Self>,
     ) {
         let menu_items = self.unified_new_session_menu_items(ctx);
+        self.open_new_session_menu_with(anchor, menu_items, open_source, ctx);
+    }
+
+    /// Opens the new-session dropdown at `anchor` showing `menu_items`.
+    fn open_new_session_menu_with(
+        &mut self,
+        anchor: NewSessionMenuAnchor,
+        menu_items: Vec<MenuItem<WorkspaceAction>>,
+        open_source: TabConfigsMenuOpenSource,
+        ctx: &mut ViewContext<Self>,
+    ) {
         let menu_height = self.new_session_menu_max_height(anchor, ctx);
         ctx.update_view(&self.new_session_dropdown_menu, |context_menu, view_ctx| {
             // Match the Figma mock width (OptionMenuItem component is 268px).
@@ -7299,35 +7320,35 @@ impl Workspace {
     }
 
     fn toggle_tab_configs_menu(&mut self, ctx: &mut ViewContext<Self>) {
-        let use_vertical_tabs =
-            FeatureFlag::VerticalTabs.is_enabled() && *TabSettings::as_ref(ctx).use_vertical_tabs;
         if self.show_new_session_dropdown_menu.is_some() {
             self.close_new_session_dropdown_menu(ctx);
             return;
         }
+        let anchor = self.keyboard_new_session_menu_anchor(ctx);
+        self.open_tab_configs_menu(anchor, TabConfigsMenuOpenSource::KeyboardShortcut, ctx);
+    }
 
+    /// Where the new-session dropdown opens when it is not opened by a click: the add-tab
+    /// button, opening the vertical tabs panel first when that is where the button lives.
+    fn keyboard_new_session_menu_anchor(
+        &mut self,
+        ctx: &mut ViewContext<Self>,
+    ) -> NewSessionMenuAnchor {
+        let use_vertical_tabs =
+            FeatureFlag::VerticalTabs.is_enabled() && *TabSettings::as_ref(ctx).use_vertical_tabs;
         if use_vertical_tabs {
             if !self.vertical_tabs_panel_open {
                 self.vertical_tabs_panel_open = true;
                 self.sync_window_button_visibility(ctx);
             }
-            self.open_tab_configs_menu(
-                NewSessionMenuAnchor::AddTabButton(Vector2F::zero()),
-                TabConfigsMenuOpenSource::KeyboardShortcut,
-                ctx,
-            );
-            return;
+            return NewSessionMenuAnchor::AddTabButton(Vector2F::zero());
         }
 
         let position = ctx
             .element_position_by_id_at_last_frame(self.window_id, NEW_TAB_BUTTON_POSITION_ID)
             .map(|position| position.lower_left())
             .unwrap_or_else(Vector2F::zero);
-        self.open_tab_configs_menu(
-            NewSessionMenuAnchor::AddTabButton(position),
-            TabConfigsMenuOpenSource::KeyboardShortcut,
-            ctx,
-        );
+        NewSessionMenuAnchor::AddTabButton(position)
     }
 
     pub fn toggle_new_session_dropdown_menu(
@@ -24558,6 +24579,12 @@ impl TypedActionView for Workspace {
             SelectNewSessionMenuItem(new_session_menu_item) => {
                 self.open_launch_config_from_menu(new_session_menu_item.clone(), ctx)
             }
+            TmuxSessionMenu(action) => {
+                #[cfg(feature = "local_tty")]
+                self.handle_tmux_menu_action(action.clone(), ctx);
+                #[cfg(not(feature = "local_tty"))]
+                let _ = action;
+            }
             SelectTabConfig(tab_config) => {
                 self.open_tab_config(tab_config.clone(), ctx);
             }
@@ -29062,9 +29089,11 @@ impl Workspace {
 
         let source_is_single_tab = self.tabs.len() == 1;
         // tmux tabs stay in the window that holds their session (U7 step 6).
-        let tab_bound_to_tmux_session = self.tabs.get(current_index).is_some_and(|tab| {
-            tab.hidden_for_tmux || tab.pane_group.as_ref(ctx).is_tmux_tab()
-        }) || self.tabs.iter().any(|tab| tab.hidden_for_tmux) && source_is_single_tab;
+        let tab_bound_to_tmux_session = self
+            .tabs
+            .get(current_index)
+            .is_some_and(|tab| tab.hidden_for_tmux || tab.pane_group.as_ref(ctx).is_tmux_tab())
+            || self.tabs.iter().any(|tab| tab.hidden_for_tmux) && source_is_single_tab;
         if (is_drag_outside_tab_bar || source_is_single_tab)
             && !tab_bound_to_tmux_session
             && FeatureFlag::DragTabsToWindows.is_enabled()

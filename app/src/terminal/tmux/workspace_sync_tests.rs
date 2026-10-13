@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use warp_core::features::FeatureFlag;
 use warp_terminal::local_tty::mio_channel;
-use warp_terminal::local_tty::tmux_gateway::{GatewayEvent, TmuxRequest};
+use warp_terminal::local_tty::tmux_gateway::{GatewayEvent, RefusalReason, TmuxRequest};
 use warp_terminal::tmux::model::{PaneRow, WindowRow};
 use warp_terminal::tmux::{
     ClientEvent, CommandReply, PaneId, SessionId, SessionModel, WindowFlags, WindowId,
@@ -121,7 +121,10 @@ fn open_windows_get_updates_and_closed_windows_close() {
 #[test]
 fn a_renamed_window_renames_its_tab_with_a_clean_title() {
     let mut model = two_window_model();
-    model.rename_window(WindowId(1), "\u{1b}]0;evil\u{7}build\r\n\u{9b}31m".to_owned());
+    model.rename_window(
+        WindowId(1),
+        "\u{1b}]0;evil\u{7}build\r\n\u{9b}31m".to_owned(),
+    );
     let ops = plan_window_sync(&model, &[open(1, "editor"), open(2, "logs")]);
     assert!(ops.contains(&WindowOp::Rename {
         window_id: WindowId(1),
@@ -165,7 +168,10 @@ fn sanitized_titles_drop_control_characters_and_fall_back() {
 
 #[test]
 fn the_tooltip_names_the_session_and_host() {
-    assert_eq!(session_tooltip("work", "devbox"), "tmux session work on devbox");
+    assert_eq!(
+        session_tooltip("work", "devbox"),
+        "tmux session work on devbox"
+    );
 }
 
 // Session end lines (R24).
@@ -181,11 +187,17 @@ fn end_lines_name_the_session_and_how_it_ended() {
         "[exited from work]"
     );
     assert_eq!(
-        end_line("work", &SessionEnd::Exited(Some("server exited".to_owned()))),
+        end_line(
+            "work",
+            &SessionEnd::Exited(Some("server exited".to_owned()))
+        ),
         "[server exited: work]"
     );
     assert_eq!(
-        end_line("work", &SessionEnd::AttachFailed(Some("can't find session: nope".into()))),
+        end_line(
+            "work",
+            &SessionEnd::AttachFailed(Some("can't find session: nope".into()))
+        ),
         "[tmux: can't find session: nope]"
     );
     assert_eq!(
@@ -206,7 +218,10 @@ fn cmd_n_and_tmux_window_index_select_the_same_visible_tab() {
     assert_eq!(visible_to_raw(&hidden, 3), None);
     // tmux selecting window 1 activates raw tab 3, which is what cmd+3 selects.
     assert_eq!(raw_to_visible(&hidden, 3), Some(2));
-    assert_eq!(visible_to_raw(&hidden, raw_to_visible(&hidden, 3).unwrap()), Some(3));
+    assert_eq!(
+        visible_to_raw(&hidden, raw_to_visible(&hidden, 3).unwrap()),
+        Some(3)
+    );
     assert_eq!(raw_to_visible(&hidden, 1), None);
 }
 
@@ -313,7 +328,10 @@ fn a_session_already_attached_on_the_same_host_is_found() {
         host: "laptop".to_owned(),
         ..existing.clone()
     };
-    assert_eq!(find_duplicate(&sessions, TmuxOriginId(2), &other_host), None);
+    assert_eq!(
+        find_duplicate(&sessions, TmuxOriginId(2), &other_host),
+        None
+    );
     sessions.clear();
     assert_eq!(find_duplicate(&sessions, TmuxOriginId(2), &existing), None);
 }
@@ -327,7 +345,10 @@ fn sessions(app: &mut App) -> (ModelHandle<TmuxGateways>, ModelHandle<TmuxSessio
     (gateways, sessions)
 }
 
-fn record_events(app: &mut App, sessions: &ModelHandle<TmuxSessions>) -> Rc<RefCell<Vec<TmuxSessionEvent>>> {
+fn record_events(
+    app: &mut App,
+    sessions: &ModelHandle<TmuxSessions>,
+) -> Rc<RefCell<Vec<TmuxSessionEvent>>> {
     let events = Rc::new(RefCell::new(Vec::new()));
     let recorded = events.clone();
     app.update(|ctx| {
@@ -338,12 +359,20 @@ fn record_events(app: &mut App, sessions: &ModelHandle<TmuxSessions>) -> Rc<RefC
     events
 }
 
-fn attach(app: &mut App, gateways: &ModelHandle<TmuxGateways>) -> (TmuxOriginId, mio_channel::Receiver<Message>) {
+fn attach(
+    app: &mut App,
+    gateways: &ModelHandle<TmuxGateways>,
+) -> (TmuxOriginId, mio_channel::Receiver<Message>) {
     let (tx, rx) = mio_channel::channel();
-    let (origin, _link) = gateways.update(app, |g, _| g.link_for_new_origin(tx, &Default::default()));
+    let (origin, _link) =
+        gateways.update(app, |g, _| g.link_for_new_origin(tx, &Default::default()));
     gateways.update(app, |g, ctx| {
         g.deliver_for_test(origin, GatewayEvent::Starting, ctx);
-        g.deliver_for_test(origin, GatewayEvent::Model(Box::new(two_window_model())), ctx);
+        g.deliver_for_test(
+            origin,
+            GatewayEvent::Model(Box::new(two_window_model())),
+            ctx,
+        );
         g.deliver_for_test(
             origin,
             GatewayEvent::Client(ClientEvent::Attached {
@@ -368,9 +397,11 @@ fn attaching_registers_the_session_and_asks_workspaces_to_build_tabs() {
             assert_eq!(info.name, "work");
             assert_eq!(info.status, SessionStatus::Attached);
         });
-        assert!(events
-            .borrow()
-            .contains(&TmuxSessionEvent::Attached { origin }));
+        assert!(
+            events
+                .borrow()
+                .contains(&TmuxSessionEvent::Attached { origin })
+        );
         gateways.read(&app, |g, _| {
             assert_eq!(g.model(origin).map(|m| m.windows().count()), Some(2));
         });
@@ -402,7 +433,11 @@ fn not_responding_and_transport_loss_change_the_status() {
             assert_eq!(s.status(origin), Some(SessionStatus::Attached));
         });
         gateways.update(&mut app, |g, ctx| {
-            g.deliver_for_test(origin, GatewayEvent::Client(ClientEvent::TransportLost), ctx);
+            g.deliver_for_test(
+                origin,
+                GatewayEvent::Client(ClientEvent::TransportLost),
+                ctx,
+            );
             g.deliver_for_test(origin, GatewayEvent::Ended, ctx);
         });
         // The tabs stay, read-only, under a Disconnected banner.
@@ -476,4 +511,122 @@ fn command_replies_reach_their_callback_once() {
         });
         assert_eq!(*replies.borrow(), vec![vec![b"htop".to_vec()]]);
     });
+}
+
+// Refusals and attach failures as lines in the origin pane (R6, R29, AE5, AE7).
+
+fn link(
+    app: &mut App,
+    gateways: &ModelHandle<TmuxGateways>,
+) -> (TmuxOriginId, mio_channel::Receiver<Message>) {
+    let (tx, rx) = mio_channel::channel();
+    let (origin, _link) =
+        gateways.update(app, |g, _| g.link_for_new_origin(tx, &Default::default()));
+    (origin, rx)
+}
+
+#[test]
+fn an_attach_failure_ends_with_tmux_error_and_never_builds_tabs() {
+    let _flag = FeatureFlag::TmuxControlMode.override_enabled(true);
+    App::test((), |mut app| async move {
+        let (gateways, sessions) = sessions(&mut app);
+        let events = record_events(&mut app, &sessions);
+        let (origin, _rx) = link(&mut app, &gateways);
+        gateways.update(&mut app, |g, ctx| {
+            g.deliver_for_test(origin, GatewayEvent::Starting, ctx);
+            g.deliver_for_test(
+                origin,
+                GatewayEvent::Client(ClientEvent::AttachFailed {
+                    error: Some("can't find session: nope".to_owned()),
+                }),
+                ctx,
+            );
+            g.deliver_for_test(origin, GatewayEvent::Ended, ctx);
+        });
+        assert_eq!(
+            *events.borrow(),
+            vec![TmuxSessionEvent::Ended {
+                origin,
+                line: Some("[tmux: can't find session: nope]".to_owned()),
+            }]
+        );
+        sessions.read(&app, |s, _| assert!(s.session(origin).is_none()));
+    });
+}
+
+#[test]
+fn an_unsupported_version_ends_with_the_reason_instead_of_a_detach_line() {
+    let _flag = FeatureFlag::TmuxControlMode.override_enabled(true);
+    App::test((), |mut app| async move {
+        let (gateways, sessions) = sessions(&mut app);
+        let events = record_events(&mut app, &sessions);
+        let (origin, _rx) = link(&mut app, &gateways);
+        gateways.update(&mut app, |g, ctx| {
+            g.deliver_for_test(origin, GatewayEvent::Starting, ctx);
+            g.deliver_for_test(
+                origin,
+                GatewayEvent::Refused(RefusalReason::UnsupportedVersion {
+                    version: "3.1".to_owned(),
+                }),
+                ctx,
+            );
+            g.deliver_for_test(
+                origin,
+                GatewayEvent::Client(ClientEvent::Exited {
+                    reason: Some("detached".to_owned()),
+                }),
+                ctx,
+            );
+            g.deliver_for_test(origin, GatewayEvent::Ended, ctx);
+        });
+        assert_eq!(
+            *events.borrow(),
+            vec![TmuxSessionEvent::Ended {
+                origin,
+                line: Some("[tmux: Native tmux needs tmux 3.2 or newer (found 3.1)]".to_owned()),
+            }]
+        );
+    });
+}
+
+#[test]
+fn a_nested_refusal_shows_a_line_without_a_session() {
+    let _flag = FeatureFlag::TmuxControlMode.override_enabled(true);
+    App::test((), |mut app| async move {
+        let (gateways, sessions) = sessions(&mut app);
+        let events = record_events(&mut app, &sessions);
+        let (origin, _rx) = link(&mut app, &gateways);
+        gateways.update(&mut app, |g, ctx| {
+            g.deliver_for_test(
+                origin,
+                GatewayEvent::Refused(RefusalReason::TmuxEnvSet),
+                ctx,
+            );
+        });
+        assert_eq!(
+            *events.borrow(),
+            vec![TmuxSessionEvent::Notice {
+                origin,
+                line: "[tmux: Nested tmux is not supported natively]".to_owned(),
+            }]
+        );
+        sessions.read(&app, |s, _| assert!(s.session(origin).is_none()));
+    });
+}
+
+#[test]
+fn refusal_lines_name_the_reason() {
+    assert_eq!(
+        refusal_line(&RefusalReason::UnsupportedVersion {
+            version: String::new()
+        }),
+        "[tmux: Native tmux needs tmux 3.2 or newer]"
+    );
+    assert_eq!(
+        end_line(
+            "",
+            &SessionEnd::Refused("Nested tmux is not supported natively".to_owned())
+        ),
+        "[tmux: Nested tmux is not supported natively]"
+    );
 }

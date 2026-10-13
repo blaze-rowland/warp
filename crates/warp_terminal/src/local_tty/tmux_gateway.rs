@@ -596,7 +596,9 @@ impl Gateway {
         let mut prune = false;
         let events = session.client.take_events();
         if events.iter().any(changes_model) {
-            (self.sink)(GatewayEvent::Model(Box::new(session.client.model().clone())));
+            (self.sink)(GatewayEvent::Model(Box::new(
+                session.client.model().clone(),
+            )));
         }
         for event in events {
             match event {

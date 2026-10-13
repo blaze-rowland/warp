@@ -93,6 +93,15 @@ where
     #[cfg(feature = "local_tty")]
     fn on_shell_determined(&mut self, _ctx: &mut ViewContext<Self>) {}
 
+    /// The PTY's event loop was linked to the tmux gateways as `origin` (KTD2).
+    #[cfg(feature = "local_tty")]
+    fn on_tmux_origin_linked(
+        &mut self,
+        _origin: crate::terminal::tmux::TmuxOriginId,
+        _ctx: &mut ViewContext<Self>,
+    ) {
+    }
+
     /// Called when the active shell launch data is updated (e.g. shell indicator metadata).
     fn on_active_shell_launch_data_updated(
         &mut self,

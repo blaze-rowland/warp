@@ -14,7 +14,7 @@ use warpui::{AppContext, Element, SingletonEntity as _, ViewContext, ViewHandle}
 
 use super::tree::{Direction, PaneData, PaneFlex, PaneNode, SplitDirection};
 use super::{PaneGroup, PaneGroupAction, PaneId, TerminalPane};
-use crate::banner::{Banner, BannerTextButton, BannerTextContent};
+use crate::banner::{Banner, BannerAction, BannerTextButton, BannerTextContent};
 use crate::terminal::tmux::TmuxOriginId;
 use crate::terminal::tmux::layout_snapshot::{LayoutShape, layout_shape};
 
@@ -29,7 +29,18 @@ pub struct TmuxTab {
     shape: LayoutShape,
     not_responding_banner: ViewHandle<Banner<PaneGroupAction>>,
     disconnected_banner: ViewHandle<Banner<PaneGroupAction>>,
+    /// R19's shadowed-keys notice or R27's old-tmux notice (U13).
+    key_notice_banner: ViewHandle<Banner<KeyNoticeAction>>,
 }
+
+/// The "Show keys" link on the shadowed-keys notice (R19, R29).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyNoticeAction {
+    ShowKeys,
+}
+
+/// Shown before a tmux tab's title while a key waits on tmux (R20).
+const KEY_IN_FLIGHT_MARK: &str = "\u{22ef}";
 
 impl TmuxTab {
     /// The layout last applied to the tab.
@@ -88,6 +99,53 @@ impl PaneGroup {
                 }
             },
         );
+        let key_notice_banner = ctx.add_typed_action_view(|_| {
+            Banner::<KeyNoticeAction>::new_with_buttons(
+                BannerTextContent::plain_text(""),
+                vec![BannerTextButton::new(
+                    "Show keys".to_owned(),
+                    Rc::new(|ctx, _, _| {
+                        ctx.dispatch_typed_action(BannerAction::Action(KeyNoticeAction::ShowKeys))
+                    }),
+                )],
+                true,
+            )
+        });
+        #[cfg(feature = "local_tty")]
+        {
+            use crate::banner::BannerEvent;
+            use crate::terminal::tmux::keys::{TmuxKeyRouter, TmuxKeyRouterEvent};
+            ctx.subscribe_to_view(&key_notice_banner, move |_, _, event, ctx| {
+                TmuxKeyRouter::handle(ctx).update(ctx, |router, ctx| match event {
+                    BannerEvent::Dismiss(_) => router.dismiss_notice(origin, ctx),
+                    BannerEvent::Action(KeyNoticeAction::ShowKeys) => {
+                        router.expand_notice(origin, ctx)
+                    }
+                });
+            });
+            ctx.subscribe_to_model(
+                &TmuxKeyRouter::handle(ctx),
+                move |me, router, event, ctx| match event {
+                    TmuxKeyRouterEvent::NoticeChanged { origin: changed } if *changed == origin => {
+                        me.sync_key_notice(ctx);
+                    }
+                    TmuxKeyRouterEvent::InFlightChanged { origin: changed }
+                        if *changed == origin =>
+                    {
+                        let in_flight = router.as_ref(ctx).is_key_in_flight(origin);
+                        if let Some(tab) = &me.tmux_tab {
+                            me.custom_title = Some(if in_flight {
+                                format!("{KEY_IN_FLIGHT_MARK} {}", tab.title)
+                            } else {
+                                tab.title.clone()
+                            });
+                        }
+                        ctx.notify();
+                    }
+                    _ => {}
+                },
+            );
+        }
         self.set_title(&title, ctx);
         self.tmux_tab = Some(TmuxTab {
             origin,
@@ -97,7 +155,56 @@ impl PaneGroup {
             layout,
             not_responding_banner,
             disconnected_banner,
+            key_notice_banner,
         });
+        #[cfg(feature = "local_tty")]
+        self.sync_key_notice(ctx);
+    }
+
+    /// Copies the session's key notice text into the tab's banner.
+    #[cfg(feature = "local_tty")]
+    fn sync_key_notice(&mut self, ctx: &mut ViewContext<Self>) {
+        use crate::terminal::tmux::keys::{KeyNoticeKind, TmuxKeyRouter};
+        let Some(tab) = &self.tmux_tab else {
+            return;
+        };
+        if !ctx.has_singleton_model::<TmuxKeyRouter>() {
+            return;
+        }
+        let router = TmuxKeyRouter::as_ref(ctx);
+        let Some(text) = router.notice_text(tab.origin, ctx) else {
+            ctx.notify();
+            return;
+        };
+        // Only the collapsed shadowed-keys notice has keys left to show.
+        let show_keys = router.notice(tab.origin).is_some_and(|notice| {
+            matches!(notice.kind, KeyNoticeKind::Shadowed { .. }) && !notice.expanded
+        });
+        tab.key_notice_banner.update(ctx, |banner, ctx| {
+            banner.set_content(BannerTextContent::plain_text(text), ctx);
+            banner.set_action_button_label(0, if show_keys { "Show keys" } else { "" }, ctx);
+        });
+        ctx.notify();
+    }
+
+    /// The focused tmux pane and the views that take its keys, for routing keys to tmux (U13).
+    #[cfg(feature = "local_tty")]
+    pub(crate) fn tmux_key_target(
+        &self,
+        app: &AppContext,
+    ) -> Option<crate::terminal::tmux::key_capture::KeyTarget> {
+        let _ = self.tmux_tab.as_ref()?;
+        let terminal = self.terminal_session_by_id(self.focused_pane_id(app))?;
+        let (origin, pane_id) = terminal.tmux_pane(app)?;
+        let view = terminal.terminal_view(app);
+        let input = view.as_ref(app).input();
+        let editor = input.as_ref(app).editor().id();
+        Some(crate::terminal::tmux::key_capture::KeyTarget {
+            origin,
+            pane_id,
+            window_id: view.window_id(app),
+            view_ids: vec![view.id(), input.id(), editor],
+        })
     }
 
     /// Shows the window's new name.
@@ -152,9 +259,7 @@ impl PaneGroup {
         current_command: &dyn Fn(TmuxPaneId) -> Option<String>,
         ctx: &mut ViewContext<Self>,
     ) {
-        use crate::terminal::tmux::layout_snapshot::{
-            UpdateKind, branch_flexes, plan_pane_update,
-        };
+        use crate::terminal::tmux::layout_snapshot::{UpdateKind, branch_flexes, plan_pane_update};
 
         let Some(tab) = &self.tmux_tab else {
             return;
@@ -430,13 +535,20 @@ impl PaneGroup {
         let tab = self.tmux_tab.as_ref()?;
         #[cfg(feature = "local_tty")]
         {
+            use crate::terminal::tmux::keys::TmuxKeyRouter;
             use crate::terminal::tmux::workspace_sync::{SessionStatus, TmuxSessions};
             let banner = match TmuxSessions::as_ref(app).status(tab.origin)? {
-                SessionStatus::NotResponding => &tab.not_responding_banner,
-                SessionStatus::Disconnected => &tab.disconnected_banner,
+                SessionStatus::NotResponding => ChildView::new(&tab.not_responding_banner).finish(),
+                SessionStatus::Disconnected => ChildView::new(&tab.disconnected_banner).finish(),
+                SessionStatus::Attached
+                    if app.has_singleton_model::<TmuxKeyRouter>()
+                        && TmuxKeyRouter::as_ref(app).notice(tab.origin).is_some() =>
+                {
+                    ChildView::new(&tab.key_notice_banner).finish()
+                }
                 SessionStatus::Starting | SessionStatus::Attached => return None,
             };
-            Some(ChildView::new(banner).finish())
+            Some(banner)
         }
         #[cfg(not(feature = "local_tty"))]
         {
@@ -449,7 +561,13 @@ impl PaneGroup {
     pub(super) fn tmux_banner_ids(&self) -> Vec<warpui::EntityId> {
         self.tmux_tab
             .as_ref()
-            .map(|tab| vec![tab.not_responding_banner.id(), tab.disconnected_banner.id()])
+            .map(|tab| {
+                vec![
+                    tab.not_responding_banner.id(),
+                    tab.disconnected_banner.id(),
+                    tab.key_notice_banner.id(),
+                ]
+            })
             .unwrap_or_default()
     }
 }

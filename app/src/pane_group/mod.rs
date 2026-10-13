@@ -8380,6 +8380,17 @@ impl View for PaneGroup {
         "PaneGroup"
     }
 
+    /// In a tmux tab, keys bound in tmux skip Warp's keymap (U13, R18).
+    #[cfg(feature = "local_tty")]
+    fn claims_keystroke(&self, keystroke: &warpui::keymap::Keystroke, app: &AppContext) -> bool {
+        self.tmux_tab.is_some()
+            && crate::terminal::tmux::key_capture::claims_keystroke(
+                self.tmux_key_target(app).as_ref(),
+                keystroke,
+                app,
+            )
+    }
+
     fn keymap_context(&self, app: &AppContext) -> Context {
         let mut ctx = Self::default_keymap_context();
 
@@ -8458,6 +8469,9 @@ impl View for PaneGroup {
                 })
                 .finish()
         };
+        #[cfg(feature = "local_tty")]
+        let main_content =
+            crate::terminal::tmux::key_capture::wrap(main_content, self.tmux_key_target(app));
         column.add_child(Shrinkable::new(1., main_content).finish());
 
         let mut stack = Stack::new().with_child(column.finish());

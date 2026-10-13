@@ -22,7 +22,8 @@ fn tmux_schema_entries() -> Vec<&'static SettingSchemaEntry> {
         .into_iter()
         .filter(|entry| match entry.hierarchy {
             Some("terminal") => entry.storage_key == "tmux_control_mode",
-            Some("terminal.tmux") => true,
+            // The escape-hatch chord is a key, not a toggle.
+            Some("terminal.tmux") => entry.storage_key != "escape_hatch_key",
             _ => false,
         })
         .collect()

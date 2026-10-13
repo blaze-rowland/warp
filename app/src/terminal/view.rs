@@ -437,7 +437,7 @@ use crate::terminal::local_tty::shell::ShellStarter;
 #[cfg(feature = "local_tty")]
 #[cfg(all(windows, feature = "local_tty"))]
 use crate::terminal::local_tty::windows::get_user_and_system_env_variable;
-use crate::terminal::model::ansi::{ClearMode, Handler};
+use crate::terminal::model::ansi::{ClearMode, Handler, Processor};
 use crate::terminal::model::block::{
     AgentInteractionMetadata, Block, BlockId, BlockMetadata, LONG_RUNNING_BOTTOM_PADDING_LINES,
 };
@@ -478,6 +478,10 @@ use crate::terminal::shared_session::{
     SharedSessionStatus,
 };
 use crate::terminal::shell_recovery::{CloudShellRecoveryRequest, recovered_command_output};
+use crate::terminal::tmux::TmuxOriginId;
+use crate::terminal::tmux::entry::{Entry as TmuxEntry, NESTED_NOTE, PaneTmuxState, plan_entry};
+use crate::terminal::tmux::session_menu::TmuxMenuTarget;
+use crate::terminal::tmux::settings::TmuxSettings;
 use crate::terminal::view::block_onboarding::onboarding_prompt_block::OnboardingPromptBlock;
 use crate::terminal::view::init_environment::mode_selector::{
     EnvironmentSetupMode, EnvironmentSetupModeSelector, EnvironmentSetupModeSelectorEvent,
@@ -2774,6 +2778,8 @@ pub struct TerminalView {
     /// The type of the subshell that we will bootstrap/"warpify"" on the next [`AfterBlockStarted`]
     /// terminal model event. Will only be `Some` with a [`ShellType`] we can bootstrap.
     pending_auto_bootstrap_shell_type: Option<ShellType>,
+    /// tmux entry state: the pane's gateway origin, remembered socket and pending notes (U8).
+    tmux: PaneTmuxState,
     env_vars: Vec<EnvVar>,
 
     show_snackbar: bool,
@@ -4466,6 +4472,7 @@ impl TerminalView {
             settings_import_onboarding_block: None,
             onboarding_callout_view: None,
             pending_auto_bootstrap_shell_type: None,
+            tmux: PaneTmuxState::default(),
             pending_env_var_collection: None,
             env_vars: Vec::new(),
             show_snackbar: true,
@@ -12723,6 +12730,9 @@ impl TerminalView {
                 if *is_for_in_band_command {
                     return;
                 }
+                if let Some(note) = self.tmux.pending_note.take() {
+                    self.write_tmux_note(note, ctx);
+                }
                 self.did_notify_long_running = false;
 
                 // Snapshot the prompt state as of when the command began executing.
@@ -16836,6 +16846,134 @@ impl TerminalView {
     pub fn execute_command_or_set_pending(&mut self, command: &str, ctx: &mut ViewContext<Self>) {
         self.set_pending_command(command, ctx);
         self.execute_pending_command((), ctx);
+    }
+
+    /// Rewrites a typed tmux command so the session opens natively (R3), and records what the
+    /// gateway and the session menu need: whether this shell is inside tmux and which socket it
+    /// used. Returns the event to run.
+    fn prepare_tmux_entry(
+        &mut self,
+        event: &ExecuteCommandEvent,
+        ctx: &mut ViewContext<Self>,
+    ) -> ExecuteCommandEvent {
+        let mut event = event.clone();
+        self.tmux.converted_from = None;
+        let settings = TmuxSettings::as_ref(ctx);
+        if !settings.control_mode_enabled() {
+            return event;
+        }
+        let auto_convert = settings.auto_convert_enabled();
+        let Some(session) = self.sessions.as_ref(ctx).get(event.session_id) else {
+            return event;
+        };
+        let tmux_env = session.environment_variable_names().contains("TMUX");
+        self.sync_tmux_origin_flags(tmux_env, ctx);
+        if !matches!(
+            event.source,
+            CommandExecutionSource::User | CommandExecutionSource::QueuedCommand
+        ) {
+            return event;
+        }
+
+        let nested = tmux_env || self.tmux.is_tmux_pane;
+        let entry = plan_entry(
+            &event.command,
+            |name| session.alias_value(name).map(str::to_owned),
+            nested,
+        );
+        match entry {
+            TmuxEntry::Convert { command, socket }
+                if auto_convert && !self.tmux.unsupported_sessions.contains(&event.session_id) =>
+            {
+                self.tmux.socket = socket;
+                let typed = std::mem::replace(&mut event.command, command);
+                self.tmux.converted_from = Some((event.session_id, typed));
+            }
+            TmuxEntry::Convert { socket, .. } | TmuxEntry::ControlMode { socket } => {
+                self.tmux.socket = socket;
+            }
+            TmuxEntry::Nested if auto_convert => self.tmux.pending_note = Some(NESTED_NOTE),
+            TmuxEntry::Nested | TmuxEntry::Unchanged => {}
+        }
+        event
+    }
+
+    /// Tells the gateway whether this pane's shell runs inside tmux, from the environment of the
+    /// session about to run a command (local or remote), so a nested `-CC` stays raw (R6).
+    fn sync_tmux_origin_flags(&self, tmux_env: bool, ctx: &AppContext) {
+        #[cfg(feature = "local_tty")]
+        {
+            use crate::terminal::tmux::gateway::TmuxGateways;
+            if let Some(origin) = self.tmux.origin
+                && ctx.has_singleton_model::<TmuxGateways>()
+                && let Some(flags) = TmuxGateways::as_ref(ctx).origin_flags(origin)
+            {
+                flags.set_tmux_env(tmux_env);
+            }
+        }
+        #[cfg(not(feature = "local_tty"))]
+        let _ = (tmux_env, ctx);
+    }
+
+    /// Writes `line` into the terminal as output (R6, R24, R29).
+    pub fn write_tmux_note(&mut self, line: &str, ctx: &mut ViewContext<Self>) {
+        let mut parser = Processor::new();
+        parser.parse_bytes(
+            &mut *self.model.lock(),
+            format!("{line}\r\n").as_bytes(),
+            &mut std::io::sink(),
+        );
+        ctx.notify();
+    }
+
+    /// Marks this view as showing a tmux pane: tmux typed here is nested, and the session menu
+    /// does not run commands here.
+    pub fn mark_as_tmux_pane(&mut self) {
+        self.tmux.is_tmux_pane = true;
+    }
+
+    /// Where the session menu lists and opens sessions: this pane's active session, unless the
+    /// pane is itself a tmux pane.
+    pub fn tmux_menu_target(&self, ctx: &AppContext) -> Option<TmuxMenuTarget> {
+        if self.tmux.is_tmux_pane {
+            return None;
+        }
+        let session = self
+            .active_block_session_id()
+            .and_then(|session_id| self.sessions.as_ref(ctx).get(session_id))?;
+        let nested = session.environment_variable_names().contains("TMUX");
+        Some(TmuxMenuTarget {
+            session,
+            socket: self.tmux.socket.clone(),
+            nested,
+        })
+    }
+
+    #[cfg(feature = "local_tty")]
+    fn on_tmux_gateway_event(
+        &mut self,
+        event: &crate::terminal::tmux::gateway::TmuxGatewayEvent,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        use crate::terminal::tmux::gateway::TmuxGatewayEvent;
+        use warp_terminal::local_tty::tmux_gateway::RefusalReason;
+
+        let TmuxGatewayEvent::Refused {
+            origin,
+            reason: RefusalReason::UnsupportedVersion { .. },
+        } = event
+        else {
+            return;
+        };
+        if Some(*origin) != self.tmux.origin {
+            return;
+        }
+        // The server is too old for control mode: run what was typed as-is once the refused
+        // attempt ends, and stop converting in this session (R6).
+        if let Some((session_id, typed)) = self.tmux.converted_from.take() {
+            self.tmux.unsupported_sessions.insert(session_id);
+            self.execute_command_or_set_pending(&typed, ctx);
+        }
     }
 
     fn hide_slow_bootstrap_banner(&mut self, ctx: &mut ViewContext<Self>) {
@@ -22557,7 +22695,8 @@ impl TerminalView {
                     self.focus_terminal(ctx);
                 }
 
-                ctx.emit(Event::ExecuteCommand(event.as_ref().clone()));
+                let event = self.prepare_tmux_entry(event, ctx);
+                ctx.emit(Event::ExecuteCommand(event));
 
                 if self.block_onboarding_active {
                     self.interrupt_onboarding_blocks(ctx);
@@ -27333,6 +27472,19 @@ impl TerminalSurface for TerminalView {
         self.fail_cloud_shell_recovery(failure_class, error, ctx);
     }
     #[cfg(feature = "local_tty")]
+    #[cfg(feature = "local_tty")]
+    fn on_tmux_origin_linked(&mut self, origin: TmuxOriginId, ctx: &mut ViewContext<Self>) {
+        use crate::terminal::tmux::gateway::TmuxGateways;
+
+        self.tmux.origin = Some(origin);
+        if !self.tmux.follows_gateways && ctx.has_singleton_model::<TmuxGateways>() {
+            self.tmux.follows_gateways = true;
+            ctx.subscribe_to_model(&TmuxGateways::handle(ctx), |me, _, event, ctx| {
+                me.on_tmux_gateway_event(event, ctx);
+            });
+        }
+    }
+
     fn on_shell_determined(&mut self, ctx: &mut ViewContext<Self>) {
         if !self.model.lock().shared_session_status().is_viewer() {
             // Start a timer for the initial session bootstrapping, so that we can log and show a

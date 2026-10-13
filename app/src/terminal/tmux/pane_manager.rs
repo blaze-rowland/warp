@@ -148,6 +148,8 @@ impl TmuxPaneTerminalManager {
             )
         });
 
+        view.update(ctx, |view, _| view.mark_as_tmux_pane());
+
         wire_up_pty_controller_with_surface(
             &backend.pty_controller,
             &view,
@@ -546,6 +548,7 @@ impl TmuxWindowSizer {
             | ClientEvent::Message { .. }
             | ClientEvent::ConfigError { .. }
             | ClientEvent::CommandCompleted { .. }
+            | ClientEvent::ClientKeyAcknowledged
             | ClientEvent::ClientKeyDropped { .. }
             | ClientEvent::NotResponding { .. }
             | ClientEvent::Responding

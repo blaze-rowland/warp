@@ -74,6 +74,28 @@ define_settings_group!(TmuxSettings, settings: [
         description: "Whether keys bound in the attached tmux server's key tables go to tmux before Warp inside a tmux-backed tab.",
         feature_flag: FeatureFlag::TmuxControlMode,
     },
+    // R18. A chord that always stays with Warp in tmux tabs; the key after it skips tmux.
+    escape_hatch_key: TmuxEscapeHatchKey {
+        type: String,
+        default: "cmdorctrl-shift-|".to_owned(),
+        supported_platforms: tmux_platforms(),
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
+        private: false,
+        storage_key: "TmuxEscapeHatchKey",
+        toml_path: "terminal.tmux.escape_hatch_key",
+        description: "A key chord that tmux never takes inside tmux-backed tabs. The key pressed right after it goes to Warp even when tmux binds it.",
+        feature_flag: FeatureFlag::TmuxControlMode,
+    },
+    // R19, R27, R29. The "once" key notices already shown, by server (and config).
+    key_notices_shown: TmuxKeyNoticesShown {
+        type: Vec<String>,
+        default: Vec::new(),
+        supported_platforms: tmux_platforms(),
+        sync_to_cloud: SyncToCloud::Never,
+        surface: settings::SettingSurfaces::GUI,
+        private: true,
+    },
 ]);
 
 impl TmuxSettings {

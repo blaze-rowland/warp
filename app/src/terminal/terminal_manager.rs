@@ -56,7 +56,10 @@ pub trait TerminalManager: Any {
     /// The session origin and tmux pane this terminal shows, for a tmux pane.
     fn tmux_pane(
         &self,
-    ) -> Option<(crate::terminal::tmux::TmuxOriginId, warp_terminal::tmux::PaneId)> {
+    ) -> Option<(
+        crate::terminal::tmux::TmuxOriginId,
+        warp_terminal::tmux::PaneId,
+    )> {
         None
     }
 

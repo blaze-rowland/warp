@@ -51,6 +51,7 @@ use crate::palette::PaletteMode;
 use crate::server::telemetry::{AgentModeEntrypoint, PaletteSource};
 use crate::settings_view::{self, SettingsSection, flags};
 use crate::tab::{NewSessionMenuItem, uses_vertical_tabs};
+use crate::terminal::tmux::session_menu::{ATTACH_LABEL, NEW_SESSION_LABEL, TmuxMenuAction};
 use crate::util::bindings::{self, CustomAction, cmd_or_ctrl_shift, is_binding_pty_compliant};
 use crate::{code, modal, notebooks, tab_configs};
 
@@ -994,6 +995,26 @@ pub fn init(app: &mut AppContext) {
     )
     .with_group(bindings::BindingGroup::Settings.as_str())
     .with_context_predicate(id!("Workspace"))]);
+
+    // The tmux session menu (R2), while tmux control mode is on.
+    app.register_editable_bindings([
+        EditableBinding::new(
+            "workspace:new_tmux_session",
+            NEW_SESSION_LABEL,
+            WorkspaceAction::TmuxSessionMenu(TmuxMenuAction::NewSession),
+        )
+        .with_enabled(|| FeatureFlag::TmuxControlMode.is_enabled())
+        .with_group(bindings::BindingGroup::Navigation.as_str())
+        .with_context_predicate(id!("Workspace") & id!(flags::TMUX_CONTROL_MODE_CONTEXT_FLAG)),
+        EditableBinding::new(
+            "workspace:attach_tmux_session",
+            ATTACH_LABEL,
+            WorkspaceAction::TmuxSessionMenu(TmuxMenuAction::ListSessions),
+        )
+        .with_enabled(|| FeatureFlag::TmuxControlMode.is_enabled())
+        .with_group(bindings::BindingGroup::Navigation.as_str())
+        .with_context_predicate(id!("Workspace") & id!(flags::TMUX_CONTROL_MODE_CONTEXT_FLAG)),
+    ]);
 
     // Tab grouping bindings (keyless by default; gated on `GroupedTabs`).
     app.register_editable_bindings([

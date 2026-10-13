@@ -691,7 +691,9 @@ fn exit_before_session_changed_is_attach_failed_with_the_preceding_error() {
         format!("%begin {TIME} 280 0\nno sessions\n%error {TIME} 280 0\n").as_bytes(),
     );
     h.client.receive_bytes(&bytes, h.now);
-    assert_eq!(h.out(), vec![VERSION_QUERY.to_owned()]);
+    // The attach failed, so the handshake never starts: tmux exits and anything written now would
+    // reach the shell.
+    assert!(h.out().is_empty());
     h.feed("%exit\n");
     assert_eq!(
         h.events(),
@@ -927,7 +929,10 @@ fn a_stale_queued_navigation_key_is_dropped_but_one_sent_in_the_prefix_table_is_
     h.reply(&[]);
     assert_eq!(
         h.events(),
-        vec![ClientEvent::ClientKeyDropped { key: stale_nav }]
+        vec![
+            ClientEvent::ClientKeyAcknowledged,
+            ClientEvent::ClientKeyDropped { key: stale_nav }
+        ]
     );
     assert_eq!(
         h.out(),
@@ -952,7 +957,7 @@ fn a_fresh_queued_navigation_key_is_not_dropped() {
     h.advance(Duration::from_millis(900));
     h.reply(&[]);
     assert_eq!(h.out().len(), 1);
-    assert!(h.events().is_empty());
+    assert_eq!(h.events(), vec![ClientEvent::ClientKeyAcknowledged]);
 }
 
 #[test]
@@ -969,7 +974,7 @@ fn a_stale_navigation_key_for_a_pane_in_a_mode_is_not_dropped() {
     h.out();
     h.advance(Duration::from_secs(2));
     h.reply(&[]);
-    assert!(h.events().is_empty());
+    assert_eq!(h.events(), vec![ClientEvent::ClientKeyAcknowledged]);
     assert_eq!(
         h.out(),
         vec!["send-keys -K -c \"client-7\" \"C-h\"\n".to_owned()]
@@ -1236,4 +1241,79 @@ fn live_attach_list_and_detach() {
     assert!(listed, "list-windows reply never arrived");
     assert!(exited, "tmux never reported %exit after detach");
     assert_eq!(client.model().panes().count(), 1);
+}
+
+#[test]
+fn each_answered_client_key_is_reported_so_the_app_can_fence_it() {
+    let mut h = Harness::attached("3.7c", &[1]);
+    h.events();
+    h.client
+        .send_client_key(key("C-b", KeyClass::Other, true), h.now)
+        .unwrap();
+    h.out();
+    assert!(h.events().is_empty());
+    h.reply(&[]);
+    assert_eq!(h.events(), vec![ClientEvent::ClientKeyAcknowledged]);
+}
+
+#[test]
+fn list_keys_lines_parse_into_bindings() {
+    assert_eq!(
+        parse_key_binding_line(b"root\t0\tC-h\tif-shell -F x \"send-keys C-h\" \"select-pane -L\""),
+        Some(KeyBinding {
+            table: "root".into(),
+            repeat: false,
+            key: "C-h".into(),
+            command: "if-shell -F x \"send-keys C-h\" \"select-pane -L\"".into(),
+        })
+    );
+    assert_eq!(parse_key_binding_line(b"garbage"), None);
+}
+
+#[test]
+fn a_failed_new_session_writes_nothing_and_reports_the_error() {
+    let mut h = Harness::new();
+    let mut bytes = CONTROL_MODE_DCS.to_vec();
+    bytes.extend_from_slice(format!("%begin {TIME} 284 0\n").as_bytes());
+    h.client.receive_bytes(&bytes, h.now);
+    assert!(h.out().is_empty());
+    h.feed(&format!("duplicate session: test\n%error {TIME} 284 0\n"));
+    assert!(h.out().is_empty());
+    assert_eq!(
+        h.client.send_command("list-sessions", h.now),
+        Err(CommandError::Closed)
+    );
+    h.feed("%exit\n");
+    assert!(h.out().is_empty());
+    assert_eq!(
+        h.events(),
+        vec![ClientEvent::AttachFailed {
+            error: Some("duplicate session: test".into())
+        }]
+    );
+    assert_eq!(h.client.phase(), Phase::Exited);
+}
+
+#[test]
+fn the_handshake_starts_only_after_the_attach_command_succeeds() {
+    let mut h = Harness::new();
+    let mut bytes = CONTROL_MODE_DCS.to_vec();
+    bytes.extend_from_slice(format!("%begin {TIME} 286 0\n").as_bytes());
+    h.client.receive_bytes(&bytes, h.now);
+    assert!(h.out().is_empty());
+    h.feed(&format!("%end {TIME} 286 0\n"));
+    assert_eq!(h.out(), vec![VERSION_QUERY.to_owned()]);
+    h.feed("%window-add @1\n%sessions-changed\n%session-changed $1 other\n");
+    assert!(h.out().is_empty());
+}
+
+#[test]
+fn without_an_attach_reply_the_handshake_starts_on_session_changed() {
+    let mut h = Harness::new();
+    let mut bytes = CONTROL_MODE_DCS.to_vec();
+    bytes.extend_from_slice(b"%window-add @1\n");
+    h.client.receive_bytes(&bytes, h.now);
+    assert!(h.out().is_empty());
+    h.feed("%session-changed $0 main\n");
+    assert_eq!(h.out(), vec![VERSION_QUERY.to_owned()]);
 }

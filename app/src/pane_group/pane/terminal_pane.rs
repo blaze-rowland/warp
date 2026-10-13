@@ -264,7 +264,10 @@ impl TerminalPane {
     pub fn tmux_pane(
         &self,
         app: &AppContext,
-    ) -> Option<(crate::terminal::tmux::TmuxOriginId, warp_terminal::tmux::PaneId)> {
+    ) -> Option<(
+        crate::terminal::tmux::TmuxOriginId,
+        warp_terminal::tmux::PaneId,
+    )> {
         self.terminal_manager(app).as_ref(app).tmux_pane()
     }
 

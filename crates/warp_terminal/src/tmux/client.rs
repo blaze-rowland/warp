@@ -220,6 +220,9 @@ pub enum ClientEvent {
         id: CommandId,
         reply: CommandReply,
     },
+    /// tmux answered a `send-keys -K` key. tmux queues the key's bound commands behind the
+    /// reply, so a command sent after this runs after them (the KTD5 fence).
+    ClientKeyAcknowledged,
     /// A stale navigation key was dropped instead of sent.
     ClientKeyDropped {
         key: ClientKey,
@@ -331,6 +334,9 @@ pub struct ControlClient {
     client_name: Option<String>,
     key_config: KeyConfig,
     handshake_remaining: usize,
+    /// Set once tmux's reply to the attach command (or the attached session) shows the attach
+    /// succeeded. Nothing is written before then.
+    handshake_started: bool,
     /// Pane output is dropped until the pane list is in: every listed pane is captured next.
     panes_listed: bool,
     wait_exit: bool,
@@ -365,6 +371,7 @@ impl ControlClient {
             client_name: None,
             key_config: KeyConfig::default(),
             handshake_remaining: 0,
+            handshake_started: false,
             panes_listed: false,
             wait_exit: false,
             closed: false,
@@ -432,9 +439,11 @@ impl ControlClient {
     pub fn handle_event(&mut self, event: ControlEvent, now: Duration) {
         match event {
             ControlEvent::EnteredControlMode => {
+                // Nothing is written until tmux's reply to the attach command itself shows the
+                // attach succeeded: after a failed attach tmux exits, and anything written would
+                // reach the shell instead.
                 if self.phase == Phase::Connecting {
                     self.phase = Phase::Handshaking;
-                    self.write(VERSION_QUERY.to_owned(), Purpose::Version, now);
                 }
                 return;
             }
@@ -450,6 +459,19 @@ impl ControlClient {
         }
         if !matches!(self.phase, Phase::Handshaking | Phase::Attached) {
             return;
+        }
+        if !self.handshake_started {
+            match &event {
+                ControlEvent::CommandEnd(reply)
+                    if reply.flags & FROM_THIS_CLIENT == 0 && !reply.error =>
+                {
+                    self.start_handshake(now)
+                }
+                // Some servers may not answer the attach command; attachment is then proven by
+                // the session it attached to.
+                ControlEvent::SessionChanged { .. } => self.start_handshake(now),
+                _ => {}
+            }
         }
         match event {
             ControlEvent::CommandBegin { number, flags, .. } => self.on_begin(number, flags),
@@ -676,7 +698,10 @@ impl ControlClient {
     }
 
     fn check_open(&self) -> Result<(), CommandError> {
-        if self.closed || !matches!(self.phase, Phase::Handshaking | Phase::Attached) {
+        if self.closed
+            || !self.handshake_started
+            || !matches!(self.phase, Phase::Handshaking | Phase::Attached)
+        {
             Err(CommandError::Closed)
         } else {
             Ok(())
@@ -686,6 +711,10 @@ impl ControlClient {
     fn write(&mut self, line: String, purpose: Purpose, now: Duration) {
         debug_assert!(check_one_line(&line).is_ok(), "{line:?}");
         if self.closed {
+            return;
+        }
+        if !self.handshake_started {
+            log::debug!("tmux: not writing {line:?} before the attach succeeded");
             return;
         }
         self.outgoing.push(format!("{line}\n"));
@@ -826,7 +855,7 @@ impl ControlClient {
                     reply
                         .lines
                         .iter()
-                        .filter_map(|l| parse_binding(l))
+                        .filter_map(|l| parse_key_binding_line(l))
                         .collect()
                 });
                 self.key_config.bindings = Some(bindings.unwrap_or_default());
@@ -850,6 +879,7 @@ impl ControlClient {
             }
             Purpose::ClientKey => {
                 self.unacknowledged_keys = self.unacknowledged_keys.saturating_sub(1);
+                self.events.push(ClientEvent::ClientKeyAcknowledged);
                 self.pump_input(now);
             }
             Purpose::PaneFlow | Purpose::PaneInput => {}
@@ -857,6 +887,11 @@ impl ControlClient {
                 .events
                 .push(ClientEvent::CommandCompleted { id, reply }),
         }
+    }
+
+    fn start_handshake(&mut self, now: Duration) {
+        self.handshake_started = true;
+        self.write(VERSION_QUERY.to_owned(), Purpose::Version, now);
     }
 
     fn on_version(&mut self, reply: CommandReply, now: Duration) {
@@ -1259,6 +1294,12 @@ fn check_one_line(line: &str) -> Result<(), CommandError> {
     }
 }
 
+/// Double-quotes an argument for tmux's command parser, for callers building their own command
+/// lines.
+pub fn quote_argument(arg: &str) -> String {
+    quote(arg)
+}
+
 /// Double-quotes an argument for tmux's command parser.
 fn quote(arg: &str) -> String {
     let mut quoted = String::with_capacity(arg.len() + 2);
@@ -1290,7 +1331,8 @@ fn key_option(reply: &CommandReply) -> Option<String> {
     (!reply.error && !value.is_empty() && value != "None").then_some(value)
 }
 
-fn parse_binding(line: &[u8]) -> Option<KeyBinding> {
+/// Parses one line of a [`LIST_KEYS_FORMAT`] reply.
+pub fn parse_key_binding_line(line: &[u8]) -> Option<KeyBinding> {
     let line = String::from_utf8_lossy(line);
     let mut fields = line.splitn(4, '\t');
     Some(KeyBinding {

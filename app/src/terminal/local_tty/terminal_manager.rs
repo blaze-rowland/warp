@@ -1141,7 +1141,11 @@ impl<S> TerminalManager<S> {
         &mut self,
         env_vars: &HashMap<OsString, OsString>,
         ctx: &mut ModelContext<Box<dyn TerminalManagerTrait>>,
-    ) -> Option<GatewayLink> {
+    ) -> Option<GatewayLink>
+    where
+        S: TerminalSurface,
+        <S as Entity>::Event: PtyIntentEvent,
+    {
         self.tmux_origin = None;
         if !ctx.has_singleton_model::<TmuxGateways>() {
             return None;
@@ -1151,6 +1155,9 @@ impl<S> TerminalManager<S> {
             gateways.link_for_new_origin(requests, env_vars)
         });
         self.tmux_origin = Some(origin);
+        self.view.update(ctx, |surface, ctx| {
+            surface.on_tmux_origin_linked(origin, ctx)
+        });
         Some(link)
     }
 
