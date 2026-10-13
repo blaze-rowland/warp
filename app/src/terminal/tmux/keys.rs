@@ -21,7 +21,6 @@ use std::time::Duration;
 
 use instant::Instant;
 use settings::Setting as _;
-
 use warp_terminal::local_tty::tmux_gateway::TmuxRequest;
 use warp_terminal::tmux::{
     ClientEvent, ClientKey, CommandReply, KeyBinding, KeyClass, KeyConfig, PaneId,
@@ -1035,7 +1034,10 @@ impl TmuxKeyRouter {
                 }
             }
             TmuxGatewayEvent::Ended { origin } => self.end(*origin, ctx),
-            TmuxGatewayEvent::Refused { .. } | TmuxGatewayEvent::PaneQueueReady { .. } => {}
+            TmuxGatewayEvent::Refused { .. }
+            | TmuxGatewayEvent::PaneQueueReady { .. }
+            | TmuxGatewayEvent::ConfirmPending { .. }
+            | TmuxGatewayEvent::ConfirmCleared { .. } => {}
         }
     }
 

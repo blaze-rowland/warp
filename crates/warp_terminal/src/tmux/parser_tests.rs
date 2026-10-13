@@ -143,6 +143,7 @@ fn summary(event: &ControlEvent) -> String {
             reason: Some(reason),
         } => format!("exit {reason}"),
         ProtocolOverflow => "overflow".into(),
+        ControlLost => "control-lost".into(),
     }
 }
 
@@ -490,16 +491,15 @@ fn notification_inside_a_block_is_delivered_and_the_reply_stays_intact() {
     // tmux 3.7 writes `%message`, `%pause` and `%continue` inside the issuing command's block
     // (see fixtures/tmux-3.7c-notifications.cc).
     assert_eq!(
-        events_after_entry(b"%begin 1 2 1\nfirst\n%window-renamed @1 build\nsecond\n%end 1 2 1\n"),
+        events_after_entry(b"%begin 1 2 1\nfirst\n%message hi\nsecond\n%end 1 2 1\n"),
         vec![
             ControlEvent::CommandBegin {
                 time: 1,
                 number: 2,
                 flags: 1
             },
-            ControlEvent::WindowRenamed {
-                window_id: WindowId(1),
-                name: "build".into()
+            ControlEvent::Message {
+                message: "hi".into()
             },
             ControlEvent::CommandEnd(CommandReply {
                 time: 1,
@@ -971,4 +971,97 @@ fn fixture_tmux_3_4_handbuilt_replays() {
     );
     assert_eq!(pane_output(&items, 0), "café\r\n".as_bytes());
     assert!(shell_bytes(&items).is_empty());
+}
+
+#[test]
+fn notification_lines_tmux_never_interleaves_stay_reply_payload() {
+    let body = b"%exit\n%window-close @1\n%layout-change @1 x\n%session-changed $1 x\n";
+    let mut input = b"%begin 1 2 1\n".to_vec();
+    input.extend_from_slice(body);
+    input.extend_from_slice(b"%end 1 2 1\n");
+    let mut parser = ControlModeParser::new();
+    let events = parser.push(&entered(&input));
+    assert_eq!(events.len(), 3, "{events:?}");
+    assert_eq!(
+        events[2],
+        ControlEvent::CommandEnd(CommandReply {
+            time: 1,
+            number: 2,
+            flags: 1,
+            error: false,
+            lines: body
+                .split(|&b| b == b'\n')
+                .filter(|l| !l.is_empty())
+                .map(<[u8]>::to_vec)
+                .collect(),
+        })
+    );
+    assert!(parser.is_in_control_mode());
+}
+
+#[test]
+fn every_line_of_an_expected_capture_reply_is_payload() {
+    let mut parser = ControlModeParser::new();
+    parser.push(CONTROL_MODE_DCS);
+    parser.expect_reply(true);
+    parser.expect_reply(false);
+    let events = parser.push(
+        b"%begin 1 2 0\n%message theirs\n%end 1 2 0\n\
+          %begin 1 3 1\n%output %1 x\n%message pane text\n%pause %1\n%end 1 3 1\n\
+          %begin 1 4 1\n%message mine\n%end 1 4 1\n",
+    );
+    let summaries: Vec<_> = events.iter().map(summary).collect();
+    assert_eq!(
+        summaries,
+        [
+            "begin 2",
+            "message theirs",
+            "end 2 [0]",
+            "begin 3",
+            "end 3 [3]",
+            "begin 4",
+            "message mine",
+            "end 4 [0]"
+        ]
+    );
+}
+
+#[test]
+fn shell_lines_where_only_control_lines_can_be_hand_the_stream_back_to_the_shell() {
+    let mut parser = ControlModeParser::new();
+    let items = parser.decode(&entered(
+        b"%session-changed $0 main\nConnection to host closed.\r\nbye\nlast\nmore",
+    ));
+    assert_eq!(
+        items[items.len() - 2..],
+        [
+            DecodeItem::Control(ControlEvent::ControlLost),
+            DecodeItem::Shell(b"Connection to host closed.\r\nbye\nlast\nmore".to_vec()),
+        ]
+    );
+    assert!(parser.shell_pending().is_some());
+}
+
+#[test]
+fn a_prompt_with_escapes_hands_the_stream_back_without_a_newline() {
+    let mut parser = ControlModeParser::new();
+    let items = parser.decode(&entered(b"%session-changed $0 main\n\x1b]133;A\x07$ "));
+    assert_eq!(
+        items[items.len() - 2..],
+        [
+            DecodeItem::Control(ControlEvent::ControlLost),
+            DecodeItem::Shell(b"\x1b]133;A\x07$ ".to_vec()),
+        ]
+    );
+}
+
+#[test]
+fn control_lines_reset_the_stray_line_count_and_block_payload_is_never_stray() {
+    let mut parser = ControlModeParser::new();
+    let events = parser.push(&entered(
+        b"one\ntwo\n%sessions-changed\nthree\nfour\n\
+          %begin 1 2 1\na\nb\nc\n\x1b[31md\n%end 1 2 1\n",
+    ));
+    assert!(!events.contains(&ControlEvent::ControlLost), "{events:?}");
+    assert!(parser.is_in_control_mode());
 }

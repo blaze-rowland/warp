@@ -31,6 +31,11 @@ use super::settings::TmuxSettings;
 /// [`TmuxGateways::take_pane_queue`] after [`TmuxGatewayEvent::PaneQueueReady`].
 #[derive(Clone, Debug)]
 pub enum TmuxGatewayEvent {
+    /// Control-mode bytes appeared on `origin` without Warp starting tmux there. Nothing is sent
+    /// until the user answers with [`TmuxGateways::answer_confirmation`] (R3).
+    ConfirmPending { origin: TmuxOriginId },
+    /// `origin` no longer waits for that answer.
+    ConfirmCleared { origin: TmuxOriginId },
     /// tmux entered control mode on `origin`; the handshake is running.
     Starting { origin: TmuxOriginId },
     /// A control-mode entry stays raw, with the reason to show (R6, AE5).
@@ -236,6 +241,18 @@ impl TmuxGateways {
         }
     }
 
+    /// Opens (`open`) or declines a control-mode start that [`TmuxGatewayEvent::ConfirmPending`]
+    /// asked about. Declining shows the held bytes as plain output.
+    pub fn answer_confirmation(&self, origin: TmuxOriginId, open: bool) {
+        if let Some(origin) = self.origins.get(&origin) {
+            origin.requests.send(if open {
+                TmuxRequest::ConfirmOpen
+            } else {
+                TmuxRequest::ConfirmDismiss
+            });
+        }
+    }
+
     /// Commands to send just before `origin` detaches, replacing earlier ones.
     pub fn set_detach_commands(&mut self, origin: TmuxOriginId, commands: Vec<String>) {
         if let Some(origin) = self.origins.get_mut(&origin) {
@@ -283,6 +300,11 @@ impl TmuxGateways {
         ctx: &mut ModelContext<Self>,
     ) {
         let event = match event {
+            GatewayEvent::ConfirmPending => {
+                log::info!("tmux: control mode on origin {origin:?} waits for the user");
+                TmuxGatewayEvent::ConfirmPending { origin }
+            }
+            GatewayEvent::ConfirmCleared => TmuxGatewayEvent::ConfirmCleared { origin },
             GatewayEvent::Starting => {
                 log::info!("tmux: control mode starting on origin {origin:?}");
                 if let Some(entry) = self.origins.get_mut(&origin) {

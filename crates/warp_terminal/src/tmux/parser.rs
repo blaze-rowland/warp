@@ -11,7 +11,7 @@
 //!
 //! Reference: <https://github.com/tmux/tmux/wiki/Control-Mode>.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
 use super::layout::WindowFlags;
@@ -23,6 +23,10 @@ pub const CONTROL_MODE_DCS: &[u8] = b"\x1bP1000p";
 const STRING_TERMINATOR: &[u8] = b"\x1b\\";
 
 const MAX_CONTROL_LINE_BYTES: usize = 1_048_576;
+/// Consecutive non-protocol lines outside a reply block after which the stream is taken to be the
+/// shell's again (the tmux client died without `%exit`, e.g. its ssh connection dropped).
+const MAX_STRAY_LINES: usize = 3;
+const ESC: u8 = 0x1b;
 const MAX_REPLY_PAYLOAD_LINES: usize = 10_000;
 const MAX_REPLY_PAYLOAD_BYTES: usize = 1_048_576;
 
@@ -205,6 +209,9 @@ pub enum ControlEvent {
     /// A control line or command-reply payload exceeded its bound. The parser discards further
     /// control text until `%exit`.
     ProtocolOverflow,
+    /// Shell output appeared where only control lines can: tmux's client is gone without `%exit`.
+    /// The parser is back to shell bytes, starting with the stray output.
+    ControlLost,
 }
 
 /// The `%begin` whose `%end`/`%error` has not arrived yet.
@@ -212,8 +219,18 @@ struct OpenBlock {
     time: u64,
     number: u64,
     flags: u32,
+    /// Every line up to the matching `%end`/`%error` is payload (pane text from `capture-pane`).
+    raw_payload: bool,
     lines: Vec<Vec<u8>>,
     bytes: usize,
+}
+
+/// Non-protocol lines seen outside a reply block since the last control line, kept verbatim so
+/// they can be handed back to the shell.
+#[derive(Default)]
+struct Stray {
+    bytes: Vec<u8>,
+    lines: usize,
 }
 
 enum State {
@@ -223,6 +240,7 @@ enum State {
     Control {
         line: Vec<u8>,
         block: Option<OpenBlock>,
+        stray: Stray,
     },
     /// Just after `%exit`: strip the `ESC \` that closes the DCS, then return to the shell.
     AfterExit { pending: Vec<u8> },
@@ -242,6 +260,9 @@ pub struct ControlModeParser {
     state: State,
     /// Per-pane trailing bytes of an incomplete UTF-8 sequence from the previous payload.
     utf8_carry: HashMap<PaneId, Vec<u8>>,
+    /// For each command this client sent and whose `%begin` has not arrived, in order: whether
+    /// its reply is raw pane text. See [`Self::expect_reply`].
+    expected_replies: VecDeque<bool>,
 }
 
 impl Default for ControlModeParser {
@@ -257,7 +278,21 @@ impl ControlModeParser {
                 pending: Vec::new(),
             },
             utf8_carry: HashMap::new(),
+            expected_replies: VecDeque::new(),
         }
+    }
+
+    /// Records that this client sent a command. tmux answers in order, so the next `%begin`
+    /// flagged as this client's is its reply. When `raw_payload` is set (`capture-pane`), every
+    /// line of that block is payload, even one that looks like a notification.
+    pub fn expect_reply(&mut self, raw_payload: bool) {
+        self.expected_replies.push_back(raw_payload);
+    }
+
+    /// Forgets the commands recorded with [`Self::expect_reply`]; their replies are parsed as
+    /// ordinary blocks.
+    pub fn clear_expected_replies(&mut self) {
+        self.expected_replies.clear();
     }
 
     pub fn is_in_control_mode(&self) -> bool {
@@ -298,8 +333,8 @@ impl ControlModeParser {
             );
             let (next, leftover) = match state {
                 State::SeekingDcs { pending } => self.seek_dcs(pending, input, &mut items),
-                State::Control { line, block } => {
-                    self.drain_control(line, block, input, &mut items)
+                State::Control { line, block, stray } => {
+                    self.drain_control(line, block, stray, input, &mut items)
                 }
                 State::AfterExit { pending } => strip_string_terminator(pending, input),
                 State::DiscardUntilExit { line } => drain_discard(line, input, &mut items),
@@ -331,6 +366,7 @@ impl ControlModeParser {
             let state = State::Control {
                 line: Vec::new(),
                 block: None,
+                stray: Stray::default(),
             };
             return (state, Some(rest));
         }
@@ -346,6 +382,7 @@ impl ControlModeParser {
         &mut self,
         mut line: Vec<u8>,
         mut block: Option<OpenBlock>,
+        mut stray: Stray,
         input: Vec<u8>,
         items: &mut Vec<DecodeItem>,
     ) -> (State, Option<Vec<u8>>) {
@@ -353,7 +390,20 @@ impl ControlModeParser {
         let mut start = 0;
         while let Some(offset) = line[start..].iter().position(|&b| b == b'\n') {
             let end = start + offset;
-            let outcome = self.handle_line(trim_cr(&line[start..end]), &mut block, items);
+            let text = trim_cr(&line[start..end]);
+            if block.is_none() && is_stray(text) {
+                stray.bytes.extend_from_slice(&line[start..=end]);
+                stray.lines += 1;
+                start = end + 1;
+                if stray.lines >= MAX_STRAY_LINES || text.contains(&ESC) {
+                    return self.control_lost(stray, line.split_off(start), items);
+                }
+                continue;
+            }
+            if !text.is_empty() {
+                stray = Stray::default();
+            }
+            let outcome = self.handle_line(text, &mut block, items);
             start = end + 1;
             match outcome {
                 LineOutcome::Continue => {}
@@ -368,10 +418,32 @@ impl ControlModeParser {
             }
         }
         line.drain(..start);
+        // A shell prompt has no newline; Warp's shell hooks and most prompts carry escapes, which
+        // tmux never writes raw outside a reply.
+        if block.is_none() && is_stray(&line) && line.contains(&ESC) {
+            return self.control_lost(stray, line, items);
+        }
         if line.len() > MAX_CONTROL_LINE_BYTES {
             return self.overflow(line, items);
         }
-        (State::Control { line, block }, None)
+        (State::Control { line, block, stray }, None)
+    }
+
+    fn control_lost(
+        &mut self,
+        stray: Stray,
+        rest: Vec<u8>,
+        items: &mut Vec<DecodeItem>,
+    ) -> (State, Option<Vec<u8>>) {
+        self.utf8_carry.clear();
+        self.expected_replies.clear();
+        items.push(DecodeItem::Control(ControlEvent::ControlLost));
+        let mut shell = stray.bytes;
+        shell.extend_from_slice(&rest);
+        let state = State::SeekingDcs {
+            pending: Vec::new(),
+        };
+        (state, Some(shell))
     }
 
     fn overflow(&mut self, rest: Vec<u8>, items: &mut Vec<DecodeItem>) -> (State, Option<Vec<u8>>) {
@@ -404,9 +476,13 @@ impl ControlModeParser {
                 )));
                 return LineOutcome::Continue;
             }
-            // Notifications can arrive inside a block (tmux 3.7 writes `%message`, `%pause` and
-            // `%continue` there). Anything else is reply payload.
-            if let Some(event) = self.parse_notification(line) {
+            // tmux 3.7 writes some notifications inside the issuing command's block (`%message`,
+            // `%pause`, `%continue`; see fixtures/tmux-3.7c-notifications.cc), and pane output may
+            // interleave. Every other line, and every line of a capture, is reply payload.
+            if !open.raw_payload
+                && is_in_block_notification(line)
+                && let Some(event) = self.parse_notification(line)
+            {
                 return self.emit(event, items);
             }
             open.bytes += line.len();
@@ -418,10 +494,12 @@ impl ControlModeParser {
         }
 
         if let Some((GuardKind::Begin, time, number, flags)) = parse_guard(line) {
+            let raw_payload = flags & 1 != 0 && self.expected_replies.pop_front().unwrap_or(false);
             *block = Some(OpenBlock {
                 time,
                 number,
                 flags,
+                raw_payload,
                 lines: Vec::new(),
                 bytes: 0,
             });
@@ -615,6 +693,19 @@ impl ControlModeParser {
             bytes,
         }
     }
+}
+
+/// A non-empty line that is not a control line.
+fn is_stray(line: &[u8]) -> bool {
+    line.first().is_some_and(|&b| b != b'%')
+}
+
+/// Notifications tmux may write between a command's `%begin` and `%end`.
+fn is_in_block_notification(line: &[u8]) -> bool {
+    matches!(
+        split_token(line).0,
+        b"%output" | b"%extended-output" | b"%message" | b"%pause" | b"%continue"
+    )
 }
 
 fn strip_string_terminator(mut pending: Vec<u8>, input: Vec<u8>) -> (State, Option<Vec<u8>>) {

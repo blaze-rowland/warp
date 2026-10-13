@@ -2646,6 +2646,8 @@ pub struct TerminalView {
     enter_agent_view_after_pending_commands: bool,
     slow_bootstrap_banner: ViewHandle<Banner<TerminalAction>>,
     is_slow_bootstrap_banner_open: bool,
+    /// Asks before a tmux control-mode start Warp did not run becomes native (R3).
+    tmux_confirm_banner: ViewHandle<Banner<TerminalAction>>,
     /// Timer that auto-dismisses the slow-bootstrap banner after
     /// [`SLOW_BOOTSTRAP_BANNER_AUTO_DISMISS_DURATION`]. Held so it can be
     /// aborted when the banner is hidden for any other reason (manual
@@ -3999,6 +4001,27 @@ impl TerminalView {
             me.handle_slow_bootstrap_banner_event(event, ctx);
         });
 
+        let tmux_confirm_banner = ctx.add_typed_action_view(|_| {
+            Banner::<TerminalAction>::new_with_buttons(
+                BannerTextContent::plain_text(
+                    "tmux control mode started in this pane. Open tmux natively?",
+                ),
+                vec![BannerTextButton::new(
+                    "Open".to_string(),
+                    Rc::new(|event_ctx, _ctx, _position| {
+                        event_ctx.dispatch_typed_action(BannerAction::<TerminalAction>::Action(
+                            TerminalAction::OpenTmuxNatively,
+                        ));
+                    }),
+                )],
+                true,
+            )
+        });
+        ctx.subscribe_to_view(&tmux_confirm_banner, |me, _, event, ctx| match event {
+            BannerEvent::Dismiss { .. } => me.answer_tmux_confirmation(false, ctx),
+            BannerEvent::Action(action) => me.handle_action(action, ctx),
+        });
+
         ctx.subscribe_to_model(&sessions, |me, _, event, ctx| {
             me.handle_sessions_event(event.clone(), ctx);
         });
@@ -4427,6 +4450,7 @@ impl TerminalView {
             enter_agent_view_after_pending_commands: false,
             slow_bootstrap_banner,
             is_slow_bootstrap_banner_open: false,
+            tmux_confirm_banner,
             slow_bootstrap_banner_auto_dismiss_handle: None,
             incompatible_configuration_banner,
             is_incompatible_configuration_banner_open: false,
@@ -16908,10 +16932,11 @@ impl TerminalView {
             nested,
             launcher.as_deref(),
         );
+        let converting =
+            auto_convert && !self.tmux.unsupported_sessions.contains(&event.session_id);
+        self.set_tmux_origin_armed(entry.arms_gateway(converting), ctx);
         match entry {
-            TmuxEntry::Convert { command, socket }
-                if auto_convert && !self.tmux.unsupported_sessions.contains(&event.session_id) =>
-            {
+            TmuxEntry::Convert { command, socket } if converting => {
                 self.tmux.socket = socket;
                 let typed = std::mem::replace(&mut event.command, command);
                 self.tmux.converted_from = Some((event.session_id, typed));
@@ -16958,6 +16983,47 @@ impl TerminalView {
         }
         #[cfg(not(feature = "local_tty"))]
         let _ = (tmux_env, ctx);
+    }
+
+    /// Arms this pane's gateway for a tmux start Warp runs (typed and converted, `-CC`, the
+    /// session menu, Reattach) so it opens without asking, or disarms it for any other command
+    /// (R3).
+    fn set_tmux_origin_armed(&self, armed: bool, ctx: &AppContext) {
+        #[cfg(feature = "local_tty")]
+        {
+            use crate::terminal::tmux::gateway::TmuxGateways;
+            if let Some(origin) = self.tmux.origin
+                && ctx.has_singleton_model::<TmuxGateways>()
+                && let Some(flags) = TmuxGateways::as_ref(ctx).origin_flags(origin)
+            {
+                if armed {
+                    flags.arm();
+                } else {
+                    flags.disarm();
+                }
+            }
+        }
+        #[cfg(not(feature = "local_tty"))]
+        let _ = (armed, ctx);
+    }
+
+    /// Answers the "Open tmux natively?" banner. Declining leaves the pane raw.
+    fn answer_tmux_confirmation(&mut self, open: bool, ctx: &mut ViewContext<Self>) {
+        if !std::mem::take(&mut self.tmux.confirm_pending) {
+            return;
+        }
+        #[cfg(feature = "local_tty")]
+        {
+            use crate::terminal::tmux::gateway::TmuxGateways;
+            if let Some(origin) = self.tmux.origin
+                && ctx.has_singleton_model::<TmuxGateways>()
+            {
+                TmuxGateways::as_ref(ctx).answer_confirmation(origin, open);
+            }
+        }
+        #[cfg(not(feature = "local_tty"))]
+        let _ = open;
+        ctx.notify();
     }
 
     /// Writes `line` into the terminal as output (R6, R24, R29).
@@ -17094,9 +17160,22 @@ impl TerminalView {
         event: &crate::terminal::tmux::gateway::TmuxGatewayEvent,
         ctx: &mut ViewContext<Self>,
     ) {
-        use crate::terminal::tmux::gateway::TmuxGatewayEvent;
         use warp_terminal::local_tty::tmux_gateway::RefusalReason;
 
+        use crate::terminal::tmux::gateway::TmuxGatewayEvent;
+
+        match event {
+            TmuxGatewayEvent::ConfirmPending { origin }
+            | TmuxGatewayEvent::ConfirmCleared { origin }
+                if Some(*origin) == self.tmux.origin =>
+            {
+                self.tmux.confirm_pending =
+                    matches!(event, TmuxGatewayEvent::ConfirmPending { .. });
+                ctx.notify();
+                return;
+            }
+            _ => {}
+        }
         let TmuxGatewayEvent::Refused {
             origin,
             reason: RefusalReason::UnsupportedVersion { .. },
@@ -28034,6 +28113,7 @@ impl TypedActionView for TerminalView {
             | AltMouseAction(_)
             | ToggleMaximizePane
             | WarpifyTmuxPane
+            | OpenTmuxNatively
             | PromptContextMenu { .. }
             | OpenInputContextMenu { .. }
             | InputContextMenuItem(_)
@@ -28348,6 +28428,7 @@ impl TypedActionView for TerminalView {
             }
             ToggleMaximizePane => ctx.emit(Event::Pane(PaneEvent::ToggleMaximized)),
             WarpifyTmuxPane => self.warpify_tmux_pane(ctx),
+            OpenTmuxNatively => self.answer_tmux_confirmation(true, ctx),
             PromptContextMenu {
                 position_offset_from_prompt,
             } => self.show_prompt_context_menu(*position_offset_from_prompt, ctx),
@@ -29644,7 +29725,9 @@ impl View for TerminalView {
 
             // Only show one of these banners at a time, to avoid them visually
             // stacking on top of each other.
-            if self.is_slow_bootstrap_banner_open
+            if self.tmux.confirm_pending {
+                stack.add_child(ChildView::new(&self.tmux_confirm_banner).finish());
+            } else if self.is_slow_bootstrap_banner_open
                 && ContextFlag::ShowSlowShellStartupBanner.is_enabled()
             {
                 stack.add_child(ChildView::new(&self.slow_bootstrap_banner).finish());

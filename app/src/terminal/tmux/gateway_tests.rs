@@ -126,6 +126,7 @@ fn gateway_events_reach_subscribers_on_the_main_thread() {
         });
 
         // Drive a real gateway the way the PTY thread would.
+        link.origin.arm();
         let mut gateway = Gateway::new(link);
         let mut writes = VecDeque::new();
         gateway.route(b"\x1bP1000p", &mut writes);
@@ -216,5 +217,46 @@ fn the_session_model_is_kept_while_the_session_runs() {
             assert!(g.model(origin).is_none());
             assert!(!g.is_in_session(origin));
         });
+    });
+}
+
+#[test]
+fn an_unarmed_entry_asks_and_the_answer_goes_to_the_origin() {
+    App::test((), |mut app| async move {
+        let gateways = gateways(&mut app);
+        let (tx, rx) = mio_channel::channel();
+        let (origin, link) = gateways.update(&mut app, |g, _| g.link_for_new_origin(tx, &env("")));
+        link.switch.set_enabled(true);
+        let (events_tx, events_rx) = async_channel::unbounded();
+        app.update(|ctx| {
+            ctx.subscribe_to_model(&gateways, move |_, event: &TmuxGatewayEvent, _| {
+                let _ = events_tx.try_send(event.clone());
+            });
+        });
+
+        let mut gateway = Gateway::new(link);
+        let mut writes = VecDeque::new();
+        gateway.route(b"\x1bP1000p", &mut writes);
+        assert!(writes.is_empty());
+        assert!(matches!(
+            events_rx.recv().await.expect("gateway event"),
+            TmuxGatewayEvent::ConfirmPending { origin: o } if o == origin
+        ));
+        gateways.read(&app, |g, _| assert!(!g.is_in_session(origin)));
+
+        gateways.read(&app, |g, _| g.answer_confirmation(origin, false));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(warp_terminal::writeable_pty::Message::Tmux(
+                TmuxRequest::ConfirmDismiss
+            ))
+        ));
+        gateways.read(&app, |g, _| g.answer_confirmation(origin, true));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(warp_terminal::writeable_pty::Message::Tmux(
+                TmuxRequest::ConfirmOpen
+            ))
+        ));
     });
 }

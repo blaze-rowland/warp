@@ -417,6 +417,8 @@ impl TmuxNativeUi {
                 ctx.emit(TmuxNativeUiEvent::ModeChanged { origin: *origin });
             }
             TmuxGatewayEvent::Starting { .. }
+            | TmuxGatewayEvent::ConfirmPending { .. }
+            | TmuxGatewayEvent::ConfirmCleared { .. }
             | TmuxGatewayEvent::Refused { .. }
             | TmuxGatewayEvent::PaneQueueReady { .. }
             | TmuxGatewayEvent::CommandCompleted { .. } => {}

@@ -192,7 +192,10 @@ where
                 Message::Resize(size) => self.pty.on_resize(&size),
                 Message::ChildExited => return ChannelResult::TerminateLoop { child_exited: true },
                 Message::Tmux(request) => match &mut self.tmux_gateway {
-                    Some(gateway) => gateway.request(request, &mut state.write_list),
+                    Some(gateway) => {
+                        gateway.request(request, &mut state.write_list);
+                        self.parse_gateway_shell_bytes(state);
+                    }
                     None => log::debug!("tmux: dropping {request:?}; no gateway on this PTY"),
                 },
             }
@@ -251,6 +254,9 @@ where
     ) -> io::Result<()> {
         let mut bytes_in_buffer = 0;
         let mut bytes_processed = 0;
+        // Bytes the tmux gateway took as control stream. They count toward the read budget so a
+        // flood still returns to the write path, where pause and key commands go out.
+        let mut bytes_routed = 0;
 
         let mut terminal = None;
 
@@ -303,8 +309,9 @@ where
                                 }
                                 bytes_processed += earlier + model_bytes.len();
                             }
+                            bytes_routed += got - model_bytes.len().min(got);
                             bytes_in_buffer = 0;
-                            if bytes_processed >= MAX_LOCKED_READ {
+                            if bytes_processed + bytes_routed >= MAX_LOCKED_READ {
                                 break;
                             }
                             if let Some(terminal) = &mut terminal {
@@ -376,10 +383,35 @@ where
     }
 
     /// Tells a running tmux session its transport is gone (KTD13). No-op otherwise.
-    fn close_tmux_transport(&mut self) {
+    fn close_tmux_transport(&mut self, state: &mut State) {
         if let Some(gateway) = self.tmux_gateway.as_mut() {
             gateway.transport_closed();
+            self.parse_gateway_shell_bytes(state);
         }
+    }
+
+    /// Parses bytes the gateway gave back to the origin model outside a read (a dismissed or
+    /// abandoned control-mode entry).
+    fn parse_gateway_shell_bytes(&mut self, state: &mut State) {
+        let Some(gateway) = self.tmux_gateway.as_mut() else {
+            return;
+        };
+        let bytes = gateway.take_shell_bytes();
+        if bytes.is_empty() {
+            return;
+        }
+        let mut terminal_response_sequences = Vec::new();
+        state.parser.parse_bytes(
+            &mut *self.terminal.lock(),
+            &bytes,
+            &mut terminal_response_sequences,
+        );
+        if !terminal_response_sequences.is_empty() {
+            state
+                .write_list
+                .push_back(Cow::Owned(terminal_response_sequences));
+        }
+        self.event_listener.send_wakeup_event();
     }
 
     #[inline]
@@ -493,6 +525,7 @@ where
                         && gateway.in_session()
                     {
                         gateway.tick(&mut state.write_list);
+                        self.parse_gateway_shell_bytes(&mut state);
                     }
 
                     // If there were no events but `poll` returned, that means we hit the timeout.
@@ -518,7 +551,7 @@ where
                                         child_exited: exited,
                                     } => {
                                         if exited {
-                                            self.close_tmux_transport();
+                                            self.close_tmux_transport(&mut state);
                                             self.terminal.lock().exit(
                                                 ExitReason::ShellProcessExited {
                                                     status: ObservedExitStatus::Unavailable,
@@ -536,7 +569,7 @@ where
                                 if let Some(local_tty::ChildEvent::Exited(status)) =
                                     self.pty.next_child_event()
                                 {
-                                    self.close_tmux_transport();
+                                    self.close_tmux_transport(&mut state);
                                     self.terminal
                                         .lock()
                                         .exit(ExitReason::ShellProcessExited { status });
@@ -562,7 +595,7 @@ where
                                     {
                                         let mut drain = true;
                                         let _ = self.pty_read(&mut state, &mut buf, &mut drain);
-                                        self.close_tmux_transport();
+                                        self.close_tmux_transport(&mut state);
                                     }
                                     // Don't try to do I/O on a dead PTY.
                                     continue;
@@ -616,7 +649,7 @@ where
 
                 // Whatever ended the loop also ended any tmux session's transport. The control
                 // core is told before the origin model's lock is taken.
-                self.close_tmux_transport();
+                self.close_tmux_transport(&mut state);
 
                 // The evented instances are not dropped here so deregister them explicitly.
                 let _ = self.poll.registry().deregister(&mut self.rx);

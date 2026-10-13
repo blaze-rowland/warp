@@ -243,6 +243,7 @@ pub enum ClientEvent {
     /// The transport ended without `%exit`.
     TransportLost,
     /// The reply stream no longer matches what was sent; pane output is no longer delivered.
+    /// The control client is detached unless the transport is gone.
     Desync {
         reason: String,
     },
@@ -422,6 +423,18 @@ impl ControlClient {
         self.parser.shell_pending()
     }
 
+    /// Whether tmux's reply to the attach command (or the attached session) showed the attach
+    /// succeeded. Until then the stream may not be tmux at all.
+    pub fn attach_confirmed(&self) -> bool {
+        self.handshake_started
+    }
+
+    /// Whether the transport is gone (EOF, failure, or the control stream turned into shell
+    /// output) without `%exit`.
+    pub fn transport_lost(&self) -> bool {
+        self.transport_lost
+    }
+
     /// Parses a transport read. Returns bytes outside control mode (before the DCS and after
     /// `%exit`), which belong to the shell.
     pub fn receive_bytes(&mut self, bytes: &[u8], now: Duration) -> Vec<u8> {
@@ -453,6 +466,10 @@ impl ControlClient {
             }
             ControlEvent::ProtocolOverflow => {
                 self.desync("a control line or reply exceeded the parser's bounds".into());
+                return;
+            }
+            ControlEvent::ControlLost => {
+                self.transport_closed();
                 return;
             }
             _ => {}
@@ -547,6 +564,7 @@ impl ControlClient {
             ControlEvent::EnteredControlMode
             | ControlEvent::Exit { .. }
             | ControlEvent::ProtocolOverflow
+            | ControlEvent::ControlLost
             | ControlEvent::UnlinkedWindowAdd { .. }
             | ControlEvent::UnlinkedWindowClose { .. }
             | ControlEvent::UnlinkedWindowRenamed { .. }
@@ -559,7 +577,7 @@ impl ControlClient {
         }
     }
 
-    /// The transport hit EOF or failed.
+    /// The transport hit EOF or failed, or the control stream turned back into shell output.
     pub fn transport_closed(&mut self) {
         self.transport_lost = true;
         if matches!(self.phase, Phase::Exited | Phase::Disconnected) {
@@ -718,6 +736,8 @@ impl ControlClient {
             return;
         }
         self.outgoing.push(format!("{line}\n"));
+        self.parser
+            .expect_reply(matches!(purpose, Purpose::Capture { .. }));
         self.sent.push_back(Sent {
             purpose,
             line,
@@ -737,6 +757,12 @@ impl ControlClient {
             return;
         }
         log::warn!("tmux control channel desynced: {reason}");
+        // Detach so tmux exits and the PTY goes back to the shell; the parser still waits for
+        // `%exit`. Nothing was written before the attach succeeded, so nothing is written now.
+        if self.handshake_started && !self.transport_lost && !self.closed {
+            self.closed = true;
+            self.outgoing.push("\n".to_owned());
+        }
         self.phase = Phase::Disconnected;
         self.reset_flow();
         self.events.push(ClientEvent::Desync { reason });
@@ -744,6 +770,7 @@ impl ControlClient {
 
     fn reset_flow(&mut self) {
         self.sent.clear();
+        self.parser.clear_expected_replies();
         self.syncs.clear();
         self.input_queue.clear();
         self.unacknowledged_keys = 0;
@@ -1300,12 +1327,14 @@ pub fn quote_argument(arg: &str) -> String {
     quote(arg)
 }
 
-/// Double-quotes an argument for tmux's command parser.
+/// Double-quotes an argument for tmux's command parser. Besides `"` and `\`, `$` and `` ` `` are
+/// escaped: tmux reads `\$` and `` \` `` as the plain characters, and a shell that is ever handed
+/// the line by mistake expands neither variables nor command substitutions.
 fn quote(arg: &str) -> String {
     let mut quoted = String::with_capacity(arg.len() + 2);
     quoted.push('"');
     for c in arg.chars() {
-        if matches!(c, '"' | '\\' | '$') {
+        if matches!(c, '"' | '\\' | '$' | '`') {
             quoted.push('\\');
         }
         quoted.push(c);

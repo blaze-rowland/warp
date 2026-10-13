@@ -162,7 +162,8 @@ impl TmuxPopups {
             | TmuxSessionEvent::ActivePaneChanged { .. }
             | TmuxSessionEvent::StatusChanged { .. }
             | TmuxSessionEvent::Focus { .. }
-            | TmuxSessionEvent::Notice { .. } => {}
+            | TmuxSessionEvent::Notice { .. }
+            | TmuxSessionEvent::ReattachReady { .. } => {}
         }
     }
 

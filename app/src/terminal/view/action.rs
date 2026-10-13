@@ -204,6 +204,8 @@ pub enum TerminalAction {
     ToggleMaximizePane,
     /// R8's "Warpify this pane" on a tmux pane without shell integration (U9).
     WarpifyTmuxPane,
+    /// Opens natively a tmux control-mode start Warp did not run itself (R3).
+    OpenTmuxNatively,
     SplitRight(Option<AvailableShell>),
     SplitLeft(Option<AvailableShell>),
     SplitDown(Option<AvailableShell>),
@@ -569,6 +571,7 @@ impl fmt::Debug for TerminalAction {
             SplitUp(_) => f.write_str("SplitUp"),
             ToggleMaximizePane => f.write_str("ToggleMaximizeActivePane"),
             WarpifyTmuxPane => f.write_str("WarpifyTmuxPane"),
+            OpenTmuxNatively => f.write_str("OpenTmuxNatively"),
             PromptContextMenu {
                 position_offset_from_prompt,
             } => write!(

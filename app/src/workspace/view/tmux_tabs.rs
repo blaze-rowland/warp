@@ -102,6 +102,7 @@ impl Workspace {
             TmuxSessionEvent::Notice { origin, line } => {
                 self.write_tmux_origin_line(*origin, line, ctx)
             }
+            TmuxSessionEvent::ReattachReady { origin } => self.tmux_reattach(*origin, ctx),
         }
     }
 
@@ -541,7 +542,7 @@ impl Workspace {
     }
 
     /// Reattach from the Disconnected banner: reruns `tmux -CC attach -t <session>` in the
-    /// origin pane.
+    /// origin pane, once the old control client no longer holds it.
     pub(super) fn tmux_reattach(&mut self, origin: TmuxOriginId, ctx: &mut ViewContext<Self>) {
         let Some(name) = TmuxSessions::as_ref(ctx)
             .session(origin)
@@ -559,6 +560,11 @@ impl Workspace {
         else {
             return;
         };
+        if !TmuxSessions::handle(ctx)
+            .update(ctx, |sessions, ctx| sessions.request_reattach(origin, ctx))
+        {
+            return;
+        }
         let command = reattach_command(&name);
         view.update(ctx, |view, ctx| {
             view.execute_command_or_set_pending(&command, ctx)

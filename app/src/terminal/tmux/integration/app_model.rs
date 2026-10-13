@@ -26,8 +26,6 @@ use super::{
     parse_launcher_path, parse_pane_facts, parse_token, plain_clients, read_token_query,
     reannounce_command, session_panes_query,
 };
-use crate::terminal::TerminalModel;
-use crate::terminal::TerminalView;
 use crate::terminal::tmux::TmuxOriginId;
 use crate::terminal::tmux::plugins::{
     AUTOSAVE_TICK, CONTINUUM_QUERY, autosave_due, parse_continuum, parse_plugin, plugin_query,
@@ -35,6 +33,7 @@ use crate::terminal::tmux::plugins::{
 use crate::terminal::tmux::popup::TmuxPopups;
 use crate::terminal::tmux::settings::TmuxSettings;
 use crate::terminal::tmux::workspace_sync::{TmuxSessionEvent, TmuxSessions};
+use crate::terminal::{TerminalModel, TerminalView};
 
 /// How long a new pane's output must pause before it counts as idle.
 const IDLE_QUIET: Duration = Duration::from_millis(500);
@@ -227,7 +226,8 @@ impl TmuxIntegration {
             | TmuxSessionEvent::ActivePaneChanged { .. }
             | TmuxSessionEvent::StatusChanged { .. }
             | TmuxSessionEvent::Focus { .. }
-            | TmuxSessionEvent::Notice { .. } => {}
+            | TmuxSessionEvent::Notice { .. }
+            | TmuxSessionEvent::ReattachReady { .. } => {}
         }
     }
 

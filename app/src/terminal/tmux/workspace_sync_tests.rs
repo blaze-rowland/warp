@@ -686,3 +686,45 @@ fn popup_windows_and_unnamed_windows_get_no_tab() {
         "{ops:?}"
     );
 }
+
+#[test]
+fn reattach_waits_for_the_old_control_client_to_end() {
+    let _flag = FeatureFlag::TmuxControlMode.override_enabled(true);
+    App::test((), |mut app| async move {
+        let (gateways, sessions) = sessions(&mut app);
+        let events = record_events(&mut app, &sessions);
+        let (origin, rx) = attach(&mut app, &gateways);
+        gateways.update(&mut app, |g, ctx| {
+            g.deliver_for_test(
+                origin,
+                GatewayEvent::Client(ClientEvent::Desync {
+                    reason: "test".to_owned(),
+                }),
+                ctx,
+            );
+        });
+        // The desynced client still holds the origin PTY: detach it first.
+        assert!(!sessions.update(&mut app, |s, ctx| s.request_reattach(origin, ctx)));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Message::Tmux(TmuxRequest::Detach))
+        ));
+        assert!(
+            !events
+                .borrow()
+                .contains(&TmuxSessionEvent::ReattachReady { origin })
+        );
+        gateways.update(&mut app, |g, ctx| {
+            g.deliver_for_test(origin, GatewayEvent::Ended, ctx);
+        });
+        assert!(
+            events
+                .borrow()
+                .contains(&TmuxSessionEvent::ReattachReady { origin })
+        );
+        sessions.read(&app, |s, _| {
+            assert_eq!(s.status(origin), Some(SessionStatus::Disconnected));
+        });
+        assert!(sessions.update(&mut app, |s, ctx| s.request_reattach(origin, ctx)));
+    });
+}

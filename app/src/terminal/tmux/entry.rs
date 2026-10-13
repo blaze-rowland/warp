@@ -49,7 +49,7 @@ pub enum Entry {
         command: String,
         socket: Option<TmuxSocket>,
     },
-    /// The command already asks for control mode; it runs unchanged and converts on its own.
+    /// The command already asks for control mode; it runs unchanged and converts without asking.
     ControlMode { socket: Option<TmuxSocket> },
     /// The command would convert, but the origin already runs inside tmux: it runs raw, with
     /// [`NESTED_NOTE`].
@@ -121,6 +121,19 @@ pub fn plan_entry_with_launcher(
     }
 }
 
+impl Entry {
+    /// Whether running the command makes Warp the one starting tmux control mode, so the origin's
+    /// gateway is armed and the session opens without asking (R3). `converting` is whether a
+    /// [`Entry::Convert`] rewrite is applied.
+    pub fn arms_gateway(&self, converting: bool) -> bool {
+        match self {
+            Self::ControlMode { .. } => true,
+            Self::Convert { .. } => converting,
+            Self::Nested | Self::Unchanged => false,
+        }
+    }
+}
+
 /// The command to send to the shell for `command`: the converted command when automatic
 /// conversion is on and applies, otherwise `command` itself.
 pub fn command_to_run(
@@ -161,6 +174,8 @@ pub struct PaneTmuxState {
     pub unsupported_sessions: HashSet<SessionId>,
     /// The pane listens for its origin's gateway refusals.
     pub follows_gateways: bool,
+    /// Control-mode bytes Warp did not start wait for the user's answer in this pane (R3).
+    pub confirm_pending: bool,
 }
 
 /// Single-quotes `value` for a POSIX shell (and fish) unless it is made only of safe characters.

@@ -12,14 +12,20 @@
 //! "control core, then pane model". Pane bytes are never scanned for the entry DCS, so an inner
 //! program printing `ESC P1000p` cannot start a second session.
 //!
+//! Control-mode bytes can appear in any output (`cat` of a file, a remote host's output), so an
+//! entry only becomes a session on its own when Warp just ran a tmux command on this origin and
+//! armed it ([`OriginFlags::arm`]). Any other entry is held, with nothing written to the PTY,
+//! until the app answers [`GatewayEvent::ConfirmPending`] (R3). A session whose attach does not
+//! complete within [`HANDSHAKE_DEADLINE`] is abandoned and its bytes go to the origin model.
+//!
 //! The crate cannot read app settings, so the app mirrors the setting into a [`GatewaySwitch`]
 //! and reports what it knows about the origin pane through [`OriginFlags`].
 
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use instant::Instant;
@@ -32,6 +38,22 @@ use crate::tmux::{
 /// CAN: aborts an escape sequence in the VT parser. Written to the origin model when a DCS
 /// prefix it already received turns out to be the control-mode entry.
 const CANCEL: u8 = 0x18;
+
+/// How long after Warp runs a tmux command on an origin a control-mode entry there starts a
+/// session without asking.
+pub const ARM_WINDOW: Duration = Duration::from_secs(10);
+
+/// How long a session may take to show that tmux attached before its bytes go back to the
+/// origin model.
+pub const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(5);
+
+/// How long a disconnected session (desync, lost control) may wait for tmux's `%exit` before the
+/// PTY goes back to the shell anyway.
+const DISCONNECT_DEADLINE: Duration = Duration::from_secs(5);
+
+/// The most control-stream bytes held for an unconfirmed entry or an unfinished attach. Past it
+/// the bytes go to the origin model as plain output.
+const MAX_HELD_BYTES: usize = 1 << 20;
 
 /// The app's `terminal.tmux_control_mode` setting (folded with the feature flag), shared by every
 /// event loop. Reading it is one relaxed atomic load.
@@ -55,9 +77,16 @@ impl GatewaySwitch {
 const TMUX_ENV: u8 = 1;
 const ORIGIN_IS_TMUX_PANE: u8 = 1 << 1;
 
-/// Facts about one origin pane that rule out a native session (R6). Set by the app.
+#[derive(Debug, Default)]
+struct OriginState {
+    bits: AtomicU8,
+    armed_until: Mutex<Option<Instant>>,
+}
+
+/// Facts about one origin pane, set by the app: what rules out a native session (R6), and
+/// whether Warp itself just started tmux there (R3).
 #[derive(Clone, Debug, Default)]
-pub struct OriginFlags(Arc<AtomicU8>);
+pub struct OriginFlags(Arc<OriginState>);
 
 impl OriginFlags {
     /// `$TMUX` is set in the origin shell: it already runs inside tmux.
@@ -72,7 +101,7 @@ impl OriginFlags {
 
     /// Why a control-mode entry on this origin must stay raw, if it must.
     pub fn nested_reason(&self) -> Option<RefusalReason> {
-        let bits = self.0.load(Ordering::Relaxed);
+        let bits = self.0.bits.load(Ordering::Relaxed);
         if bits & ORIGIN_IS_TMUX_PANE != 0 {
             Some(RefusalReason::OriginIsTmuxPane)
         } else if bits & TMUX_ENV != 0 {
@@ -82,6 +111,31 @@ impl OriginFlags {
         }
     }
 
+    /// Warp is running a tmux command here (typed and converted, or from the session menu): the
+    /// next control-mode entry within [`ARM_WINDOW`] starts a session without asking.
+    pub fn arm(&self) {
+        *self.armed_until() = Some(Instant::now() + ARM_WINDOW);
+    }
+
+    /// Withdraws [`Self::arm`]: the command Warp ran is over, or another one started.
+    pub fn disarm(&self) {
+        *self.armed_until() = None;
+    }
+
+    /// Whether an entry now would start a session without asking. Consumes the arm.
+    fn take_armed(&self) -> bool {
+        self.armed_until()
+            .take()
+            .is_some_and(|until| Instant::now() < until)
+    }
+
+    fn armed_until(&self) -> std::sync::MutexGuard<'_, Option<Instant>> {
+        self.0
+            .armed_until
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// A handle that does not keep the origin alive.
     pub fn downgrade(&self) -> WeakOriginFlags {
         WeakOriginFlags(Arc::downgrade(&self.0))
@@ -89,16 +143,16 @@ impl OriginFlags {
 
     fn set(&self, bit: u8, set: bool) {
         if set {
-            self.0.fetch_or(bit, Ordering::Relaxed);
+            self.0.bits.fetch_or(bit, Ordering::Relaxed);
         } else {
-            self.0.fetch_and(!bit, Ordering::Relaxed);
+            self.0.bits.fetch_and(!bit, Ordering::Relaxed);
         }
     }
 }
 
 /// [`OriginFlags`] that do not keep the origin alive; the gateway holds the strong handle.
 #[derive(Clone, Debug)]
-pub struct WeakOriginFlags(std::sync::Weak<AtomicU8>);
+pub struct WeakOriginFlags(std::sync::Weak<OriginState>);
 
 impl WeakOriginFlags {
     /// `None` once the origin's event loop has ended.
@@ -154,11 +208,24 @@ pub enum TmuxRequest {
     ResumePane(PaneId),
     /// Detach the control client (the final bare newline).
     Detach,
+    /// The user accepted [`GatewayEvent::ConfirmPending`]: start the session.
+    ConfirmOpen,
+    /// The user declined [`GatewayEvent::ConfirmPending`]: the held bytes go to the origin model
+    /// as plain output and the PTY stays the shell's. Nothing is written, since the stream may
+    /// not be tmux; a real `tmux -CC` left running there ends with `detach` or Ctrl-C.
+    ConfirmDismiss,
 }
 
 /// What the gateway reports to the app.
 #[derive(Debug)]
 pub enum GatewayEvent {
+    /// Control-mode bytes appeared on an origin Warp did not just start tmux on. They are held
+    /// and nothing is written until the app sends [`TmuxRequest::ConfirmOpen`] or
+    /// [`TmuxRequest::ConfirmDismiss`].
+    ConfirmPending,
+    /// A [`Self::ConfirmPending`] entry is no longer waiting: dismissed, or its held bytes went
+    /// to the origin model because there were too many or the setting turned off.
+    ConfirmCleared,
     /// tmux entered control mode on this origin; the handshake is running.
     Starting,
     /// A control-mode entry stays raw (R6). For nested tmux nothing was diverted; for an old
@@ -174,8 +241,8 @@ pub enum GatewayEvent {
     PaneQueueOpened { queue: PaneQueueReceiver },
     /// The reply to a [`TmuxRequest::Command`].
     CommandCompleted { tag: u64, reply: CommandReply },
-    /// The control stream ended (`%exit`, desync recovery, or transport loss) and the PTY
-    /// belongs to the shell again. Every pane queue is closed.
+    /// The control stream ended (`%exit`, desync recovery, transport loss, or an attach that
+    /// never completed) and the PTY belongs to the shell again. Every pane queue is closed.
     Ended,
 }
 
@@ -408,12 +475,22 @@ struct Session {
     tags: HashMap<CommandId, u64>,
     /// The server was refused; its `AttachFailed` on `%exit` is expected and not reported.
     refused: bool,
+    started_at: Duration,
+    /// Every byte of the stream, from the DCS, until the attach is confirmed. If the attach never
+    /// completes, the stream was not a working tmux and these go to the origin model.
+    prelude: Option<Vec<u8>>,
+    /// When the client disconnected (desync, lost control) while tmux may still be running.
+    disconnected_at: Option<Duration>,
 }
 
 enum State {
     /// Shell bytes. `matched` DCS bytes at the end of earlier reads already went to the model.
     Seeking {
         matched: usize,
+    },
+    /// An unarmed entry waits for the app; `held` is the stream from the DCS on.
+    Confirming {
+        held: Vec<u8>,
     },
     Session(Box<Session>),
 }
@@ -428,6 +505,9 @@ pub struct Gateway {
     queue_limits: PaneQueueLimits,
     clock: Instant,
     state: State,
+    /// Bytes for the origin model produced outside [`Gateway::route`]; see
+    /// [`Gateway::take_shell_bytes`].
+    shell_out: Vec<u8>,
 }
 
 impl Gateway {
@@ -441,14 +521,21 @@ impl Gateway {
             queue_limits: link.queue_limits,
             clock: Instant::now(),
             state: State::Seeking { matched: 0 },
+            shell_out: Vec::new(),
         }
     }
 
-    /// Whether reads must go through [`Self::route`]: the switch is on, or a session that started
-    /// while it was on is still running.
+    /// Whether reads must go through [`Self::route`]: the switch is on, or an entry that started
+    /// while it was on is still held or running.
     #[inline]
     pub fn engaged(&self) -> bool {
-        self.switch.is_enabled() || matches!(self.state, State::Session(_))
+        self.switch.is_enabled() || !matches!(self.state, State::Seeking { .. })
+    }
+
+    /// Bytes for the origin model that a request or a timer released. Parse them before the next
+    /// read.
+    pub fn take_shell_bytes(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.shell_out)
     }
 
     pub fn in_session(&self) -> bool {
@@ -475,18 +562,23 @@ impl Gateway {
                 if entry.carried {
                     model.push(CANCEL);
                 }
-                log::info!("tmux: control mode entered; starting the gateway session");
-                self.state = State::Session(Box::new(Session {
-                    client: ControlClient::new(self.client_config.clone()),
-                    queues: HashMap::new(),
-                    tags: HashMap::new(),
-                    refused: false,
-                }));
-                (self.sink)(GatewayEvent::Starting);
                 let mut control = CONTROL_MODE_DCS.to_vec();
                 control.extend_from_slice(&input[entry.end..]);
-                self.feed_session(&control, &mut model, writes);
+                if self.origin.take_armed() {
+                    self.start_session(&control, &mut model, writes);
+                } else {
+                    log::info!("tmux: control mode on an origin Warp did not start; asking first");
+                    self.state = State::Confirming { held: control };
+                    (self.sink)(GatewayEvent::ConfirmPending);
+                    self.check_held();
+                    model.append(&mut self.shell_out);
+                }
                 Routed::Split(model)
+            }
+            State::Confirming { held } => {
+                held.extend_from_slice(input);
+                self.check_held();
+                Routed::Split(std::mem::take(&mut self.shell_out))
             }
             State::Session(_) => {
                 let mut model = Vec::new();
@@ -496,9 +588,77 @@ impl Gateway {
         }
     }
 
+    /// Releases held bytes to the origin model when there are too many or the setting is off.
+    fn check_held(&mut self) {
+        let State::Confirming { held } = &self.state else {
+            return;
+        };
+        if held.len() > MAX_HELD_BYTES || !self.switch.is_enabled() {
+            log::info!("tmux: no answer for a held control-mode entry; showing it as output");
+            self.release_held();
+        }
+    }
+
+    fn release_held(&mut self) {
+        if let Some(held) = self.take_held() {
+            self.shell_out.extend_from_slice(&held);
+            (self.sink)(GatewayEvent::ConfirmCleared);
+        }
+    }
+
+    /// Leaves [`State::Confirming`], returning what it held.
+    fn take_held(&mut self) -> Option<Vec<u8>> {
+        let State::Confirming { held } = &mut self.state else {
+            return None;
+        };
+        let held = std::mem::take(held);
+        self.state = State::Seeking { matched: 0 };
+        Some(held)
+    }
+
+    fn start_session(
+        &mut self,
+        control: &[u8],
+        model: &mut Vec<u8>,
+        writes: &mut VecDeque<Cow<'static, [u8]>>,
+    ) {
+        log::info!("tmux: control mode entered; starting the gateway session");
+        self.state = State::Session(Box::new(Session {
+            client: ControlClient::new(self.client_config.clone()),
+            queues: HashMap::new(),
+            tags: HashMap::new(),
+            refused: false,
+            started_at: self.now(),
+            prelude: Some(Vec::new()),
+            disconnected_at: None,
+        }));
+        (self.sink)(GatewayEvent::Starting);
+        self.feed_session(control, model, writes);
+    }
+
     /// Applies a request from the app.
     pub fn request(&mut self, request: TmuxRequest, writes: &mut VecDeque<Cow<'static, [u8]>>) {
         let now = self.now();
+        match request {
+            TmuxRequest::ConfirmOpen => {
+                if let Some(held) = self.take_held() {
+                    (self.sink)(GatewayEvent::ConfirmCleared);
+                    let mut model = Vec::new();
+                    self.start_session(&held, &mut model, writes);
+                    self.shell_out.append(&mut model);
+                }
+                return;
+            }
+            TmuxRequest::ConfirmDismiss => {
+                self.release_held();
+                return;
+            }
+            TmuxRequest::PaneInput { .. }
+            | TmuxRequest::ClientKey(_)
+            | TmuxRequest::Command { .. }
+            | TmuxRequest::ResumePane(_)
+            | TmuxRequest::Detach => {}
+        }
         let State::Session(session) = &mut self.state else {
             log::debug!("tmux: dropping {request:?} with no session running");
             return;
@@ -520,6 +680,7 @@ impl Gateway {
                 client.detach();
                 Ok(())
             }
+            TmuxRequest::ConfirmOpen | TmuxRequest::ConfirmDismiss => Ok(()),
         };
         if let Err(error) = result {
             log::warn!("tmux: request rejected: {error}");
@@ -532,24 +693,63 @@ impl Gateway {
         let State::Session(session) = &self.state else {
             return None;
         };
-        let deadline = session.client.next_deadline()?;
+        let deadline = [
+            session.client.next_deadline(),
+            session
+                .prelude
+                .as_ref()
+                .map(|_| session.started_at + HANDSHAKE_DEADLINE),
+            session.disconnected_at.map(|at| at + DISCONNECT_DEADLINE),
+        ]
+        .into_iter()
+        .flatten()
+        .min()?;
         Some(deadline.saturating_sub(self.now()))
     }
 
-    /// Runs the engine's timers.
+    /// Runs the engine's timers, and gives the PTY back to the shell when an attach never
+    /// completed or a disconnected tmux never exited.
     pub fn tick(&mut self, writes: &mut VecDeque<Cow<'static, [u8]>>) {
         let now = self.now();
-        if let State::Session(session) = &mut self.state {
-            session.client.tick(now);
-            self.pump(writes);
+        let State::Session(session) = &mut self.state else {
+            return;
+        };
+        session.client.tick(now);
+        self.pump(writes);
+        let State::Session(session) = &mut self.state else {
+            return;
+        };
+        if session.prelude.is_some() && now >= session.started_at + HANDSHAKE_DEADLINE {
+            log::info!("tmux: the attach did not complete in time; showing the stream as output");
+            self.abandon();
+        } else if session
+            .disconnected_at
+            .is_some_and(|at| now >= at + DISCONNECT_DEADLINE)
+        {
+            log::info!("tmux: a disconnected session did not exit; the shell gets the PTY back");
+            self.end_session();
         }
+    }
+
+    /// Ends a session whose attach never completed: everything it read goes to the origin model.
+    fn abandon(&mut self) {
+        if let State::Session(session) = &mut self.state
+            && let Some(prelude) = session.prelude.take()
+        {
+            self.shell_out.extend_from_slice(&prelude);
+        }
+        self.end_session();
     }
 
     /// The PTY hit EOF, failed, or its child exited (KTD13). Ends any session.
     pub fn transport_closed(&mut self) {
+        self.release_held();
         let State::Session(session) = &mut self.state else {
             return;
         };
+        if let Some(prelude) = session.prelude.take() {
+            self.shell_out.extend_from_slice(&prelude);
+        }
         session.client.transport_closed();
         let mut writes = VecDeque::new();
         self.pump(&mut writes);
@@ -558,6 +758,12 @@ impl Gateway {
 
     fn now(&self) -> Duration {
         self.clock.elapsed()
+    }
+
+    /// Moves the gateway's clock forward, for deadline tests.
+    #[cfg(test)]
+    fn advance_clock(&mut self, by: Duration) {
+        self.clock = self.clock.checked_sub(by).expect("clock in range");
     }
 
     fn feed_session(
@@ -570,11 +776,33 @@ impl Gateway {
         let State::Session(session) = &mut self.state else {
             return;
         };
-        model.extend(session.client.receive_bytes(input, now));
+        if let Some(prelude) = &mut session.prelude {
+            prelude.extend_from_slice(input);
+        }
+        let shell = session.client.receive_bytes(input, now);
+        if session.client.attach_confirmed() {
+            session.prelude = None;
+        }
+        let abandoned = session.prelude.as_ref().is_some_and(|prelude| {
+            prelude.len() > MAX_HELD_BYTES || session.client.transport_lost()
+        });
+        if abandoned {
+            log::info!("tmux: the control stream was not a working tmux; showing it as output");
+            let State::Session(session) = &mut self.state else {
+                return;
+            };
+            model.extend(session.prelude.take().unwrap_or_default());
+            self.end_session();
+            return;
+        }
+        model.extend(shell);
         self.pump(writes);
-        let State::Session(session) = &self.state else {
+        let State::Session(session) = &mut self.state else {
             return;
         };
+        if session.disconnected_at.is_none() && session.client.phase() == Phase::Disconnected {
+            session.disconnected_at = Some(now);
+        }
         if let Some(pending) = session.client.shell_pending() {
             // `pending` is a partial DCS the parser held back; it goes to the model now and the
             // detector carries on from it.

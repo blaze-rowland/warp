@@ -489,8 +489,15 @@ impl GatewayHarness {
         }
     }
 
-    /// The prompt, the DCS, tmux's reply to the attach command itself, and `%session-changed`.
+    /// Warp runs `tmux -CC` (arming the origin), then the prompt, the DCS, tmux's reply to the
+    /// attach command itself, and `%session-changed`.
     fn enter(&mut self) {
+        self.origin.arm();
+        self.enter_unarmed();
+    }
+
+    /// [`Self::enter`] for a control-mode start Warp did not run.
+    fn enter_unarmed(&mut self) {
         let mut bytes = b"$ tmux -CC\r\n\x1bP1000p".to_vec();
         bytes.extend_from_slice(
             format!(
@@ -672,6 +679,7 @@ fn flag_on_diverts_the_control_stream_and_the_model_gets_only_shell_bytes() {
 #[test]
 fn the_entry_dcs_split_across_reads_is_cancelled_in_the_model() {
     let mut g = GatewayHarness::spawn(true);
+    g.origin.arm();
     g.h.shell_prints(b"$ tmux -CC\r\n\x1bP10");
     g.h.wait_for_terminal("the prompt", |t| t.text().contains("$ tmux -CC"));
     g.h.shell_prints(b"00p");
@@ -809,6 +817,7 @@ fn while_attached_control_lines_never_take_the_origin_model_lock() {
     // control line if it tried to take it.
     let terminal = g.h.terminal.clone();
     let guard = terminal.lock();
+    g.origin.arm();
     let mut bytes = b"\x1bP1000p".to_vec();
     bytes.extend_from_slice(
         format!("%begin {TIME} 280 0\n%end {TIME} 280 0\n%session-changed $0 main\n").as_bytes(),
@@ -1233,4 +1242,229 @@ fn shutdown_without_a_session_writes_nothing() {
     g.h.send(Message::Shutdown);
     g.h.join();
     assert!(g.h.take_written().is_empty());
+}
+
+fn wait_for_event(g: &GatewayHarness, what: &str, matches: impl Fn(&GatewayEvent) -> bool) {
+    let deadline = Instant::now() + WAIT;
+    while !g.has_event(&matches) {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {what}: {:?}",
+            g.events.lock()
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[test]
+fn an_unarmed_entry_writes_nothing_until_the_user_opens_it() {
+    let mut g = GatewayHarness::spawn(true);
+    g.enter_unarmed();
+    wait_for_event(&g, "the confirmation", |e| {
+        matches!(e, GatewayEvent::ConfirmPending)
+    });
+    g.h.wait_for_terminal("the prompt", |t| t.text() == "$ tmux -CC");
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(g.h.take_written().is_empty());
+    assert!(!g.has_event(|e| matches!(e, GatewayEvent::Starting)));
+
+    g.h.send(Message::Tmux(TmuxRequest::ConfirmOpen));
+    g.answer_until("attach", |events| {
+        events
+            .iter()
+            .any(|e| matches!(e, GatewayEvent::Client(ClientEvent::Attached { .. })))
+    });
+    assert_eq!(g.h.terminal.lock().text(), "$ tmux -CC");
+}
+
+#[test]
+fn dismissing_an_unarmed_entry_shows_the_held_bytes_as_output() {
+    let mut g = GatewayHarness::spawn(true);
+    let cat = b"$ cat notes\r\n\x1bP1000phidden\x1b\\ shown";
+    g.h.shell_prints(cat);
+    wait_for_event(&g, "the confirmation", |e| {
+        matches!(e, GatewayEvent::ConfirmPending)
+    });
+    g.h.send(Message::Tmux(TmuxRequest::ConfirmDismiss));
+    g.h.wait_for_terminal("the released bytes", |t| t.text().ends_with("shown"));
+    let expected = direct_parse_trace(&[cat]);
+    assert_eq!(g.h.terminal.lock().trace, expected);
+    g.h.shell_prints(b"!");
+    g.h.wait_for_terminal("more shell output", |t| t.text().ends_with('!'));
+    assert!(g.h.take_written().is_empty());
+}
+
+#[test]
+fn a_dropped_connection_while_attached_gives_the_origin_back_to_its_shell() {
+    let mut g = GatewayHarness::spawn(true);
+    g.attach();
+    let written = g.h.take_written().len();
+    g.h.shell_prints(b"Connection to host closed.\r\n\x1b]133;A\x07$ ");
+    wait_for_event(&g, "the end", |e| matches!(e, GatewayEvent::Ended));
+    assert!(g.has_event(|e| matches!(e, GatewayEvent::Client(ClientEvent::TransportLost))));
+    g.h.shell_prints(b"ls\r\n");
+    g.h.wait_for_terminal("the shell", |t| t.text().ends_with("ls"));
+    assert_eq!(
+        g.h.terminal.lock().text(),
+        "$ tmux -CCConnection to host closed.$ ls"
+    );
+    let _ = written;
+    assert!(g.h.take_written().is_empty());
+}
+
+#[test]
+fn a_desync_detaches_and_the_shell_gets_the_pty_back() {
+    let mut g = GatewayHarness::spawn(true);
+    g.attach();
+    g.answer();
+    g.h.shell_prints(format!("%begin {TIME} 9999 1\n%end {TIME} 9999 1\n").as_bytes());
+    g.answer_until("the end", |events| {
+        events.iter().any(|e| matches!(e, GatewayEvent::Ended))
+    });
+    assert!(g.has_event(|e| matches!(e, GatewayEvent::Client(ClientEvent::Desync { .. }))));
+    g.h.shell_prints(b"$ ");
+    g.h.wait_for_terminal("the shell", |t| t.text() == "$ tmux -CC$ ");
+}
+
+/// A PTY whose output is a fixed stream that never pauses until it is used up.
+struct FloodPty {
+    reader: FloodReader,
+    writer: SharedWriter,
+}
+
+struct FloodReader {
+    data: Vec<u8>,
+    position: usize,
+}
+
+impl Read for FloodReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.position == self.data.len() {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        let n = buf.len().min(16 << 10).min(self.data.len() - self.position);
+        buf[..n].copy_from_slice(&self.data[self.position..self.position + n]);
+        self.position += n;
+        Ok(n)
+    }
+}
+
+#[derive(Clone, Default)]
+struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+impl Write for SharedWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl EventedReadWrite for FloodPty {
+    type Reader = FloodReader;
+    type Writer = SharedWriter;
+
+    fn register(&mut self, _: &mio::Poll, _: Interest) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn reregister(&mut self, _: &mio::Poll, _: Interest) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn deregister(&mut self, _: &mio::Poll) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn reader(&mut self) -> &mut FloodReader {
+        &mut self.reader
+    }
+
+    fn read_token(&self) -> Token {
+        PTY_TOKEN
+    }
+
+    fn writer(&mut self) -> &mut SharedWriter {
+        &mut self.writer
+    }
+
+    fn write_token(&self) -> Token {
+        WRITE_TOKEN
+    }
+}
+
+impl EventedPty for FloodPty {
+    fn child_event_token(&self) -> Token {
+        SIGNALS_TOKEN
+    }
+
+    fn next_child_event(&mut self) -> Option<ChildEvent> {
+        None
+    }
+
+    fn on_resize(&mut self, _: &SizeInfo) {}
+
+    fn kill(self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_control_stream_flood_yields_so_queued_writes_go_out() {
+    let mut data =
+        format!("\x1bP1000p%begin {TIME} 280 0\n%end {TIME} 280 0\n%session-changed $0 main\n")
+            .into_bytes();
+    while data.len() < 4 << 20 {
+        data.extend_from_slice(
+            b"%output %1 yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy\\015\\012\n",
+        );
+    }
+    let total = data.len();
+    let writer = SharedWriter::default();
+    let pty = FloodPty {
+        reader: FloodReader { data, position: 0 },
+        writer: writer.clone(),
+    };
+    let (wakeups_tx, _wakeups) = async_channel::unbounded();
+    let (events_tx, _events) = async_channel::unbounded::<crate::event::Event>();
+    let (pty_reads_tx, _) = async_broadcast::broadcast(16);
+    let listener = ChannelEventListener::new(wakeups_tx, events_tx, pty_reads_tx);
+    let terminal = Arc::new(FairMutex::new(RecordingTerminal::default()));
+    let (_tx, rx) = mio_channel::channel();
+    let origin = OriginFlags::default();
+    origin.arm();
+    let mut event_loop =
+        EventLoop::new(terminal, listener, pty, rx).with_tmux_gateway(GatewayLink {
+            switch: GatewaySwitch::new(true),
+            origin,
+            sink: Box::new(|_| {}),
+            requester: Arc::new(|_| {}),
+            client_config: crate::tmux::ClientConfig::default(),
+            queue_limits: PaneQueueLimits::default(),
+        });
+
+    let mut state = State::default();
+    let mut buf = vec![0u8; READ_BUFFER_SIZE];
+    let mut can_read = true;
+    event_loop
+        .pty_read(&mut state, &mut buf, &mut can_read)
+        .expect("read");
+    let consumed = event_loop.pty.reader.position;
+    assert!(
+        consumed < total,
+        "the read only returned once the flood ended ({consumed} of {total} bytes)"
+    );
+    assert!(can_read);
+    assert!(state.needs_write());
+    let mut can_write = true;
+    event_loop
+        .pty_write(&mut state, &mut can_write)
+        .expect("write");
+    assert!(contains(
+        &writer.0.lock(),
+        b"display-message -p '#{version}"
+    ));
 }

@@ -189,18 +189,26 @@ fn a_closed_queue_does_not_request_a_resume() {
 }
 
 fn gateway(enabled: bool) -> (Gateway, Arc<Mutex<Vec<GatewayEvent>>>) {
+    let (gateway, events, origin) = gateway_with_origin(enabled);
+    // Most tests play an entry Warp started; see the `unarmed` tests for the rest.
+    origin.arm();
+    (gateway, events)
+}
+
+fn gateway_with_origin(enabled: bool) -> (Gateway, Arc<Mutex<Vec<GatewayEvent>>>, OriginFlags) {
     let events = Arc::new(Mutex::new(Vec::new()));
     let sink_events = events.clone();
     let (requester, _) = recording_requester();
+    let origin = OriginFlags::default();
     let gateway = Gateway::new(GatewayLink {
         switch: GatewaySwitch::new(enabled),
-        origin: OriginFlags::default(),
+        origin: origin.clone(),
         sink: Box::new(move |event| sink_events.lock().unwrap().push(event)),
         requester,
         client_config: ClientConfig::default(),
         queue_limits: PaneQueueLimits::default(),
     });
-    (gateway, events)
+    (gateway, events, origin)
 }
 
 #[test]
@@ -253,6 +261,7 @@ fn exit_and_shell_bytes_in_the_same_read_end_the_session() {
         ]
     ));
     // The held-back partial DCS went to the model and the detector carries on from it.
+    gateway.origin.arm();
     assert!(matches!(
         gateway.route(b"000p", &mut writes),
         Routed::Split(model) if model == [CANCEL]
@@ -269,14 +278,20 @@ fn transport_closed_ends_a_session_and_is_a_no_op_without_one() {
     gateway.route(b"\x1bP1000p", &mut writes);
     gateway.transport_closed();
     assert!(!gateway.in_session());
-    assert!(matches!(
-        &events.lock().unwrap()[..],
-        [
-            GatewayEvent::Starting,
-            GatewayEvent::Client(ClientEvent::TransportLost),
-            GatewayEvent::Ended
-        ]
-    ));
+    // The attach never completed, so the stream is the shell's output.
+    assert_eq!(gateway.take_shell_bytes(), b"\x1bP1000p");
+    assert!(
+        matches!(
+            &events.lock().unwrap()[..],
+            [
+                GatewayEvent::Starting,
+                GatewayEvent::Client(ClientEvent::TransportLost),
+                GatewayEvent::Ended
+            ]
+        ),
+        "{:?}",
+        event_names(&events)
+    );
 }
 
 #[test]
@@ -302,4 +317,204 @@ fn a_test_pane_queue_delivers_in_order_and_closes_when_the_sender_drops() {
     assert_eq!(queue.try_recv(), None);
     assert!(queue.is_closed());
     assert_eq!(queue.queued_bytes(), 0);
+}
+
+const ATTACH: &[u8] = b"\x1bP1000p%begin 1 280 0\n%end 1 280 0\n%session-changed $0 main\n";
+const VERSION_LINE: &[u8] = b"display-message -p '#{version}\t#{client_name}'\n";
+
+fn event_names(events: &Arc<Mutex<Vec<GatewayEvent>>>) -> Vec<String> {
+    events
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|event| match event {
+            GatewayEvent::Client(event) => format!("{event:?}")
+                .split([' ', '{', '('])
+                .next()
+                .unwrap_or_default()
+                .to_owned(),
+            GatewayEvent::Model(_) => "Model".to_owned(),
+            event => format!("{event:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn an_unarmed_entry_writes_nothing_and_asks_first() {
+    let (mut gateway, events, _) = gateway_with_origin(true);
+    let mut writes = VecDeque::new();
+    let mut read = b"$ cat notes\r\n".to_vec();
+    read.extend_from_slice(ATTACH);
+    assert_eq!(
+        gateway.route(&read, &mut writes),
+        Routed::Split(b"$ cat notes\r\n".to_vec())
+    );
+    assert_eq!(
+        gateway.route(b"%output %1 more\n", &mut writes),
+        Routed::Split(Vec::new())
+    );
+    assert!(writes.is_empty());
+    assert!(!gateway.in_session());
+    assert!(gateway.engaged());
+    assert_eq!(gateway.next_timeout(), None);
+    assert_eq!(event_names(&events), ["ConfirmPending"]);
+}
+
+#[test]
+fn dismissing_an_unarmed_entry_releases_the_held_bytes_to_the_model() {
+    let (mut gateway, events, _) = gateway_with_origin(true);
+    let mut writes = VecDeque::new();
+    gateway.route(b"\x1bP1000phello", &mut writes);
+    gateway.route(b" world\x1b\\", &mut writes);
+    gateway.request(TmuxRequest::ConfirmDismiss, &mut writes);
+    assert!(writes.is_empty());
+    assert_eq!(gateway.take_shell_bytes(), b"\x1bP1000phello world\x1b\\");
+    assert_eq!(event_names(&events), ["ConfirmPending", "ConfirmCleared"]);
+    assert_eq!(gateway.route(b"$ ", &mut writes), Routed::Shell);
+    assert!(!gateway.in_session());
+}
+
+#[test]
+fn opening_an_unarmed_entry_starts_the_session_with_the_held_bytes() {
+    let (mut gateway, events, _) = gateway_with_origin(true);
+    let mut writes = VecDeque::new();
+    gateway.route(ATTACH, &mut writes);
+    assert!(writes.is_empty());
+    gateway.request(TmuxRequest::ConfirmOpen, &mut writes);
+    assert!(gateway.in_session());
+    assert_eq!(writes.pop_front().as_deref(), Some(VERSION_LINE));
+    assert_eq!(
+        event_names(&events),
+        ["ConfirmPending", "ConfirmCleared", "Starting"]
+    );
+}
+
+#[test]
+fn an_armed_entry_starts_without_asking_and_the_arm_is_used_up() {
+    let (mut gateway, events, origin) = gateway_with_origin(true);
+    origin.arm();
+    let mut writes = VecDeque::new();
+    gateway.route(ATTACH, &mut writes);
+    assert!(gateway.in_session());
+    assert_eq!(writes.pop_front().as_deref(), Some(VERSION_LINE));
+    gateway.route(b"%exit\n\x1b\\", &mut writes);
+    assert!(!gateway.in_session());
+    gateway.route(ATTACH, &mut writes);
+    assert!(!gateway.in_session());
+    assert_eq!(event_names(&events).last().unwrap(), "ConfirmPending");
+}
+
+#[test]
+fn a_disarmed_origin_asks() {
+    let (mut gateway, events, origin) = gateway_with_origin(true);
+    origin.arm();
+    origin.disarm();
+    gateway.route(ATTACH, &mut VecDeque::new());
+    assert_eq!(event_names(&events), ["ConfirmPending"]);
+}
+
+#[test]
+fn an_attach_that_does_not_complete_in_time_is_abandoned_to_the_model() {
+    let (mut gateway, events) = gateway(true);
+    let mut writes = VecDeque::new();
+    assert_eq!(
+        gateway.route(b"$ \x1bP1000p%begin 1 280 0\n", &mut writes),
+        Routed::Split(b"$ ".to_vec())
+    );
+    assert!(
+        gateway
+            .next_timeout()
+            .is_some_and(|t| t <= HANDSHAKE_DEADLINE)
+    );
+    gateway.tick(&mut writes);
+    assert!(gateway.in_session());
+    gateway.advance_clock(HANDSHAKE_DEADLINE);
+    gateway.tick(&mut writes);
+    assert!(!gateway.in_session());
+    assert!(writes.is_empty());
+    assert_eq!(gateway.take_shell_bytes(), b"\x1bP1000p%begin 1 280 0\n");
+    assert_eq!(event_names(&events), ["Starting", "Ended"]);
+}
+
+#[test]
+fn plain_text_after_an_entry_is_given_back_before_anything_is_written() {
+    let (mut gateway, events) = gateway(true);
+    let mut writes = VecDeque::new();
+    assert_eq!(
+        gateway.route(b"\x1bP1000pnot\ntmux\nat all\n$ ", &mut writes),
+        Routed::Split(b"\x1bP1000pnot\ntmux\nat all\n$ ".to_vec())
+    );
+    assert!(!gateway.in_session());
+    assert!(writes.is_empty());
+    assert_eq!(event_names(&events), ["Starting", "Ended"]);
+}
+
+#[test]
+fn lost_control_while_attached_ends_the_session_and_shell_bytes_flow_again() {
+    let (mut gateway, events) = gateway(true);
+    let mut writes = VecDeque::new();
+    gateway.route(ATTACH, &mut writes);
+    assert_eq!(writes.len(), 1);
+    let dropped = b"Connection to host closed.\r\n\x1b]133;A\x07$ ";
+    assert_eq!(
+        gateway.route(dropped, &mut writes),
+        Routed::Split(dropped.to_vec())
+    );
+    assert!(!gateway.in_session());
+    assert_eq!(writes.len(), 1, "nothing more is written: {writes:?}");
+    let names = event_names(&events);
+    assert!(names.contains(&"TransportLost".to_owned()), "{names:?}");
+    assert_eq!(names.last().unwrap(), "Ended");
+    assert_eq!(gateway.route(b"ls\r\n", &mut writes), Routed::Shell);
+}
+
+/// A control line past the parser's bound, which desyncs the session.
+fn overlong_control_line() -> Vec<u8> {
+    let mut line = b"%message ".to_vec();
+    line.resize(2 << 20, b'a');
+    line
+}
+
+#[test]
+fn a_desync_detaches_and_the_session_ends_on_exit() {
+    let (mut gateway, events) = gateway(true);
+    let mut writes = VecDeque::new();
+    gateway.route(ATTACH, &mut writes);
+    writes.clear();
+    gateway.route(&overlong_control_line(), &mut writes);
+    assert_eq!(writes.pop_front().as_deref(), Some(b"\n".as_slice()));
+    assert!(gateway.in_session());
+    assert!(event_names(&events).contains(&"Desync".to_owned()));
+    assert_eq!(
+        gateway.route(b"%exit\n\x1b\\$ ", &mut writes),
+        Routed::Split(b"$ ".to_vec())
+    );
+    assert!(!gateway.in_session());
+    assert_eq!(event_names(&events).last().unwrap(), "Ended");
+}
+
+#[test]
+fn a_disconnected_session_that_never_exits_gives_the_pty_back() {
+    let (mut gateway, events) = gateway(true);
+    let mut writes = VecDeque::new();
+    gateway.route(ATTACH, &mut writes);
+    gateway.route(&overlong_control_line(), &mut writes);
+    assert!(gateway.next_timeout().is_some());
+    gateway.advance_clock(Duration::from_secs(5));
+    gateway.tick(&mut writes);
+    assert!(!gateway.in_session());
+    assert_eq!(event_names(&events).last().unwrap(), "Ended");
+}
+
+#[test]
+fn confirm_requests_without_a_held_entry_leave_a_running_session_alone() {
+    let (mut gateway, events) = gateway(true);
+    let mut writes = VecDeque::new();
+    gateway.route(ATTACH, &mut writes);
+    gateway.request(TmuxRequest::ConfirmOpen, &mut writes);
+    gateway.request(TmuxRequest::ConfirmDismiss, &mut writes);
+    gateway.transport_closed();
+    assert!(!gateway.in_session());
+    assert!(gateway.take_shell_bytes().is_empty());
+    assert_eq!(event_names(&events), ["Starting", "TransportLost", "Ended"]);
 }

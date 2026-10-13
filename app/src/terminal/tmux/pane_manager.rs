@@ -552,6 +552,8 @@ impl TmuxWindowSizer {
             TmuxGatewayEvent::Client { origin, event } => self.on_client_event(*origin, event),
             TmuxGatewayEvent::Ended { origin } => self.remove_origin(*origin),
             TmuxGatewayEvent::Starting { .. }
+            | TmuxGatewayEvent::ConfirmPending { .. }
+            | TmuxGatewayEvent::ConfirmCleared { .. }
             | TmuxGatewayEvent::Refused { .. }
             | TmuxGatewayEvent::PaneQueueReady { .. }
             | TmuxGatewayEvent::CommandCompleted { .. } => {}

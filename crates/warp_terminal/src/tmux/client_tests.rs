@@ -505,9 +505,9 @@ fn output_during_a_seed_is_applied_after_it_in_order_with_no_duplicate_at_the_se
     // output is already in the capture (recorded from tmux 3.7c).
     h.feed("%output %4 L1\\015\\012\n");
     let capture_number = h.begin();
-    // Output after the reply starts is newer than the capture.
-    h.feed("%output %4 L2\\015\\012\n");
     h.end(capture_number, &["L0", "L1", ""], false);
+    // Output after the reply is newer than the capture.
+    h.feed("%output %4 L2\\015\\012\n");
     h.feed("%output %4 L3\\015\\012\n");
     assert!(h.events().is_empty());
     h.reply(&["0\t2"]);
@@ -546,9 +546,8 @@ fn buffered_output_over_the_cap_resyncs_instead_of_truncating() {
     h.feed("%pause %1\n");
     h.out();
     h.reply(&[]);
-    let number = h.begin();
+    h.reply(&["old"]);
     h.feed("%output %1 0123456789\n");
-    h.end(number, &["old"], false);
     h.reply(&["0\t0"]);
     assert!(h.events().is_empty());
     assert_eq!(h.out(), vec![capture(1), cursor(1)]);
@@ -762,9 +761,8 @@ fn a_window_add_after_the_refresh_starts_queues_one_more_refresh() {
     let mut h = Harness::attached("3.7c", &[1]);
     h.feed("%window-add @2\n");
     assert_eq!(h.out().len(), 2);
-    let number = h.begin();
+    h.reply(&[]);
     h.feed("%window-add @3\n%window-add @4\n");
-    h.end(number, &[], false);
     h.reply(&[]);
     assert_eq!(h.out(), vec![list_windows(), list_panes()]);
 }
@@ -1316,4 +1314,84 @@ fn without_an_attach_reply_the_handshake_starts_on_session_changed() {
     assert!(h.out().is_empty());
     h.feed("%session-changed $0 main\n");
     assert_eq!(h.out(), vec![VERSION_QUERY.to_owned()]);
+}
+
+#[test]
+fn a_desync_detaches_so_tmux_exits_and_the_shell_gets_the_pty_back() {
+    let mut h = Harness::attached("3.7c", &[1]);
+    h.feed(&format!("%begin {TIME} 9999 1\n"));
+    assert_eq!(h.out(), vec!["\n".to_owned()]);
+    assert!(
+        h.events()
+            .iter()
+            .any(|e| matches!(e, ClientEvent::Desync { .. }))
+    );
+    assert_eq!(h.client.phase(), Phase::Disconnected);
+    assert!(h.client.shell_pending().is_none());
+    assert_eq!(
+        h.feed(&format!("%end {TIME} 9999 1\n%exit\n\x1b\\$ ")),
+        b"$ "
+    );
+    assert!(h.client.shell_pending().is_some());
+}
+
+#[test]
+fn a_desync_after_the_transport_is_gone_writes_nothing() {
+    let mut h = Harness::attached("3.7c", &[1]);
+    h.client.transport_closed();
+    h.client.desync("late".into());
+    assert!(h.out().is_empty());
+}
+
+#[test]
+fn shell_output_on_the_control_stream_is_transport_lost_and_flows_to_the_shell() {
+    let mut h = Harness::attached("3.7c", &[1]);
+    let dropped = "Connection to host closed.\r\n\x1b]133;A\x07$ ";
+    assert_eq!(h.feed(dropped), dropped.as_bytes());
+    assert_eq!(h.events(), vec![ClientEvent::TransportLost]);
+    assert!(h.client.transport_lost());
+    assert!(h.client.shell_pending().is_some());
+    h.client.detach();
+    assert!(h.out().is_empty());
+}
+
+#[test]
+fn capture_text_that_looks_like_notifications_stays_pane_text() {
+    let mut h = Harness::attached("3.7c", &[1]);
+    h.feed("%pause %1\n");
+    assert_eq!(h.out(), vec![continue_pane(1), capture(1), cursor(1)]);
+    h.reply(&[]);
+    h.reply(&["%exit", "%window-close @1", "%output %1 x", "%message hi"]);
+    h.reply(&["0\t0"]);
+    assert_eq!(
+        h.events(),
+        vec![ClientEvent::PaneSnapshot(PaneSnapshot {
+            pane_id: PaneId(1),
+            kind: SnapshotKind::Resync,
+            lines: vec![
+                b"%exit".to_vec(),
+                b"%window-close @1".to_vec(),
+                b"%output %1 x".to_vec(),
+                b"%message hi".to_vec(),
+            ],
+            cursor: Some((0, 0)),
+        })]
+    );
+    assert_eq!(h.client.phase(), Phase::Attached);
+}
+
+#[test]
+fn quoted_values_cannot_expand_in_a_shell() {
+    let value = "a`touch /nonexistent/x`$(id)${HOME}\"\\b";
+    let quoted = quote_argument(value);
+    assert_eq!(
+        quoted,
+        "\"a\\`touch /nonexistent/x\\`\\$(id)\\${HOME}\\\"\\\\b\""
+    );
+    let output = command::blocking::Command::new("sh")
+        .arg("-c")
+        .arg(format!("printf %s {quoted}"))
+        .output()
+        .expect("run sh");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), value);
 }

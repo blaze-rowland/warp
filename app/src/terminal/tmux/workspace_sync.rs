@@ -9,11 +9,12 @@
 //! - The command builders here are the only place Warp actions become tmux commands. Only an
 //!   explicit close sends `kill-pane` or `kill-window` (R25, KTD3).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use warp_terminal::local_tty::tmux_gateway::{RefusalReason, TmuxRequest};
 use warp_terminal::tmux::{
     ClientEvent, CommandReply, PaneId, SessionId, SessionModel, TmuxWindow, WindowId,
+    quote_argument,
 };
 use warpui::{AppContext, Entity, ModelContext, SingletonEntity};
 
@@ -362,20 +363,6 @@ pub fn reattach_command(session: &str) -> String {
     )
 }
 
-/// A double-quoted tmux command argument. `$` is escaped so no variable is expanded.
-fn quote_argument(value: &str) -> String {
-    let mut quoted = String::with_capacity(value.len() + 2);
-    quoted.push('"');
-    for c in value.chars() {
-        if matches!(c, '"' | '\\' | '$') {
-            quoted.push('\\');
-        }
-        quoted.push(c);
-    }
-    quoted.push('"');
-    quoted
-}
-
 // Duplicate sessions.
 
 /// What makes two attaches the same session.
@@ -474,6 +461,8 @@ pub enum TmuxSessionEvent {
     Focus { origin: TmuxOriginId },
     /// Show `line` in the origin pane; no session started (R6, R29).
     Notice { origin: TmuxOriginId, line: String },
+    /// A Reattach that waited for the old control client to end can run now.
+    ReattachReady { origin: TmuxOriginId },
 }
 
 /// Called with a tagged command's reply. It runs inside the registry's update, so it gets the
@@ -486,6 +475,8 @@ pub struct TmuxSessions {
     sessions: HashMap<TmuxOriginId, SessionInfo>,
     pending: HashMap<(TmuxOriginId, u64), ReplyCallback>,
     next_tag: u64,
+    /// Disconnected sessions whose Reattach waits for the old control client to end.
+    reattach_after_end: HashSet<TmuxOriginId>,
 }
 
 impl Entity for TmuxSessions {
@@ -503,7 +494,21 @@ impl TmuxSessions {
             sessions: HashMap::new(),
             pending: HashMap::new(),
             next_tag: 1,
+            reattach_after_end: HashSet::new(),
         }
+    }
+
+    /// Whether Reattach can run `tmux -CC attach` in `origin`'s pane now. While the old control
+    /// client still holds the PTY, a command typed there would go to tmux, so this detaches it
+    /// and emits [`TmuxSessionEvent::ReattachReady`] once it has ended.
+    pub fn request_reattach(&mut self, origin: TmuxOriginId, ctx: &mut ModelContext<Self>) -> bool {
+        let gateways = TmuxGateways::as_ref(ctx);
+        if !gateways.is_in_session(origin) {
+            return true;
+        }
+        self.reattach_after_end.insert(origin);
+        gateways.detach(origin);
+        false
     }
 
     pub fn session(&self, origin: TmuxOriginId) -> Option<&SessionInfo> {
@@ -618,6 +623,7 @@ impl TmuxSessions {
             .is_some_and(|session| session.status == SessionStatus::Disconnected)
         {
             self.sessions.remove(&origin);
+            self.reattach_after_end.remove(&origin);
         }
     }
 
@@ -651,7 +657,9 @@ impl TmuxSessions {
                     }),
                 }
             }
-            TmuxGatewayEvent::PaneQueueReady { .. } => {}
+            TmuxGatewayEvent::PaneQueueReady { .. }
+            | TmuxGatewayEvent::ConfirmPending { .. }
+            | TmuxGatewayEvent::ConfirmCleared { .. } => {}
         }
     }
 
@@ -752,6 +760,9 @@ impl TmuxSessions {
         if session.status == SessionStatus::Disconnected {
             // The tabs stay under the Disconnected banner until Reattach or close.
             ctx.emit(TmuxSessionEvent::StatusChanged { origin });
+            if self.reattach_after_end.remove(&origin) {
+                ctx.emit(TmuxSessionEvent::ReattachReady { origin });
+            }
             return;
         }
         let Some(session) = self.sessions.remove(&origin) else {

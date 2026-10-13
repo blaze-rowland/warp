@@ -279,3 +279,14 @@ fn a_session_with_its_own_command_or_an_attach_keeps_it() {
         plan("tmux new")
     );
 }
+
+#[test]
+fn only_commands_warp_runs_into_control_mode_arm_the_gateway() {
+    assert!(plan("tmux -CC attach").arms_gateway(false));
+    assert!(plan("tmux a").arms_gateway(true));
+    // Automatic conversion off: plain tmux stays raw, so nothing should open natively.
+    assert!(!plan("tmux a").arms_gateway(false));
+    assert!(!plan("tmux ls").arms_gateway(true));
+    assert!(!plan("cat notes.txt").arms_gateway(true));
+    assert!(!plan_entry("tmux", no_aliases, true).arms_gateway(true));
+}
