@@ -317,13 +317,15 @@ fn running_ls_from_the_input_editor_sends_one_send_keys() {
             });
         assert!(outcome.is_accepted());
 
+        // The kill-buffer chord, the command, then the shell's Enter.
+        let expected = [ShellType::Bash.kill_buffer_bytes(), b"ls", b"\n"].concat();
         // The write waits for the line editor, then goes out as one pane input. Warp's own
-        // writes (such as the input-reporting sequence when the editor activates) may surround
-        // it; exactly one input carries the command.
+        // writes (the input-reporting sequence, or a late bootstrap script whose text happens to
+        // contain "ls") may surround it; exactly one input is the whole command.
         let command_inputs = || {
             pane.pane_inputs()
                 .into_iter()
-                .filter(|input| input.windows(2).any(|w| w == b"ls"))
+                .filter(|input| input.ends_with(b"ls\n") && input.len() <= expected.len())
                 .collect::<Vec<_>>()
         };
         assert_eventually!(
@@ -338,8 +340,6 @@ fn running_ls_from_the_input_editor_sends_one_send_keys() {
             1,
             "one input for the whole command: {inputs:?}"
         );
-        // The kill-buffer chord, the command, then the shell's Enter.
-        let expected = [ShellType::Bash.kill_buffer_bytes(), b"ls", b"\n"].concat();
         assert_eq!(inputs[0], expected);
         assert_eq!(send_keys_command(PANE, &inputs[0]).len(), 1);
     });
