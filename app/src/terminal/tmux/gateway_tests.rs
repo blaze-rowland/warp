@@ -84,13 +84,14 @@ fn tmux_in_the_shell_environment_marks_the_origin_nested() {
 }
 
 #[test]
-fn starts_inside_tmux_prefers_the_spawn_environment() {
+fn only_the_spawn_environment_counts_as_inside_tmux() {
     let set = Some(OsStr::new("/tmp/tmux-501/default,1,0"));
     let empty = Some(OsStr::new(""));
-    assert!(starts_inside_tmux(set, None));
-    assert!(starts_inside_tmux(None, set));
-    assert!(!starts_inside_tmux(empty, set));
-    assert!(!starts_inside_tmux(None, None));
+    assert!(starts_inside_tmux(set));
+    assert!(!starts_inside_tmux(empty));
+    // Warp's own TMUX (when launched from a tmux pane) is stripped from shells, so it no longer
+    // makes a fresh shell look nested.
+    assert!(!starts_inside_tmux(None));
 }
 
 #[test]

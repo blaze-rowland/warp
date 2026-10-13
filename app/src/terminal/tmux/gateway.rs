@@ -137,9 +137,9 @@ impl TmuxGateways {
         self.next_origin += 1;
 
         let flags = OriginFlags::default();
+        // Warp strips TMUX from the shells it starts, so only an explicit spawn value counts.
         flags.set_tmux_env(starts_inside_tmux(
             env_vars.get(OsStr::new("TMUX")).map(OsString::as_os_str),
-            std::env::var_os("TMUX").as_deref(),
         ));
 
         let events_tx = self.events_tx.clone();
@@ -333,10 +333,8 @@ impl TmuxGateways {
 
 /// Whether a shell spawned with `spawn_value` for `$TMUX` (or inheriting `inherited`) starts
 /// inside tmux.
-fn starts_inside_tmux(spawn_value: Option<&OsStr>, inherited: Option<&OsStr>) -> bool {
-    spawn_value
-        .or(inherited)
-        .is_some_and(|value| !value.is_empty())
+fn starts_inside_tmux(spawn_value: Option<&OsStr>) -> bool {
+    spawn_value.is_some_and(|value| !value.is_empty())
 }
 
 fn on_off(enabled: bool) -> &'static str {

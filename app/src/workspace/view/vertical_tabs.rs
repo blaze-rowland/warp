@@ -2183,8 +2183,11 @@ fn render_tab_group_internal(
     // an override here would shadow every pane's title with the same string.
     // In Tabs/Summary modes there is only one row per tab, so the tab-level
     // custom title is still the right thing to show.
-    let displayed_tab_title_override =
-        if in_tab_group && matches!(display_granularity, VerticalTabsDisplayGranularity::Panes) {
+    // A tmux tab is one tmux window, so its window name is the title in every mode.
+    let displayed_tab_title_override = if pane_group.is_tmux_tab() {
+        pane_group.custom_title(app)
+    } else if in_tab_group && matches!(display_granularity, VerticalTabsDisplayGranularity::Panes)
+    {
             None
         } else {
             (!uses_outer_group_container)
