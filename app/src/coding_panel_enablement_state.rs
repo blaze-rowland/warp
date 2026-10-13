@@ -17,7 +17,34 @@ pub(crate) enum CodingPanelEnablementState {
         has_remote_server: bool,
     },
     UnsupportedSession,
+    /// The session is remote but its files can't be shown; the reason says why.
+    RemoteUnavailable(RemoteUnavailableReason),
     Disabled,
+}
+
+/// Why a remote tmux pane's file explorer and code review are unavailable (R13, KTD9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RemoteUnavailableReason {
+    /// Warp's SSH extension can't run on the host.
+    NoRemoteServer,
+    /// The SSH extension's connection dropped and is being retried.
+    Reconnecting,
+    /// The pane's shell runs on a different host than its tmux session's connection.
+    PaneOnOtherHost,
+}
+
+impl RemoteUnavailableReason {
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            Self::NoRemoteServer => {
+                "The file explorer and code review are unavailable on this host because Warp's SSH extension can't run there."
+            }
+            Self::Reconnecting => "Reconnecting to the remote host…",
+            Self::PaneOnOtherHost => {
+                "The file explorer is unavailable for this pane because it's on a different host than its tmux session."
+            }
+        }
+    }
 }
 
 impl CodingPanelEnablementState {
@@ -38,3 +65,7 @@ impl CodingPanelEnablementState {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "coding_panel_enablement_state_tests.rs"]
+mod tests;

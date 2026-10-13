@@ -656,3 +656,33 @@ fn refusal_lines_name_the_reason() {
         "[tmux: Nested tmux is not supported natively]"
     );
 }
+
+/// U14: a popup's window shows as a floating pane, never as a tab, and a new window waits for
+/// its name (which arrives just after its layout) before it gets a tab.
+#[test]
+fn popup_windows_and_unnamed_windows_get_no_tab() {
+    let mut model = two_window_model();
+    model.replace_windows(vec![
+        window_row(1, 0, "editor", "80x24,0,0,1"),
+        window_row(2, 1, "logs", "80x24,0,0{40x24,0,0,2,39x24,41,0,3}"),
+        window_row(5, 2, "warp-popup:Files", "80x24,0,0,5"),
+    ]);
+    let ops = plan_window_sync(&model, &[open(1, "editor"), open(2, "logs")]);
+    assert!(
+        !ops.iter()
+            .any(|op| matches!(op, WindowOp::Open { window_id, .. } if *window_id == WindowId(5))),
+        "{ops:?}"
+    );
+    let mut model = two_window_model();
+    model.add_window(WindowId(7));
+    model.apply_layout(
+        WindowId(7),
+        parse_layout_change(&layout("80x24,0,0,7"), None, &WindowFlags::new("")).unwrap(),
+    );
+    let ops = plan_window_sync(&model, &[open(1, "editor"), open(2, "logs")]);
+    assert!(
+        !ops.iter()
+            .any(|op| matches!(op, WindowOp::Open { window_id, .. } if *window_id == WindowId(7))),
+        "{ops:?}"
+    );
+}

@@ -389,6 +389,7 @@ fn the_bundle_holds_the_launcher_and_every_shells_bootstrap() {
         paths,
         [
             LAUNCHER_FILE,
+            WRAPPER_FILE,
             "zsh/.zshenv",
             "init.zsh",
             "init.bash",

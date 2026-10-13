@@ -1538,6 +1538,10 @@ pub(crate) fn initialize_app(
     #[cfg(feature = "local_tty")]
     ctx.add_singleton_model(crate::terminal::tmux::keys::TmuxKeyRouter::new);
     #[cfg(feature = "local_tty")]
+    ctx.add_singleton_model(crate::terminal::tmux::popup::TmuxPopups::new);
+    #[cfg(feature = "local_tty")]
+    ctx.add_singleton_model(crate::terminal::tmux::native_ui::TmuxNativeUi::new);
+    #[cfg(feature = "local_tty")]
     crate::terminal::tmux::key_capture::init(ctx);
     timer.mark_interval_end("READ_USER_DEFAULTS_AND_INITIALIZE_SETTINGS");
 
@@ -1935,6 +1939,8 @@ pub(crate) fn initialize_app(
     ctx.add_singleton_model(|_ctx| SyncedInputState::new());
 
     ctx.add_singleton_model(remote_server::manager::RemoteServerManager::new);
+    #[cfg(feature = "local_tty")]
+    ctx.add_singleton_model(crate::terminal::tmux::remote::TmuxRemoteHosts::new);
     #[cfg(not(target_family = "wasm"))]
     ctx.add_singleton_model(remote_server::codebase_index_model::RemoteCodebaseIndexModel::new);
     #[cfg(not(target_family = "wasm"))]

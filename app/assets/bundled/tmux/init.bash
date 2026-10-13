@@ -15,7 +15,18 @@ source "$WARP_TMUX_DIR/bootstrap.bash"
 # A Warp that attaches later asks for the integration to be announced again; it shows blocks
 # from the next prompt.
 _warp_tmux_announce_file="$WARP_TMUX_DIR/../announce/$WARP_SESSION_ID"
+# Warp's `tmux` wrapper goes first on PATH, after the user's startup files had their say, so
+# scripts that open tmux popups reach it.
+_warp_tmux_path() {
+  case ":$PATH:" in
+    ":$WARP_TMUX_DIR/bin:"*) ;;
+    *) PATH="$WARP_TMUX_DIR/bin:$PATH" ;;
+  esac
+}
+_warp_tmux_path
+
 _warp_tmux_precmd() {
+  _warp_tmux_path
   if [[ -e $_warp_tmux_announce_file ]]; then
     command -p rm -f -- "$_warp_tmux_announce_file"
     _warp_tmux_init_shell

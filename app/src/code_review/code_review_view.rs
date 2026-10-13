@@ -2883,7 +2883,9 @@ impl CodeReviewView {
             let is_remote = matches!(is_local, Some(false));
             let is_wsl = session.as_ref().map(|s| s.is_wsl()).unwrap_or(false);
 
-            let enablement = if is_remote {
+            let enablement = if let Some(state) = terminal.tmux_pane_coding_panel_state(ctx) {
+                state
+            } else if is_remote {
                 CodingPanelEnablementState::RemoteSession {
                     has_remote_server: false,
                 }
@@ -2925,6 +2927,9 @@ impl CodeReviewView {
             Some(GitSessionState {
                 enablement: CodingPanelEnablementState::UnsupportedSession,
             }) => Self::render_wsl_state(appearance, open_repo_button()),
+            Some(GitSessionState {
+                enablement: CodingPanelEnablementState::RemoteUnavailable(reason),
+            }) => Self::render_no_repo_found_state(appearance, reason.message(), None),
             None
             | Some(GitSessionState {
                 enablement:

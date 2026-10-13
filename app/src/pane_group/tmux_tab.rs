@@ -31,6 +31,27 @@ pub struct TmuxTab {
     disconnected_banner: ViewHandle<Banner<PaneGroupAction>>,
     /// R19's shadowed-keys notice or R27's old-tmux notice (U13).
     key_notice_banner: ViewHandle<Banner<KeyNoticeAction>>,
+    /// Remote features unavailable on this session's host (U11, R13, R29).
+    remote_banner: ViewHandle<Banner<PaneGroupAction>>,
+    /// Native tmux prompts, menus and pickers (U14).
+    #[cfg(feature = "local_tty")]
+    surface_view: ViewHandle<crate::terminal::tmux::native_ui::view::TmuxSurfaceView>,
+    /// The popup shown as a floating pane (U14).
+    #[cfg(feature = "local_tty")]
+    popup: Option<TmuxPopupPane>,
+    /// The pane that had focus before a native surface or popup took it.
+    focus_before_overlay: Option<PaneId>,
+}
+
+/// A tmux popup's window shown as a floating pane over the tab (U14, KTD10, KTD14).
+#[cfg(feature = "local_tty")]
+struct TmuxPopupPane {
+    window_id: WindowId,
+    pane_id: TmuxPaneId,
+    title: Option<String>,
+    view: ViewHandle<crate::terminal::TerminalView>,
+    /// Keeps the pane's terminal model fed while the popup shows.
+    _manager: warpui::ModelHandle<Box<dyn crate::terminal::TerminalManager>>,
 }
 
 /// The "Show keys" link on the shadowed-keys notice (R19, R29).
@@ -146,6 +167,51 @@ impl PaneGroup {
                 },
             );
         }
+        let remote_banner = ctx.add_typed_action_view(|_| {
+            Banner::<PaneGroupAction>::new(BannerTextContent::plain_text(""))
+        });
+        #[cfg(feature = "local_tty")]
+        if ctx.has_singleton_model::<crate::terminal::tmux::remote::TmuxRemoteHosts>() {
+            use crate::banner::BannerEvent;
+            use crate::terminal::tmux::remote::{TmuxRemoteEvent, TmuxRemoteHosts};
+            ctx.subscribe_to_view(&remote_banner, move |_, _, event, ctx| {
+                if let BannerEvent::Dismiss(_) = event {
+                    TmuxRemoteHosts::handle(ctx)
+                        .update(ctx, |hosts, ctx| hosts.dismiss_banner(origin, ctx));
+                }
+            });
+            ctx.subscribe_to_model(&TmuxRemoteHosts::handle(ctx), move |me, _, event, ctx| {
+                let TmuxRemoteEvent::Changed { origin: changed } = event;
+                if *changed == origin {
+                    me.sync_remote_banner(ctx);
+                }
+            });
+        }
+        #[cfg(feature = "local_tty")]
+        let surface_view = {
+            use crate::terminal::tmux::native_ui::view::TmuxSurfaceView;
+            use crate::terminal::tmux::native_ui::{TmuxNativeUi, TmuxNativeUiEvent};
+            use crate::terminal::tmux::popup::{TmuxPopups, TmuxPopupsEvent};
+            ctx.subscribe_to_model(
+                &TmuxNativeUi::handle(ctx),
+                move |me, _, event, ctx| match event {
+                    TmuxNativeUiEvent::SurfaceChanged { origin: changed } if *changed == origin => {
+                        me.sync_tmux_surface(ctx);
+                    }
+                    TmuxNativeUiEvent::ModeChanged { origin: changed } if *changed == origin => {
+                        ctx.notify();
+                    }
+                    _ => {}
+                },
+            );
+            ctx.subscribe_to_model(&TmuxPopups::handle(ctx), move |me, _, event, ctx| {
+                let TmuxPopupsEvent::PopupsChanged { origin: changed } = event;
+                if *changed == origin {
+                    me.sync_tmux_popup(ctx);
+                }
+            });
+            ctx.add_typed_action_view(|ctx| TmuxSurfaceView::new(origin, ctx))
+        };
         self.set_title(&title, ctx);
         self.tmux_tab = Some(TmuxTab {
             origin,
@@ -156,9 +222,231 @@ impl PaneGroup {
             not_responding_banner,
             disconnected_banner,
             key_notice_banner,
+            remote_banner,
+            #[cfg(feature = "local_tty")]
+            surface_view,
+            #[cfg(feature = "local_tty")]
+            popup: None,
+            focus_before_overlay: None,
         });
         #[cfg(feature = "local_tty")]
-        self.sync_key_notice(ctx);
+        {
+            self.sync_key_notice(ctx);
+            self.sync_remote_banner(ctx);
+            self.sync_tmux_popup(ctx);
+        }
+    }
+
+    /// Copies the session's remote-features notice into the tab's banner (U11, R13, R29).
+    #[cfg(feature = "local_tty")]
+    fn sync_remote_banner(&mut self, ctx: &mut ViewContext<Self>) {
+        use crate::terminal::tmux::remote::TmuxRemoteHosts;
+        let Some(tab) = &self.tmux_tab else {
+            return;
+        };
+        if !ctx.has_singleton_model::<TmuxRemoteHosts>() {
+            return;
+        }
+        if let Some(text) = TmuxRemoteHosts::as_ref(ctx).banner(tab.origin) {
+            tab.remote_banner.update(ctx, |banner, ctx| {
+                banner.set_content(BannerTextContent::plain_text(text), ctx);
+            });
+        }
+        ctx.notify();
+    }
+
+    /// Gives the native surface focus while it is open for a pane of this tab, and gives focus
+    /// back to the pane that had it when it closes (U14).
+    #[cfg(feature = "local_tty")]
+    fn sync_tmux_surface(&mut self, ctx: &mut ViewContext<Self>) {
+        use crate::terminal::tmux::native_ui::TmuxNativeUi;
+        let Some(tab) = &self.tmux_tab else {
+            return;
+        };
+        let surface_pane = TmuxNativeUi::as_ref(ctx)
+            .surface(tab.origin)
+            .map(|surface| surface.pane_id);
+        let mine = surface_pane.is_some_and(|pane| self.tmux_pane_ids(ctx).contains_key(&pane));
+        let surface_view = tab.surface_view.clone();
+        if mine {
+            if !surface_view.is_focused(ctx) {
+                let focused = self.focused_pane_id(ctx);
+                if let Some(tab) = &mut self.tmux_tab {
+                    tab.focus_before_overlay.get_or_insert(focused);
+                }
+                ctx.focus(&surface_view);
+            }
+        } else if surface_view.is_focused(ctx) {
+            self.restore_overlay_focus(ctx);
+        }
+        ctx.notify();
+    }
+
+    /// Shows the session's newest popup as a floating pane on the tab of the session's current
+    /// window, and removes it when its window closes (U14).
+    #[cfg(feature = "local_tty")]
+    fn sync_tmux_popup(&mut self, ctx: &mut ViewContext<Self>) {
+        use crate::terminal::tmux::gateway::TmuxGateways;
+        use crate::terminal::tmux::keys::TmuxKeyRouter;
+        use crate::terminal::tmux::popup::TmuxPopups;
+        let Some(tab) = &self.tmux_tab else {
+            return;
+        };
+        let origin = tab.origin;
+        let current = TmuxGateways::as_ref(ctx)
+            .model(origin)
+            .and_then(|model| model.active_window());
+        let wanted = if current == Some(tab.window_id) {
+            TmuxPopups::as_ref(ctx).popups(origin).last().cloned()
+        } else {
+            None
+        };
+        let shown = tab.popup.as_ref().map(|popup| popup.window_id);
+        if shown == wanted.as_ref().map(|popup| popup.window_id) {
+            return;
+        }
+        if let Some(tab) = &mut self.tmux_tab
+            && tab.popup.take().is_some()
+        {
+            TmuxKeyRouter::handle(ctx).update(ctx, |router, _| router.set_popup_pane(origin, None));
+            self.restore_overlay_focus(ctx);
+        }
+        let Some(wanted) = wanted else {
+            ctx.notify();
+            return;
+        };
+        let resources = super::TerminalViewResources {
+            tips_completed: self.tips_completed.clone(),
+            server_api: self.server_api.clone(),
+            model_event_sender: self.model_event_sender.clone(),
+        };
+        let view_size = Self::estimated_view_bounds(ctx).size() * 0.7;
+        let Ok((view, manager)) = Self::create_tmux_pane_session(
+            crate::app_state::TmuxPaneSnapshot {
+                origin,
+                pane_id: wanted.pane_id,
+                current_command: None,
+            },
+            resources,
+            view_size,
+            self.model_event_sender.clone(),
+            ctx,
+        ) else {
+            log::warn!("tmux: could not show popup {}", wanted.window_id);
+            return;
+        };
+        let focused = self.focused_pane_id(ctx);
+        if let Some(tab) = &mut self.tmux_tab {
+            tab.focus_before_overlay.get_or_insert(focused);
+            tab.popup = Some(TmuxPopupPane {
+                window_id: wanted.window_id,
+                pane_id: wanted.pane_id,
+                title: wanted.title,
+                view: view.clone(),
+                _manager: manager,
+            });
+        }
+        TmuxKeyRouter::handle(ctx).update(ctx, |router, _| {
+            router.set_popup_pane(origin, Some(wanted.pane_id))
+        });
+        ctx.focus(&view);
+        ctx.notify();
+    }
+
+    /// Focuses the pane that had focus before a surface or popup took it.
+    fn restore_overlay_focus(&mut self, ctx: &mut ViewContext<Self>) {
+        let Some(previous) = self
+            .tmux_tab
+            .as_mut()
+            .and_then(|tab| tab.focus_before_overlay.take())
+        else {
+            return;
+        };
+        if let Some(view) = self.terminal_view_from_pane_id(previous, ctx) {
+            ctx.focus(&view);
+        } else {
+            let focused = self.focused_pane_id(ctx);
+            self.focus_pane_by_id(focused, ctx);
+        }
+    }
+
+    /// The overlays drawn over a tmux tab's panes: the floating popup pane and the native
+    /// surface (U14).
+    pub(super) fn render_tmux_overlays(&self, app: &AppContext) -> Vec<Box<dyn Element>> {
+        let mut overlays = Vec::new();
+        let Some(tab) = &self.tmux_tab else {
+            return overlays;
+        };
+        #[cfg(feature = "local_tty")]
+        {
+            use crate::appearance::Appearance;
+            use warpui::elements::{
+                Align, Border, Container, CornerRadius, Flex, ParentElement, Percentage, Radius,
+                Shrinkable, Text,
+            };
+            if let Some(popup) = &tab.popup {
+                let appearance = Appearance::as_ref(app);
+                let theme = appearance.theme();
+                let title = popup
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| "tmux popup".to_owned());
+                let body = Flex::column()
+                    .with_child(
+                        Container::new(
+                            Text::new_inline(
+                                title,
+                                appearance.ui_font_family(),
+                                appearance.ui_font_size(),
+                            )
+                            .with_color(theme.nonactive_ui_text_color().into())
+                            .finish(),
+                        )
+                        .with_horizontal_padding(8.)
+                        .with_vertical_padding(4.)
+                        .finish(),
+                    )
+                    .with_child(Shrinkable::new(1., ChildView::new(&popup.view).finish()).finish())
+                    .finish();
+                let frame = Container::new(body)
+                    .with_background(theme.surface_2())
+                    .with_border(Border::all(1.).with_border_fill(theme.accent()))
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+                    .finish();
+                overlays.push(Align::new(Percentage::both(0.8, 0.6, frame).finish()).finish());
+            }
+            if tab.surface_view.as_ref(app).is_open(app) {
+                overlays.push(ChildView::new(&tab.surface_view).finish());
+            }
+        }
+        #[cfg(not(feature = "local_tty"))]
+        let _ = (tab, app);
+        overlays
+    }
+
+    /// The "tmux mode" strip for a pane of this tab in copy mode or another tmux mode (U14).
+    pub(super) fn render_tmux_mode_strip(&self, app: &AppContext) -> Option<Box<dyn Element>> {
+        let tab = self.tmux_tab.as_ref()?;
+        #[cfg(feature = "local_tty")]
+        {
+            use crate::terminal::tmux::native_ui::TmuxNativeUi;
+            if !app.has_singleton_model::<TmuxNativeUi>() {
+                return None;
+            }
+            let panes = self.tmux_pane_ids(app);
+            let (_, mode) = TmuxNativeUi::as_ref(app)
+                .modes(tab.origin)
+                .into_iter()
+                .find(|(pane, _)| panes.contains_key(pane))?;
+            Some(crate::terminal::tmux::native_ui::view::render_mode_strip(
+                &mode, app,
+            ))
+        }
+        #[cfg(not(feature = "local_tty"))]
+        {
+            let _ = (tab, app);
+            None
+        }
     }
 
     /// Copies the session's key notice text into the tab's banner.
@@ -193,7 +481,22 @@ impl PaneGroup {
         &self,
         app: &AppContext,
     ) -> Option<crate::terminal::tmux::key_capture::KeyTarget> {
-        let _ = self.tmux_tab.as_ref()?;
+        let tab = self.tmux_tab.as_ref()?;
+        // A focused popup takes the keys, as a tmux popup does (U14).
+        if let Some(popup) = &tab.popup {
+            let view = &popup.view;
+            let input = view.as_ref(app).input();
+            let editor = input.as_ref(app).editor().id();
+            let target = crate::terminal::tmux::key_capture::KeyTarget {
+                origin: tab.origin,
+                pane_id: popup.pane_id,
+                window_id: view.window_id(app),
+                view_ids: vec![view.id(), input.id(), editor],
+            };
+            if target.is_focused(app) {
+                return Some(target);
+            }
+        }
         let terminal = self.terminal_session_by_id(self.focused_pane_id(app))?;
         let (origin, pane_id) = terminal.tmux_pane(app)?;
         let view = terminal.terminal_view(app);
@@ -548,6 +851,16 @@ impl PaneGroup {
                 SessionStatus::NotResponding => ChildView::new(&tab.not_responding_banner).finish(),
                 SessionStatus::Disconnected => ChildView::new(&tab.disconnected_banner).finish(),
                 SessionStatus::Attached
+                    if app
+                        .has_singleton_model::<crate::terminal::tmux::remote::TmuxRemoteHosts>(
+                        )
+                        && crate::terminal::tmux::remote::TmuxRemoteHosts::as_ref(app)
+                            .banner(tab.origin)
+                            .is_some() =>
+                {
+                    ChildView::new(&tab.remote_banner).finish()
+                }
+                SessionStatus::Attached
                     if app.has_singleton_model::<TmuxKeyRouter>()
                         && TmuxKeyRouter::as_ref(app).notice(tab.origin).is_some() =>
                 {
@@ -569,11 +882,19 @@ impl PaneGroup {
         self.tmux_tab
             .as_ref()
             .map(|tab| {
-                vec![
+                #[allow(unused_mut)]
+                let mut ids = vec![
                     tab.not_responding_banner.id(),
                     tab.disconnected_banner.id(),
                     tab.key_notice_banner.id(),
-                ]
+                    tab.remote_banner.id(),
+                ];
+                #[cfg(feature = "local_tty")]
+                {
+                    ids.push(tab.surface_view.id());
+                    ids.extend(tab.popup.as_ref().map(|popup| popup.view.id()));
+                }
+                ids
             })
             .unwrap_or_default()
     }

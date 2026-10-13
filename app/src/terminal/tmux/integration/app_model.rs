@@ -26,6 +26,7 @@ use super::{
 use crate::terminal::TerminalModel;
 use crate::terminal::TerminalView;
 use crate::terminal::tmux::TmuxOriginId;
+use crate::terminal::tmux::popup::TmuxPopups;
 use crate::terminal::tmux::settings::TmuxSettings;
 use crate::terminal::tmux::workspace_sync::{TmuxSessionEvent, TmuxSessions};
 
@@ -331,7 +332,15 @@ impl TmuxIntegration {
                  the default shell"
             ),
         }
-        state.launcher_path = path;
+        state.launcher_path = path.clone();
+        // KTD14: the `tmux` wrapper beside the launcher goes first on the server's PATH.
+        if let Some(path) = path
+            && ctx.has_singleton_model::<TmuxPopups>()
+        {
+            TmuxPopups::handle(ctx).update(ctx, |popups, ctx| {
+                popups.wrapper_installed(origin, &path, ctx);
+            });
+        }
         send(
             origin,
             session_panes_query(),

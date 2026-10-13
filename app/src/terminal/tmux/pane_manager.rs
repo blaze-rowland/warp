@@ -27,6 +27,7 @@ use warpui::{
 use super::TmuxOriginId;
 use super::gateway::{TmuxGatewayEvent, TmuxGateways};
 use super::integration::TmuxIntegration;
+use super::remote::TmuxRemoteHosts;
 use super::pane_event_loop::{
     DisconnectedSink, PaneRequestSink, TmuxPaneEventLoop, TmuxPaneEventLoopEvent,
 };
@@ -96,8 +97,16 @@ impl TmuxPaneTerminalManager {
         let colors = model.colors();
         let model = Arc::new(FairMutex::new(model));
 
-        let sessions: ModelHandle<Sessions> =
-            ctx.add_model(|ctx| Sessions::new(executor_command_tx, ctx));
+        let sessions: ModelHandle<Sessions> = ctx.add_model(|ctx| {
+            let mut sessions = Sessions::new(executor_command_tx, ctx);
+            sessions.set_tmux_origin(origin);
+            sessions
+        });
+        if ctx.has_singleton_model::<TmuxRemoteHosts>() {
+            TmuxRemoteHosts::handle(ctx).update(ctx, |hosts, ctx| {
+                hosts.register_pane(origin, &sessions, ctx);
+            });
+        }
 
         let requests: Arc<dyn PaneRequestSink> =
             match TmuxGateways::as_ref(ctx).request_sender(origin) {

@@ -11,10 +11,14 @@ pub mod key_tables;
 #[cfg(feature = "local_tty")]
 pub mod keys;
 pub mod layout_snapshot;
+pub mod native_ui;
 #[cfg(feature = "local_tty")]
 pub mod pane_event_loop;
 #[cfg(feature = "local_tty")]
 pub mod pane_manager;
+pub mod popup;
+#[cfg(feature = "local_tty")]
+pub mod remote;
 pub mod session_menu;
 pub mod settings;
 #[cfg(feature = "local_tty")]

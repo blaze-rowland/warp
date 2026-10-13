@@ -2960,6 +2960,10 @@ impl View for FileTreeView {
             return self.render_loading_state(app);
         }
 
+        if let CodingPanelEnablementState::RemoteUnavailable(reason) = self.enablement {
+            return self.render_error_state(reason.message().to_string(), app);
+        }
+
         if self.displayed_directories.is_empty() {
             if let CodingPanelEnablementState::RemoteSession { has_remote_server } = self.enablement
             {

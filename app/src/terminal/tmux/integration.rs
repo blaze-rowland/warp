@@ -36,6 +36,9 @@ pub const SHELL_OPTION: &str = "@warp_shell";
 pub const INSTALL_ROOT: &str = ".cache/warp/tmux";
 /// The launcher's file name in the install directory.
 pub const LAUNCHER_FILE: &str = "warp-shell.sh";
+/// The `tmux` wrapper's path in the install directory (KTD14). Its directory goes first on PATH
+/// in Warp's panes and in the server's global environment; see [`super::popup`].
+pub const WRAPPER_FILE: &str = "bin/tmux";
 /// Base64 characters per upload command. tmux has no hard line limit, but short lines keep each
 /// command cheap to parse and well under any shell's argument limit.
 pub const UPLOAD_CHUNK_CHARS: usize = 2048;
@@ -469,7 +472,17 @@ fn verify_script(bundle: &LauncherBundle, dir: &str) -> String {
 /// Decodes the staged chunks into the bundle's files, verifies them, and moves the directory
 /// into place. A directory another Warp installed meanwhile is kept.
 fn finish_script(bundle: &LauncherBundle, staging: &str) -> String {
-    let mut script = format!("cd \"{staging}\" && mkdir -p zsh");
+    let mut dirs: Vec<&str> = bundle
+        .files()
+        .iter()
+        .filter_map(|file| file.path.rsplit_once('/').map(|(dir, _)| dir))
+        .collect();
+    dirs.sort_unstable();
+    dirs.dedup();
+    let mut script = format!("cd \"{staging}\"");
+    if !dirs.is_empty() {
+        script.push_str(&format!(" && mkdir -p {}", dirs.join(" ")));
+    }
     for (index, file) in bundle.files().iter().enumerate() {
         let path = file.path;
         script.push_str(&format!(
@@ -494,7 +507,7 @@ fn finish_script(bundle: &LauncherBundle, staging: &str) -> String {
 /// from the option it did not set rather than from an error reply. tmux expands formats in the
 /// command, so the script must not contain `#`, and it is single-quoted, so it must not contain
 /// `'`.
-fn run_shell(script: &str) -> String {
+pub(crate) fn run_shell(script: &str) -> String {
     debug_assert!(!script.contains('#') && !script.contains('\''));
     format!("run-shell '{{ {script}; }} >/dev/null 2>&1 || true'")
 }
@@ -525,8 +538,8 @@ pub fn launcher_shell_command(launcher_path: &str) -> String {
     format!("'{launcher_path}'")
 }
 
-/// The launcher bundle built from Warp's assets: the launcher, its per-shell entry files, and
-/// Warp's full bootstrap for each shell (in marker-only mode at run time).
+/// The launcher bundle built from Warp's assets: the launcher, the `tmux` wrapper, its per-shell
+/// entry files, and Warp's full bootstrap for each shell (in marker-only mode at run time).
 pub fn launcher_bundle(assets: &dyn warpui::AssetProvider) -> LauncherBundle {
     let asset = |path: &str| -> Vec<u8> {
         assets
@@ -540,6 +553,11 @@ pub fn launcher_bundle(assets: &dyn warpui::AssetProvider) -> LauncherBundle {
         BundleFile {
             path: LAUNCHER_FILE,
             contents: asset("warp-shell.sh"),
+            executable: true,
+        },
+        BundleFile {
+            path: WRAPPER_FILE,
+            contents: asset("tmux"),
             executable: true,
         },
         BundleFile {

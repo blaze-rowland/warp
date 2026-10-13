@@ -17937,6 +17937,7 @@ impl Workspace {
                     is_wsl_session,
                     session_id,
                     has_pending_ssh,
+                    tmux_pane_enablement,
                 ) = terminal_handle.read(ctx, |terminal, ctx| {
                     let active_session_id = terminal.active_block_session_id();
                     let session = active_session_id
@@ -17954,6 +17955,7 @@ impl Workspace {
                         is_wsl_session,
                         active_session_id,
                         has_pending_ssh,
+                        terminal.tmux_pane_coding_panel_state(ctx),
                     )
                 });
 
@@ -18007,6 +18009,7 @@ impl Workspace {
                 } else {
                     enablement
                 };
+                let enablement = tmux_pane_enablement.unwrap_or(enablement);
 
                 self.left_panel_view.update(ctx, |left_panel, ctx| {
                     left_panel.update_coding_panel_enablement(enablement, ctx);

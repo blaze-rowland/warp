@@ -2076,6 +2076,14 @@ impl View for GlobalSearchView {
             CodingPanelEnablementState::UnsupportedSession => {
                 return self.render_unsupported_session_state(app);
             }
+            CodingPanelEnablementState::RemoteUnavailable(reason) => {
+                return self.render_zero_state(
+                    Icon::AlertTriangle,
+                    "Global search unavailable",
+                    reason.message(),
+                    app,
+                );
+            }
             CodingPanelEnablementState::Disabled => {
                 return self.render_unavailable_state(app);
             }

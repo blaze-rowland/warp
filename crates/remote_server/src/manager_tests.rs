@@ -107,3 +107,40 @@ fn start_ripgrep_search_without_connected_host_resolves_immediately() {
         ));
     });
 }
+
+/// A tmux pane's session closing deregisters only that pane's id, which the manager never
+/// tracked; the origin session that owns the host's connection stays (KTD9).
+#[test]
+fn deregistering_an_untracked_session_leaves_the_hosts_connection_alone() {
+    App::test((), |mut app| async move {
+        let manager = app.add_model(RemoteServerManager::new);
+        let host_id = HostId::new("test-host".to_string());
+        let origin = SessionId::from(7);
+        let tmux_pane = SessionId::from(101);
+
+        manager.update(&mut app, |manager, ctx| {
+            manager.sessions.insert(
+                origin,
+                super::RemoteSessionState::Reconnecting {
+                    attempt: 1,
+                    host_id: host_id.clone(),
+                    control_path: crate::transport::ControlPath::None,
+                },
+            );
+            manager
+                .host_to_sessions
+                .entry(host_id.clone())
+                .or_default()
+                .insert(origin);
+
+            manager.deregister_session(tmux_pane, ctx);
+
+            assert!(manager.is_session_potentially_active(origin));
+            assert!(
+                manager
+                    .sessions_for_host(&host_id)
+                    .is_some_and(|sessions| sessions.contains(&origin))
+            );
+        });
+    });
+}

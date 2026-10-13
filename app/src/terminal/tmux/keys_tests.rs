@@ -774,3 +774,181 @@ fn live_routing_through_tmux_key_tables() {
     );
     assert_eq!(focused_after_up_up.trim(), "%0");
 }
+
+// U14: interception, modes and hidden popups.
+
+/// Routes `key` and, if it goes to tmux, sends it like the router does (with the table guess).
+fn press_noting(core: &mut KeyRouterCore, key: &str) -> Option<ClientKey> {
+    let KeyRoute::Tmux(client_key) = route(core, key) else {
+        return None;
+    };
+    core.note_key(ORIGIN, &client_key);
+    core.key_sent(ORIGIN, Instant::now());
+    Some(client_key)
+}
+
+fn interactive_config() -> KeyConfig {
+    KeyConfig {
+        prefix: Some("C-b".into()),
+        prefix2: None,
+        bindings: Some(vec![
+            binding(
+                "prefix",
+                false,
+                "x",
+                "confirm-before -p \"kill-pane #P? (y/n)\" kill-pane",
+            ),
+            binding("prefix", true, "Up", "select-pane -U"),
+            binding("prefix", false, "m", "switch-client -T mine"),
+            binding("mine", false, "w", "choose-tree -Zw"),
+            binding("root", false, "M-m", "display-menu -T t a a \"kill-pane\""),
+        ]),
+    }
+}
+
+/// Covers AE9: `prefix x` resolves to its binding in the prefix table, so Warp can draw it
+/// instead of sending `x`; tmux then goes back to the root table.
+#[test]
+fn the_key_after_the_prefix_is_looked_up_in_the_prefix_table() {
+    let mut core = attached_core(&interactive_config());
+    press_noting(&mut core, "ctrl-b").expect("prefix goes to tmux");
+    let KeyRoute::Tmux(x) = route(&core, "x") else {
+        panic!("x after the prefix goes to tmux");
+    };
+    assert_eq!(
+        core.bound_command(ORIGIN, &x)
+            .map(|bound| bound.command.as_str()),
+        Some("confirm-before -p \"kill-pane #P? (y/n)\" kill-pane")
+    );
+    // Warp draws it: tmux is put back in `root` and a fence closes the window once the prefix
+    // is acknowledged.
+    assert_eq!(
+        core.intercepted(ORIGIN),
+        vec![command(
+            "switch-client -c \"client-7\" -T root",
+            CommandPurpose::Fire
+        )]
+    );
+    assert_eq!(
+        core.key_resolved(ORIGIN, Instant::now()),
+        vec![fence_line()]
+    );
+    core.on_reply(ORIGIN, CommandPurpose::Fence, &reply(&["root %1"]));
+    assert!(!core.is_window_open(ORIGIN));
+    // The next key reaches the pane as typed input.
+    assert_eq!(route(&core, "n"), KeyRoute::Warp);
+}
+
+#[test]
+fn an_intercepted_key_after_an_acknowledged_prefix_fences_right_away() {
+    let mut core = attached_core(&interactive_config());
+    press_noting(&mut core, "ctrl-b");
+    assert_eq!(
+        core.key_resolved(ORIGIN, Instant::now()),
+        vec![fence_line()]
+    );
+    core.on_reply(ORIGIN, CommandPurpose::Fence, &reply(&["prefix %1"]));
+    assert!(core.is_window_open(ORIGIN));
+    let KeyRoute::Tmux(x) = route(&core, "x") else {
+        panic!();
+    };
+    assert!(core.bound_command(ORIGIN, &x).is_some());
+    assert_eq!(
+        core.intercepted(ORIGIN),
+        vec![
+            command(
+                "switch-client -c \"client-7\" -T root",
+                CommandPurpose::Fire
+            ),
+            fence_line()
+        ]
+    );
+}
+
+#[test]
+fn the_table_guess_follows_repeat_and_switch_client() {
+    let mut core = attached_core(&interactive_config());
+    press_noting(&mut core, "ctrl-b");
+    let up = press_noting(&mut core, "up").unwrap();
+    // `bind -r Up` keeps the prefix table, so a repeated Up is still a prefix binding.
+    assert_eq!(
+        core.bound_command(ORIGIN, &up).map(|b| b.command.clone()),
+        Some("select-pane -U".to_owned())
+    );
+    let mut core = attached_core(&interactive_config());
+    press_noting(&mut core, "ctrl-b");
+    press_noting(&mut core, "m");
+    let KeyRoute::Tmux(w) = route(&core, "w") else {
+        panic!();
+    };
+    assert_eq!(
+        core.bound_command(ORIGIN, &w).map(|b| b.command.clone()),
+        Some("choose-tree -Zw".to_owned())
+    );
+    assert_eq!(
+        crate::terminal::tmux::key_tables::switched_table("switch-client -c x -T mine"),
+        Some("mine".to_owned())
+    );
+    // A root binding is looked up in root.
+    let core = attached_core(&interactive_config());
+    let KeyRoute::Tmux(menu) = route(&core, "alt-m") else {
+        panic!("M-m is bound in root");
+    };
+    assert!(core.bound_command(ORIGIN, &menu).is_some());
+}
+
+/// While only control clients are attached, plain typing never goes through `-K`: it stays
+/// with Warp (typed input, `send-keys -H`) unless tmux binds it.
+#[test]
+fn plain_typing_is_typed_input_not_client_keys() {
+    let core = attached_core(&interactive_config());
+    for key in ["a", "x", "shift-X", "space", "enter", "1"] {
+        assert_eq!(route(&core, key), KeyRoute::Warp, "{key}");
+    }
+}
+
+#[test]
+fn a_pane_in_a_tmux_mode_sends_every_key_through_tmux() {
+    let mut core = attached_core(&interactive_config());
+    core.set_pane_mode(ORIGIN, PANE, true);
+    assert_eq!(route(&core, "q"), tmux_key("q", KeyClass::Other, false));
+    assert_eq!(route(&core, "up"), tmux_key("Up", KeyClass::Other, false));
+    core.set_pane_mode(ORIGIN, PANE, false);
+    assert_eq!(route(&core, "q"), KeyRoute::Warp);
+}
+
+/// A popup open where Warp cannot show it takes `-K` keys, so none are sent; typed input still
+/// reaches the pane.
+#[test]
+fn a_hidden_popup_keeps_keys_out_of_tmux() {
+    let mut core = attached_core(&interactive_config());
+    core.set_hidden_popup(ORIGIN, true);
+    assert_eq!(route(&core, "ctrl-b"), KeyRoute::Warp);
+    assert_eq!(route(&core, "alt-m"), KeyRoute::Warp);
+    core.set_hidden_popup(ORIGIN, false);
+    assert_eq!(
+        route(&core, "ctrl-b"),
+        tmux_key("C-b", KeyClass::Other, true)
+    );
+}
+
+#[test]
+fn fences_are_counted_for_the_watchdog() {
+    let mut core = attached_core(&interactive_config());
+    assert_eq!(core.fence_state(ORIGIN), Some((0, false)));
+    press_noting(&mut core, "ctrl-b");
+    core.key_resolved(ORIGIN, Instant::now());
+    assert_eq!(core.fence_state(ORIGIN), Some((1, true)));
+    assert_eq!(
+        core.last_bound(ORIGIN),
+        None,
+        "the prefix itself is not bound"
+    );
+    core.on_reply(ORIGIN, CommandPurpose::Fence, &reply(&["prefix %1"]));
+    assert_eq!(core.fence_state(ORIGIN), Some((1, false)));
+    press_noting(&mut core, "x");
+    assert_eq!(
+        core.last_bound(ORIGIN),
+        Some("confirm-before -p \"kill-pane #P? (y/n)\" kill-pane")
+    );
+}

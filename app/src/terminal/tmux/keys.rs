@@ -33,7 +33,8 @@ use warpui::{AppContext, Entity, ModelContext, SingletonEntity};
 use super::TmuxOriginId;
 use super::gateway::{TmuxGatewayEvent, TmuxGateways};
 use super::key_tables::{
-    self, IDENTITY_QUERY, KeyTables, LIST_CLIENTS_COMMAND, PREFIX_QUERY, ServerIdentity, TmuxKey,
+    self, Bound, IDENTITY_QUERY, KeyTables, LIST_CLIENTS_COMMAND, PREFIX_QUERY, ServerIdentity,
+    TmuxKey,
 };
 use super::settings::TmuxSettings;
 use crate::util::bindings::CustomAction;
@@ -106,6 +107,8 @@ struct KeyWindow {
     resolved: u64,
     /// The number of keys sent when the fence in flight was sent.
     fence: Option<u64>,
+    /// Counts fences sent, so the watchdog can tell whether the one it watches was answered.
+    fences_sent: u64,
     /// When the oldest unacknowledged key was sent.
     in_flight_since: Option<Instant>,
 }
@@ -132,6 +135,7 @@ impl KeyWindow {
             return false;
         }
         self.fence = Some(self.sent);
+        self.fences_sent += 1;
         true
     }
 
@@ -150,9 +154,20 @@ impl KeyWindow {
         // Keys were sent after this fence. Fence again once they are all acknowledged.
         if self.resolved == self.sent {
             self.fence = Some(self.sent);
+            self.fences_sent += 1;
             return true;
         }
         false
+    }
+
+    /// Starts a fence now if every key is acknowledged and none is in flight.
+    fn fence_now(&mut self) -> bool {
+        if !self.open || self.fence.is_some() || self.resolved != self.sent {
+            return false;
+        }
+        self.fence = Some(self.sent);
+        self.fences_sent += 1;
+        true
     }
 }
 
@@ -236,7 +251,16 @@ struct OriginKeys {
     tables: Option<KeyTables>,
     identity: Option<ServerIdentity>,
     window: KeyWindow,
+    /// The key table tmux is believed to be in for the next key while the window is open,
+    /// from the keys sent and the last fence. `None` when unknown.
+    table_guess: Option<String>,
+    /// The bound command of the last `-K` key, for the watchdog (U14).
+    last_bound: Option<String>,
     popup_pane: Option<PaneId>,
+    /// Panes in a tmux mode (copy mode, choose mode), whose keys all go through tmux (U14).
+    mode_panes: HashSet<PaneId>,
+    /// A popup tmux opened where Warp cannot show it takes `-K` keys, so none are sent (U14).
+    hidden_popup: bool,
     refresh: Refresh,
     hook_scan: Option<HookScan>,
     hooks_installed: bool,
@@ -409,6 +433,9 @@ impl KeyRouterCore {
             }
             CommandPurpose::Fence => {
                 let table = key_tables::parse_fence_reply(reply).map(|(table, _)| table);
+                if keys.window.fence == Some(keys.window.sent) {
+                    keys.table_guess = table.clone();
+                }
                 if keys.window.fence_answered(table.as_deref()) {
                     vec![Self::fence(keys)]
                 } else {
@@ -447,7 +474,7 @@ impl KeyRouterCore {
         if self.bypass_until.is_some_and(|until| now < until) {
             return KeyRoute::Warp;
         }
-        if keys.supports_client_keys != Some(true) {
+        if keys.supports_client_keys != Some(true) || keys.hidden_popup {
             return KeyRoute::Warp;
         }
         let Some(key) = TmuxKey::from_keystroke(keystroke) else {
@@ -461,8 +488,8 @@ impl KeyRouterCore {
                 in_root_table,
             })
         };
-        if keys.window.open {
-            // tmux may be in a non-root table: it decides, bound or not.
+        if keys.window.open || keys.mode_panes.contains(&pane_id) {
+            // tmux may be in a non-root table or a pane mode: it decides, bound or not.
             return client_key(KeyClass::Other, false);
         }
         let Some(tables) = &keys.tables else {
@@ -482,6 +509,104 @@ impl KeyRouterCore {
         if let Some(keys) = self.origins.get_mut(&origin) {
             keys.window.key_sent(now);
         }
+    }
+
+    /// The command `key` is bound to in the table tmux is believed to be in: the root table
+    /// outside the window, the guessed table inside it. `None` when unbound or unknown.
+    pub fn bound_command(&self, origin: TmuxOriginId, key: &ClientKey) -> Option<&Bound> {
+        let keys = self.origins.get(&origin)?;
+        let tables = keys.tables.as_ref()?;
+        let key = TmuxKey::parse(&key.key)?;
+        let table = if keys.window.open {
+            keys.table_guess.as_deref()?
+        } else {
+            "root"
+        };
+        tables.binding(table, &key)
+    }
+
+    /// Updates the table guess for a `-K` key about to be sent: the prefix enters `prefix`, a
+    /// `switch-client -T` binding enters its table, a repeatable binding stays, and anything
+    /// else returns to `root`.
+    pub fn note_key(&mut self, origin: TmuxOriginId, key: &ClientKey) {
+        let bound = self.bound_command(origin, key).cloned();
+        let Some(keys) = self.origins.get_mut(&origin) else {
+            return;
+        };
+        let current = if keys.window.open {
+            keys.table_guess.clone()
+        } else {
+            Some("root".to_owned())
+        };
+        let parsed = TmuxKey::parse(&key.key);
+        let is_prefix = parsed
+            .as_ref()
+            .zip(keys.tables.as_ref())
+            .is_some_and(|(parsed, tables)| tables.is_prefix(parsed));
+        keys.last_bound = bound.as_ref().map(|bound| bound.command.clone());
+        keys.table_guess = match (current.as_deref(), bound) {
+            (Some("root"), _) if is_prefix => Some("prefix".to_owned()),
+            (_, Some(bound)) => match key_tables::switched_table(&bound.command) {
+                Some(table) => Some(table),
+                None if bound.repeat => current,
+                None => Some("root".to_owned()),
+            },
+            (Some(_), None) => Some("root".to_owned()),
+            (None, None) => None,
+        };
+    }
+
+    /// The bound command of the last `-K` key sent.
+    pub fn last_bound(&self, origin: TmuxOriginId) -> Option<&str> {
+        self.origins.get(&origin)?.last_bound.as_deref()
+    }
+
+    /// Warp drew the UI a key's binding opens instead of sending the key (U14, KTD10). If tmux
+    /// was in another table (the key followed the prefix), it is put back in `root`, and a
+    /// fence closes the window.
+    pub fn intercepted(&mut self, origin: TmuxOriginId) -> Vec<Outbound> {
+        let Some(keys) = self.origins.get_mut(&origin) else {
+            return Vec::new();
+        };
+        if !keys.window.open {
+            return Vec::new();
+        }
+        keys.table_guess = Some("root".to_owned());
+        let reset = match &keys.identity {
+            Some(identity) => {
+                super::native_ui::reset_key_table_command(Some(&identity.client_name))
+            }
+            None => super::native_ui::reset_key_table_command(None),
+        };
+        let mut out = vec![command(reset, CommandPurpose::Fire)];
+        if keys.window.fence_now() {
+            out.push(Self::fence(keys));
+        }
+        out
+    }
+
+    /// Records whether a pane is in a tmux mode.
+    pub fn set_pane_mode(&mut self, origin: TmuxOriginId, pane_id: PaneId, in_mode: bool) {
+        if let Some(keys) = self.origins.get_mut(&origin) {
+            if in_mode {
+                keys.mode_panes.insert(pane_id);
+            } else {
+                keys.mode_panes.remove(&pane_id);
+            }
+        }
+    }
+
+    /// Records whether a hidden popup is open on the session's client.
+    pub fn set_hidden_popup(&mut self, origin: TmuxOriginId, hidden: bool) {
+        if let Some(keys) = self.origins.get_mut(&origin) {
+            keys.hidden_popup = hidden;
+        }
+    }
+
+    /// The number of fences sent so far, and whether one is in flight.
+    pub fn fence_state(&self, origin: TmuxOriginId) -> Option<(u64, bool)> {
+        let keys = self.origins.get(&origin)?;
+        Some((keys.window.fences_sent, keys.window.fence.is_some()))
     }
 
     /// tmux acknowledged a `-K` key, or the engine dropped a stale one.
@@ -516,6 +641,7 @@ impl KeyRouterCore {
             return Vec::new();
         };
         keys.window.fence = Some(keys.window.sent);
+        keys.window.fences_sent += 1;
         vec![Self::fence(keys)]
     }
 
@@ -687,12 +813,19 @@ pub fn escape_hatch_keystroke(app: &AppContext) -> Option<Keystroke> {
 }
 
 /// Notifications from [`TmuxKeyRouter`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TmuxKeyRouterEvent {
     /// The session's key notice appeared, changed or went away.
     NoticeChanged { origin: TmuxOriginId },
     /// A `-K` key started or stopped showing the in-flight spinner (R20).
     InFlightChanged { origin: TmuxOriginId },
+    /// A fence went unanswered for [`super::native_ui::WATCHDOG_DELAY`]: the last key's
+    /// commands keep tmux's command queue busy, e.g. tmux UI opened on Warp's client (U14).
+    Stalled {
+        origin: TmuxOriginId,
+        /// The last `-K` key's bound command.
+        command: Option<String>,
+    },
 }
 
 /// Commands the router sent and waits on, by gateway tag.
@@ -707,6 +840,8 @@ pub struct TmuxKeyRouter {
     spinning: HashSet<TmuxOriginId>,
     /// Sessions with a spinner timer scheduled.
     timers: HashSet<TmuxOriginId>,
+    /// Commands other features send before a detach, merged with the router's own (U14).
+    extra_detach: HashMap<TmuxOriginId, Vec<String>>,
 }
 
 impl Entity for TmuxKeyRouter {
@@ -732,6 +867,7 @@ impl TmuxKeyRouter {
             next_tag: FIRST_TAG,
             spinning: HashSet::new(),
             timers: HashSet::new(),
+            extra_detach: HashMap::new(),
         }
     }
 
@@ -772,13 +908,53 @@ impl TmuxKeyRouter {
 
     /// U14: marks `pane_id` as the session's focused popup pane (or clears it with `None`).
     /// While it has focus, every key except Warp's reserved actions goes to it as typed input.
-    pub fn set_popup_pane(
+    pub fn set_popup_pane(&mut self, origin: TmuxOriginId, pane_id: Option<PaneId>) {
+        self.core.set_popup_pane(origin, pane_id);
+    }
+
+    /// The command a routed key is bound to (U14).
+    pub fn bound_command(&self, origin: TmuxOriginId, key: &ClientKey) -> Option<String> {
+        self.core
+            .bound_command(origin, key)
+            .map(|bound| bound.command.clone())
+    }
+
+    /// Warp drew a key's UI natively instead of sending the key (U14).
+    pub fn key_intercepted(&mut self, origin: TmuxOriginId, ctx: &mut ModelContext<Self>) {
+        let out = self.core.intercepted(origin);
+        self.execute(origin, out, ctx);
+    }
+
+    /// A pane entered or left a tmux mode (U14).
+    pub fn set_pane_mode(&mut self, origin: TmuxOriginId, pane_id: PaneId, in_mode: bool) {
+        self.core.set_pane_mode(origin, pane_id, in_mode);
+    }
+
+    /// A hidden popup opened or closed on the session's client (U14).
+    pub fn set_hidden_popup(&mut self, origin: TmuxOriginId, hidden: bool) {
+        self.core.set_hidden_popup(origin, hidden);
+    }
+
+    /// Commands another feature needs sent before `origin` detaches, e.g. restoring the
+    /// server's PATH (U14).
+    pub fn set_extra_detach_commands(
         &mut self,
         origin: TmuxOriginId,
-        pane_id: Option<PaneId>,
-        _ctx: &mut ModelContext<Self>,
+        commands: Vec<String>,
+        ctx: &mut ModelContext<Self>,
     ) {
-        self.core.set_popup_pane(origin, pane_id);
+        self.extra_detach.insert(origin, commands);
+        self.sync_detach_commands(origin, ctx);
+    }
+
+    fn sync_detach_commands(&self, origin: TmuxOriginId, ctx: &mut ModelContext<Self>) {
+        let mut detach_commands = self.core.detach_commands(origin);
+        if let Some(extra) = self.extra_detach.get(&origin) {
+            detach_commands.extend(extra.iter().cloned());
+        }
+        TmuxGateways::handle(ctx).update(ctx, |gateways, _| {
+            gateways.set_detach_commands(origin, detach_commands);
+        });
     }
 
     /// The escape-hatch chord was pressed: the next key stays with Warp.
@@ -874,6 +1050,10 @@ impl TmuxKeyRouter {
                 self.core.key_config_loaded(origin, config);
                 Vec::new()
             }
+            ClientEvent::PaneModeChanged { pane_id, mode } => {
+                self.core.set_pane_mode(origin, *pane_id, mode.is_some());
+                Vec::new()
+            }
             ClientEvent::Attached { .. } => self.core.attached(origin),
             ClientEvent::Message { text } => self.core.on_message(origin, text),
             ClientEvent::ConfigError { .. } => self.core.refresh(origin),
@@ -897,6 +1077,7 @@ impl TmuxKeyRouter {
     fn end(&mut self, origin: TmuxOriginId, ctx: &mut ModelContext<Self>) {
         let had_notice = self.core.notice(origin).is_some();
         self.core.ended(origin);
+        self.extra_detach.remove(&origin);
         self.pending.retain(|(o, _), _| *o != origin);
         if self.spinning.remove(&origin) {
             ctx.emit(TmuxKeyRouterEvent::InFlightChanged { origin });
@@ -925,6 +1106,7 @@ impl TmuxKeyRouter {
         for outbound in out {
             match outbound {
                 Outbound::Key(key) => {
+                    self.core.note_key(origin, &key);
                     if sender.send(TmuxRequest::ClientKey(key)) {
                         self.core.key_sent(origin, Instant::now());
                         self.schedule_spinner(origin, IN_FLIGHT_INDICATOR_DELAY, ctx);
@@ -935,14 +1117,31 @@ impl TmuxKeyRouter {
                     self.next_tag = self.next_tag.wrapping_add(1).max(FIRST_TAG);
                     if sender.send(TmuxRequest::Command { tag, line }) {
                         self.pending.insert((origin, tag), purpose);
+                        if purpose == CommandPurpose::Fence {
+                            self.watch_fence(origin, ctx);
+                        }
                     }
                 }
             }
         }
-        let detach_commands = self.core.detach_commands(origin);
-        TmuxGateways::handle(ctx).update(ctx, |gateways, _| {
-            gateways.set_detach_commands(origin, detach_commands);
-        });
+        self.sync_detach_commands(origin, ctx);
+    }
+
+    /// Emits [`TmuxKeyRouterEvent::Stalled`] if the fence just sent is still unanswered after
+    /// the watchdog delay (U14).
+    fn watch_fence(&mut self, origin: TmuxOriginId, ctx: &mut ModelContext<Self>) {
+        let Some((sent, _)) = self.core.fence_state(origin) else {
+            return;
+        };
+        let _ = ctx.spawn(
+            Timer::after(super::native_ui::WATCHDOG_DELAY),
+            move |me, _, ctx| {
+                if me.core.fence_state(origin) == Some((sent, true)) {
+                    let command = me.core.last_bound(origin).map(str::to_owned);
+                    ctx.emit(TmuxKeyRouterEvent::Stalled { origin, command });
+                }
+            },
+        );
     }
 
     fn schedule_spinner(

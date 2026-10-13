@@ -17,7 +17,17 @@ source "$WARP_TMUX_DIR/bootstrap.fish"
 # A Warp that attaches later asks for the integration to be announced again; it shows blocks
 # from the next prompt.
 set -g _warp_tmux_announce_file "$WARP_TMUX_DIR/../announce/$WARP_SESSION_ID"
+# Warp's `tmux` wrapper goes first on PATH, after the user's startup files had their say, so
+# scripts that open tmux popups reach it.
+function _warp_tmux_path
+    if test "$PATH[1]" != "$WARP_TMUX_DIR/bin"
+        set -gx PATH "$WARP_TMUX_DIR/bin" $PATH
+    end
+end
+_warp_tmux_path
+
 function _warp_tmux_precmd --on-event fish_prompt
+    _warp_tmux_path
     if test -e "$_warp_tmux_announce_file"
         command rm -f -- "$_warp_tmux_announce_file"
         _warp_tmux_init_shell

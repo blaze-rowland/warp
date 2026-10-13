@@ -20,6 +20,8 @@ use crate::terminal::model::session::command_executor::ExecuteCommandOptions;
 use crate::terminal::tmux::TmuxOriginId;
 use crate::terminal::tmux::gateway::TmuxGateways;
 use crate::terminal::tmux::layout_snapshot::{layout_to_snapshot, tab_layout};
+use crate::terminal::tmux::native_ui::TmuxNativeUi;
+use crate::terminal::tmux::remote::{OriginSession, TmuxRemoteEvent, TmuxRemoteHosts};
 use crate::terminal::tmux::session_menu::{
     ATTACH_LABEL, ListOutcome, MenuEntry, NEW_SESSION_LABEL, TmuxMenuAction, attach_menu_entries,
     command_for_with_launcher, list_outcome, list_sessions_command,
@@ -43,6 +45,20 @@ impl Workspace {
         ctx.subscribe_to_model(&TmuxSessions::handle(ctx), |me, _, event, ctx| {
             me.handle_tmux_session_event(event, ctx);
         });
+        if ctx.has_singleton_model::<TmuxRemoteHosts>() {
+            ctx.subscribe_to_model(&TmuxRemoteHosts::handle(ctx), |me, _, event, ctx| {
+                let TmuxRemoteEvent::Changed { origin } = event;
+                let active_is_session = me
+                    .tabs
+                    .get(me.active_tab_index)
+                    .and_then(|tab| tab.pane_group.as_ref(ctx).tmux_tab().map(|t| t.origin))
+                    == Some(*origin);
+                if active_is_session {
+                    me.update_active_session(ctx);
+                }
+                ctx.notify();
+            });
+        }
     }
 
     fn handle_tmux_session_event(&mut self, event: &TmuxSessionEvent, ctx: &mut ViewContext<Self>) {
@@ -145,16 +161,33 @@ impl Workspace {
         let Some(origin_index) = self.tmux_origin_tab_index(origin, ctx) else {
             return;
         };
-        let host = self.tabs[origin_index]
+        let origin_session = self.tabs[origin_index]
             .pane_group
             .as_ref(ctx)
             .tmux_origin_view(origin, ctx)
-            .and_then(|view| {
-                let session = view.as_ref(ctx).active_session().as_ref(ctx).session(ctx)?;
-                Some(session.hostname().to_owned())
-            })
+            .and_then(|view| view.as_ref(ctx).active_session().as_ref(ctx).session(ctx));
+        if ctx.has_singleton_model::<TmuxRemoteHosts>() {
+            let pairing = origin_session
+                .as_deref()
+                .and_then(OriginSession::from_session);
+            TmuxRemoteHosts::handle(ctx).update(ctx, |hosts, ctx| {
+                hosts.pair(origin, pairing, ctx);
+            });
+        }
+        let host = origin_session
+            .map(|session| session.hostname().to_owned())
             .filter(|host| !host.is_empty())
             .unwrap_or_else(|| "this computer".to_owned());
+        // The watchdog's second tmux client runs through the origin pane's session, which
+        // reaches the server's host (U14).
+        if let Some(session) = self.tabs[origin_index]
+            .pane_group
+            .as_ref(ctx)
+            .tmux_origin_view(origin, ctx)
+            .and_then(|view| view.as_ref(ctx).active_session().as_ref(ctx).session(ctx))
+        {
+            TmuxNativeUi::handle(ctx).update(ctx, |ui, _| ui.set_executor(origin, session));
+        }
         let duplicate = TmuxSessions::handle(ctx).update(ctx, |sessions, ctx| {
             sessions.register_host(origin, host, ctx)
         });

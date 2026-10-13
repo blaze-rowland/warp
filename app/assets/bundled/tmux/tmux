@@ -1,0 +1,188 @@
+#!/bin/sh
+# Warp's `tmux` wrapper (KTD14).
+#
+# Warp puts this directory first on PATH in tmux panes and in the server's global environment, so
+# scripts and plugins that open a popup (`fzf-tmux -p`, tmux-fzf) reach it. A popup opened on a
+# control client (Warp) would run hidden, block its caller and capture Warp's keys. When the popup
+# would land on a control client, this runs its command in a detached window instead, which Warp
+# shows as a floating pane, and blocks until the command exits, as a popup does. Everything else
+# goes to the real tmux unchanged.
+
+warp_quote() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+warp_find_tmux() {
+  if [ -n "${WARP_REAL_TMUX:-}" ] && [ -x "$WARP_REAL_TMUX" ]; then
+    printf '%s\n' "$WARP_REAL_TMUX"
+    return 0
+  fi
+  warp_self=$(CDPATH='' cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P)
+  warp_ifs=$IFS
+  set -f
+  IFS=:
+  for warp_dir in $PATH; do
+    case $warp_dir in
+      '' | */.cache/warp/tmux/*/bin) continue ;;
+    esac
+    [ "$(CDPATH='' cd -- "$warp_dir" 2>/dev/null && pwd -P)" = "$warp_self" ] && continue
+    if [ -f "$warp_dir/tmux" ] && [ -x "$warp_dir/tmux" ]; then
+      IFS=$warp_ifs
+      set +f
+      printf '%s\n' "$warp_dir/tmux"
+      return 0
+    fi
+  done
+  IFS=$warp_ifs
+  set +f
+  for warp_dir in /opt/homebrew/bin /usr/local/bin /usr/bin /bin; do
+    if [ -x "$warp_dir/tmux" ]; then
+      printf '%s\n' "$warp_dir/tmux"
+      return 0
+    fi
+  done
+  return 1
+}
+
+warp_real=$(warp_find_tmux) || {
+  echo "tmux: command not found" >&2
+  exit 127
+}
+
+warp_all=""
+for warp_arg in "$@"; do
+  warp_all="$warp_all $(warp_quote "$warp_arg")"
+done
+warp_exec_real() {
+  eval "exec $(warp_quote "$warp_real") $warp_all"
+}
+
+# tmux's own options come before the command; keep them for every call to the real tmux.
+warp_global=""
+warp_count=0
+warp_command=""
+warp_expect_value=0
+for warp_arg in "$@"; do
+  warp_count=$((warp_count + 1))
+  if [ "$warp_expect_value" = 1 ]; then
+    warp_global="$warp_global $(warp_quote "$warp_arg")"
+    warp_expect_value=0
+    continue
+  fi
+  case $warp_arg in
+    -c) exec "$warp_real" "$@" ;;
+    -L | -S | -f | -T)
+      warp_global="$warp_global $(warp_quote "$warp_arg")"
+      warp_expect_value=1
+      ;;
+    --)
+      warp_global="$warp_global --"
+      ;;
+    -*)
+      warp_global="$warp_global $(warp_quote "$warp_arg")"
+      ;;
+    *)
+      warp_command=$warp_arg
+      break
+      ;;
+  esac
+done
+
+case $warp_command in
+  popup | display-popup) ;;
+  *) warp_exec_real ;;
+esac
+
+# The popup's arguments: everything after the command.
+shift "$warp_count"
+
+warp_client=""
+warp_dir=""
+warp_target=""
+warp_title=""
+warp_env=""
+while [ $# -gt 0 ]; do
+  case $1 in
+    --)
+      shift
+      break
+      ;;
+    -?*)
+      warp_flags=${1#-}
+      shift
+      while [ -n "$warp_flags" ]; do
+        warp_flag=$(printf '%s' "$warp_flags" | cut -c1)
+        warp_flags=${warp_flags#?}
+        case $warp_flag in
+          C) warp_exec_real ;;
+          b | c | d | e | h | s | S | t | T | w | x | y)
+            if [ -n "$warp_flags" ]; then
+              warp_value=$warp_flags
+              warp_flags=""
+            else
+              warp_value=$1
+              shift
+            fi
+            case $warp_flag in
+              c) warp_client=$warp_value ;;
+              d) warp_dir=$warp_value ;;
+              t) warp_target=$warp_value ;;
+              T) warp_title=$warp_value ;;
+              e) warp_env="$warp_env -e $(warp_quote "$warp_value")" ;;
+            esac
+            ;;
+        esac
+      done
+      ;;
+    *) break ;;
+  esac
+done
+
+warp_tmux() {
+  eval "$(warp_quote "$warp_real") $warp_global \"\$@\""
+}
+
+# Only a popup that would land on a control client is hidden; a plain client draws it itself.
+if [ -n "$warp_client" ]; then
+  warp_control=$(warp_tmux display-message -p -c "$warp_client" '#{client_control_mode}' 2>/dev/null)
+else
+  warp_control=$(warp_tmux display-message -p '#{client_control_mode}' 2>/dev/null)
+fi
+[ "$warp_control" = 1 ] || warp_exec_real
+
+warp_session_target=""
+if [ -n "$warp_target" ]; then
+  warp_session=$(warp_tmux display-message -p -t "$warp_target" '#{session_id}' 2>/dev/null)
+  [ -n "$warp_session" ] && warp_session_target="-t $(warp_quote "$warp_session:")"
+fi
+[ -n "$warp_dir" ] || warp_dir=$PWD
+
+warp_channel="warp-popup-$$-$(date +%s 2>/dev/null)"
+warp_rc_file=$(mktemp "${TMPDIR:-/tmp}/warp-popup.XXXXXX") || exit 1
+trap 'rm -f "$warp_rc_file"' EXIT
+warp_name="warp-popup"
+[ -n "$warp_title" ] && warp_name="warp-popup:$warp_title"
+
+# The window runs the popup's command, records its exit status and wakes this script. A window
+# closed under it still wakes the script.
+warp_script='
+trap "\"\$WARP_POPUP_TMUX\" wait-for -S \"\$WARP_POPUP_CHANNEL\"; exit 129" HUP TERM
+if [ $# -eq 0 ]; then "${SHELL:-/bin/sh}"; elif [ $# -eq 1 ]; then (eval "$1"); else "$@"; fi
+echo $? > "$WARP_POPUP_RC"
+"$WARP_POPUP_TMUX" wait-for -S "$WARP_POPUP_CHANNEL"
+'
+
+warp_window=$(eval "$(warp_quote "$warp_real") $warp_global new-window -d -P -F '#{window_id}' \
+  -n $(warp_quote "$warp_name") -c $(warp_quote "$warp_dir") $warp_session_target $warp_env \
+  -e $(warp_quote "WARP_POPUP_TMUX=$warp_real") \
+  -e $(warp_quote "WARP_POPUP_CHANNEL=$warp_channel") \
+  -e $(warp_quote "WARP_POPUP_RC=$warp_rc_file") \
+  -- /bin/sh -c $(warp_quote "$warp_script") warp-popup \"\$@\"") || exit 1
+
+warp_tmux wait-for "$warp_channel"
+warp_tmux kill-window -t "$warp_window" 2>/dev/null
+warp_status=$(cat "$warp_rc_file" 2>/dev/null)
+case $warp_status in
+  '' | *[!0-9]*) exit 0 ;;
+  *) exit "$warp_status" ;;
+esac

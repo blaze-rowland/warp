@@ -23,6 +23,7 @@ use warpui::{
 
 use super::TmuxOriginId;
 use super::keys::{KeyRoute, TmuxKeyRouter, escape_hatch_keystroke};
+use super::native_ui::TmuxNativeUi;
 use crate::pane_group::PaneGroup;
 use crate::util::bindings::trigger_to_keystroke;
 
@@ -195,6 +196,16 @@ pub fn init(app: &mut AppContext) {
 fn route_key(pane_group: &PaneGroup, routed: &RoutedKey, ctx: &mut ViewContext<PaneGroup>) {
     let origin = routed.origin;
     let router = TmuxKeyRouter::handle(ctx);
+    // U14, KTD10: a binding that opens tmux UI is drawn by Warp instead of reaching tmux.
+    if let Some(command) = router.as_ref(ctx).bound_command(origin, &routed.key)
+        && ctx.has_singleton_model::<TmuxNativeUi>()
+        && TmuxNativeUi::handle(ctx).update(ctx, |ui, ctx| {
+            ui.intercept(origin, routed.key.pane_id, &command, ctx)
+        })
+    {
+        router.update(ctx, |router, ctx| router.key_intercepted(origin, ctx));
+        return;
+    }
     router.update(ctx, |router, ctx| {
         router.send_client_key(origin, routed.key.clone(), ctx);
     });

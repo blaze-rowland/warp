@@ -407,6 +407,20 @@ pub fn is_navigation_command(command: &str) -> bool {
     false
 }
 
+/// The table a bound command switches the client to (`switch-client -T table`), if any.
+pub fn switched_table(command: &str) -> Option<String> {
+    use super::native_ui::{parse_args, split_commands};
+    split_commands(command).into_iter().find_map(|tokens| {
+        let (name, args) = tokens.split_first()?;
+        if !matches!(name.text.as_str(), "switch-client" | "switchc") {
+            return None;
+        }
+        parse_args(args, "cOtT")
+            .value('T')
+            .map(|table| table.text.clone())
+    })
+}
+
 /// 64-bit FNV-1a. Stable across runs and Rust versions, unlike `DefaultHasher`, because the hash
 /// is persisted.
 fn fnv1a(bytes: &[u8]) -> u64 {

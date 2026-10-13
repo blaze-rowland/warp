@@ -60,7 +60,17 @@ pub fn plan_window_sync(model: &SessionModel, open: &[OpenTab]) -> Vec<WindowOp>
             window_id: tab.window_id,
         })
         .collect();
-    let mut windows: Vec<&TmuxWindow> = model.windows().collect();
+    // Popup windows (U14) show as floating panes, not tabs. A new window's name arrives just
+    // after its layout, so a window waits for its name before it gets a tab.
+    let mut windows: Vec<&TmuxWindow> = model
+        .windows()
+        .filter(|window| {
+            window
+                .name
+                .as_deref()
+                .is_none_or(|name| !super::popup::is_popup_window_name(name))
+        })
+        .collect();
     windows.sort_by_key(|window| (window.index.unwrap_or(u32::MAX), window.id));
     for window in windows {
         let title = window_title(window);
@@ -76,7 +86,7 @@ pub fn plan_window_sync(model: &SessionModel, open: &[OpenTab]) -> Vec<WindowOp>
                     });
                 }
             }
-            None if window.layout.is_some() => ops.push(WindowOp::Open {
+            None if window.layout.is_some() && window.name.is_some() => ops.push(WindowOp::Open {
                 window_id: window.id,
                 title,
             }),

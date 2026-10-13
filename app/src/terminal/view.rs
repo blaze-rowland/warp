@@ -12286,7 +12286,9 @@ impl TerminalView {
                         if self.session_is_local(sid, ctx) {
                             RepoDetectionSessionType::Local
                         } else {
-                            RepoDetectionSessionType::Remote { session_id: sid }
+                            RepoDetectionSessionType::Remote {
+                                session_id: self.remote_server_session_id(sid, ctx),
+                            }
                         }
                     });
                     if let Some(session_type) = session_type {
@@ -13702,8 +13704,10 @@ impl TerminalView {
                 // that child via `kill_on_drop`, which closes the
                 // multiplexed channel on the ControlMaster so the foreground
                 // ssh can exit cleanly instead of hanging.
+                // A tmux pane's sessions are never manager sessions; the connection belongs to the
+                // hidden origin pane for the whole attach (KTD9).
                 #[cfg(not(target_family = "wasm"))]
-                if FeatureFlag::SshRemoteServer.is_enabled() {
+                if FeatureFlag::SshRemoteServer.is_enabled() && !self.tmux.is_tmux_pane {
                     use crate::remote_server::manager::RemoteServerManager;
                     RemoteServerManager::handle(ctx).update(
                         ctx,
@@ -16977,6 +16981,51 @@ impl TerminalView {
     ) {
         self.tmux.is_tmux_pane = true;
         self.tmux.tmux_pane = Some((origin, pane_id));
+    }
+
+    /// The file explorer and code review state for a tmux pane, which skips the remote-server
+    /// controller wiring other terminals get (KTD9). `None` keeps the usual session-based state.
+    pub(crate) fn tmux_pane_coding_panel_state(
+        &self,
+        ctx: &AppContext,
+    ) -> Option<crate::coding_panel_enablement_state::CodingPanelEnablementState> {
+        #[cfg(feature = "local_tty")]
+        {
+            self.tmux_pane_remote(self.active_block_session_id()?, ctx)?
+                .coding_panel_state()
+        }
+        #[cfg(not(feature = "local_tty"))]
+        {
+            let _ = ctx;
+            None
+        }
+    }
+
+    /// The remote-server session that serves `session_id`'s session-scoped requests: the tmux
+    /// origin's for a pane on the paired host, else the session itself.
+    fn remote_server_session_id(&self, session_id: SessionId, ctx: &AppContext) -> SessionId {
+        #[cfg(feature = "local_tty")]
+        {
+            self.tmux_pane_remote(session_id, ctx)
+                .and_then(|pane| pane.remote_server_session())
+                .unwrap_or(session_id)
+        }
+        #[cfg(not(feature = "local_tty"))]
+        {
+            let _ = ctx;
+            session_id
+        }
+    }
+
+    #[cfg(feature = "local_tty")]
+    fn tmux_pane_remote(
+        &self,
+        session_id: SessionId,
+        ctx: &AppContext,
+    ) -> Option<crate::terminal::tmux::remote::PaneRemote> {
+        let (origin, _) = self.tmux.tmux_pane?;
+        let session = self.sessions.as_ref(ctx).get(session_id)?;
+        crate::terminal::tmux::remote::pane_remote_for_view(origin, &session, ctx)
     }
 
     /// Whether this view is a tmux pane in plain-terminal mode: no input editor, keys straight to

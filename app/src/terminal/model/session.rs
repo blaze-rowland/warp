@@ -137,6 +137,11 @@ pub struct Sessions {
     /// Tracks the remote server setup state for SSH sessions that have the
     /// `SshRemoteServer` feature flag enabled. Keyed by the pending session ID.
     remote_server_setup_states: HashMap<SessionId, RemoteServerSetupState>,
+
+    /// The tmux session this pane model belongs to, when it backs a tmux pane. Its sessions get
+    /// their command executor and remote host from the tmux layer (U11, KTD9).
+    #[cfg_attr(not(feature = "local_tty"), allow(dead_code))]
+    tmux_origin: Option<crate::terminal::tmux::TmuxOriginId>,
 }
 
 #[derive(Clone, Debug)]
@@ -255,6 +260,7 @@ impl Sessions {
             executor_for_all_sessions: None,
             env_vars: Default::default(),
             remote_server_setup_states: Default::default(),
+            tmux_origin: None,
         }
     }
 
@@ -280,7 +286,18 @@ impl Sessions {
             executor_for_all_sessions: None,
             env_vars: Default::default(),
             remote_server_setup_states: Default::default(),
+            tmux_origin: None,
         }
+    }
+
+    /// Marks this model as a tmux pane's, in `origin`'s session.
+    pub fn set_tmux_origin(&mut self, origin: crate::terminal::tmux::TmuxOriginId) {
+        self.tmux_origin = Some(origin);
+    }
+
+    /// The bootstrapped sessions.
+    pub fn sessions(&self) -> impl Iterator<Item = &Arc<Session>> {
+        self.sessions.values()
     }
 
     #[cfg(test)]
@@ -412,6 +429,13 @@ impl Sessions {
             && let Some(host_id) = RemoteServerManager::as_ref(ctx).host_id_for_session(session_id)
         {
             session.set_remote_host_id(Some(host_id.clone()));
+        }
+
+        #[cfg(feature = "local_tty")]
+        if let Some(origin) = self.tmux_origin
+            && self.executor_for_all_sessions.is_none()
+        {
+            crate::terminal::tmux::remote::adopt_pane_session(origin, &session, ctx);
         }
 
         let bootstrap_duration_seconds =
@@ -1061,6 +1085,14 @@ impl Session {
         )
     }
 
+    /// The SSH wrapper's ControlMaster socket, for sessions the wrapper established.
+    pub fn ssh_control_master_socket(&self) -> Option<&Path> {
+        match &self.info.is_ssh_wrapper_session {
+            IsSSHWrapperSession::Yes { socket_path, .. } => Some(socket_path),
+            IsSSHWrapperSession::No => None,
+        }
+    }
+
     pub fn is_subshell_or_ssh(&self) -> bool {
         matches!(self.session_type(), SessionType::WarpifiedRemote { .. })
             || self.is_ssh_wrapper_session()
@@ -1586,9 +1618,7 @@ impl Session {
         &self.external_commands
     }
 
-    /// Returns a reference to the session's command executor for integration
-    /// test assertions (e.g. to verify `RemoteServerCommandExecutor` is wired).
-    #[cfg(any(test, feature = "integration_tests"))]
+    /// Returns the session's current command executor.
     pub fn command_executor(&self) -> Arc<dyn CommandExecutor> {
         self.command_executor.read().clone()
     }

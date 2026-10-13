@@ -8454,6 +8454,9 @@ impl View for PaneGroup {
         if let Some(banner) = self.render_tmux_banner(app) {
             column.add_child(banner);
         }
+        if let Some(strip) = self.render_tmux_mode_strip(app) {
+            column.add_child(strip);
+        }
 
         let main_content = if self.is_focused_pane_maximized(app) {
             self.focused_pane_id(app).render(app)
@@ -8475,6 +8478,9 @@ impl View for PaneGroup {
         column.add_child(Shrinkable::new(1., main_content).finish());
 
         let mut stack = Stack::new().with_child(column.finish());
+        for overlay in self.render_tmux_overlays(app) {
+            stack.add_child(overlay);
+        }
 
         // Render the share modals on the pane group level so that their
         // size is not restricted to within the terminal view.
