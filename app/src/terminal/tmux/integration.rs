@@ -23,6 +23,7 @@
 use sha2::{Digest, Sha256};
 use warp_terminal::tmux::{CommandReply, PaneId};
 
+use super::plugins::{CURRENT_DIR, PLUGIN_FILE};
 use crate::terminal::model::session::SessionId;
 use crate::terminal::shell::ShellType;
 
@@ -309,11 +310,14 @@ pub enum NewPanePlan {
 }
 
 /// Plans a pane that appeared after attach. `plain_clients` is `None` when the client list could
-/// not be read, which counts as shared.
+/// not be read, which counts as shared. With Warp's tmux plugin loaded (`plugin`), tmux starts
+/// new panes through the launcher itself, so Warp never types into one: a pane that did not
+/// integrate gets R8's action instead.
 pub fn new_pane_plan(
     pane: &PaneFacts,
     token: Option<&str>,
     plain_clients: Option<&[String]>,
+    plugin: bool,
     integrate_panes: bool,
 ) -> NewPanePlan {
     if !integrate_panes {
@@ -324,7 +328,9 @@ pub fn new_pane_plan(
     }
     let availability = warpify_availability(pane.current_command.as_deref(), pane.alternate_on);
     match (availability, plain_clients) {
-        (WarpifyAvailability::Available(shell), Some([])) => NewPanePlan::TypeInit(shell),
+        (WarpifyAvailability::Available(shell), Some([])) if !plugin => {
+            NewPanePlan::TypeInit(shell)
+        }
         (availability, _) => NewPanePlan::Warpify(availability),
     }
 }
@@ -453,7 +459,8 @@ fn read_launcher_path_query(bundle: &LauncherBundle) -> String {
 }
 
 /// A shell script that, if `dir` holds exactly the bundle, records the launcher's absolute path
-/// in the bundle's option.
+/// in the bundle's option and points the stable [`CURRENT_DIR`] link at it, where the tmux
+/// plugin finds the launcher whichever Warp version installed it.
 fn verify_script(bundle: &LauncherBundle, dir: &str) -> String {
     let files = bundle
         .files()
@@ -463,9 +470,11 @@ fn verify_script(bundle: &LauncherBundle, dir: &str) -> String {
         .join(" ");
     format!(
         "cd \"{dir}\" 2>/dev/null && [ \"$(cat {files} 2>/dev/null | {SHA256_COMMAND} | cut -c1-64)\" = {sum} ] \
-         && tmux set-option -g {option} \"$(pwd -P)/{LAUNCHER_FILE}\"",
+         && tmux set-option -g {option} \"$(pwd -P)/{LAUNCHER_FILE}\" \
+         && ln -sfn {version} \"$HOME/{INSTALL_ROOT}/{CURRENT_DIR}\"",
         sum = bundle.checksum(),
         option = bundle.launcher_option(),
+        version = bundle.version(),
     )
 }
 
@@ -561,6 +570,11 @@ pub fn launcher_bundle(assets: &dyn warpui::AssetProvider) -> LauncherBundle {
             executable: true,
         },
         BundleFile {
+            path: PLUGIN_FILE,
+            contents: asset("warp.tmux"),
+            executable: true,
+        },
+        BundleFile {
             path: "zsh/.zshenv",
             contents: asset("zshenv"),
             executable: false,
@@ -612,6 +626,7 @@ pub fn install_locally(
 
     let dir = home.join(bundle.install_dir());
     if local_install_verifies(bundle, &dir) {
+        link_current(bundle, home);
         return Ok(dir.join(LAUNCHER_FILE));
     }
     let staging = home.join(format!(
@@ -636,6 +651,7 @@ pub fn install_locally(
     }
     let _ = fs::remove_dir_all(&staging);
     if local_install_verifies(bundle, &dir) {
+        link_current(bundle, home);
         Ok(dir.join(LAUNCHER_FILE))
     } else {
         Err(Error::new(
@@ -644,6 +660,32 @@ pub fn install_locally(
         ))
     }
 }
+
+/// Points `~/.cache/warp/tmux/current` at `bundle`'s install, replacing the link in one step.
+/// The plugin works without it (it then does nothing), so a failure is only logged.
+#[cfg(all(unix, not(target_family = "wasm")))]
+fn link_current(bundle: &LauncherBundle, home: &std::path::Path) {
+    let root = home.join(INSTALL_ROOT);
+    let link = root.join(CURRENT_DIR);
+    if std::fs::read_link(&link).is_ok_and(|target| target.as_os_str() == bundle.version().as_str())
+    {
+        return;
+    }
+    let staging = root.join(format!("{CURRENT_DIR}.part-{}", std::process::id()));
+    let _ = std::fs::remove_file(&staging);
+    let linked = std::os::unix::fs::symlink(bundle.version(), &staging)
+        .and_then(|()| std::fs::rename(&staging, &link));
+    if let Err(error) = linked {
+        let _ = std::fs::remove_file(&staging);
+        log::warn!(
+            "tmux: could not point {} at the launcher: {error}",
+            link.display()
+        );
+    }
+}
+
+#[cfg(all(not(unix), not(target_family = "wasm")))]
+fn link_current(_bundle: &LauncherBundle, _home: &std::path::Path) {}
 
 #[cfg(not(target_family = "wasm"))]
 fn local_install_verifies(bundle: &LauncherBundle, dir: &std::path::Path) -> bool {
@@ -664,4 +706,4 @@ pub use app_model::*;
 
 #[cfg(test)]
 #[path = "integration_tests.rs"]
-mod tests;
+pub(crate) mod tests;

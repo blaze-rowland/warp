@@ -4,7 +4,10 @@
 //! server's host, and lists the session's panes. Each tmux pane's model gets its derived session
 //! id registered before its output is parsed. Panes that existed at attach are planned with
 //! [`existing_pane_plan`]; panes that appear later wait until they first go idle and are planned
-//! with [`new_pane_plan`].
+//! with [`new_pane_plan`], which never types into a pane while Warp's tmux plugin is loaded.
+//!
+//! It also runs tmux-continuum's autosave while Warp is the only client (KTD11; see
+//! [`crate::terminal::tmux::plugins`]).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Weak};
@@ -26,6 +29,9 @@ use super::{
 use crate::terminal::TerminalModel;
 use crate::terminal::TerminalView;
 use crate::terminal::tmux::TmuxOriginId;
+use crate::terminal::tmux::plugins::{
+    AUTOSAVE_TICK, CONTINUUM_QUERY, autosave_due, parse_continuum, parse_plugin, plugin_query,
+};
 use crate::terminal::tmux::popup::TmuxPopups;
 use crate::terminal::tmux::settings::TmuxSettings;
 use crate::terminal::tmux::workspace_sync::{TmuxSessionEvent, TmuxSessions};
@@ -70,6 +76,10 @@ struct OriginState {
     held_queues: Vec<ConnectQueue>,
     /// New panes being watched for their first idle moment.
     watching: HashSet<PaneId>,
+    /// Warp's tmux plugin was loaded at attach (re-read before each new pane is planned).
+    plugin: bool,
+    /// The running continuum autosave loop, by generation; a new attach starts a new one.
+    autosave: Option<u64>,
 }
 
 /// See the module docs.
@@ -78,6 +88,8 @@ pub struct TmuxIntegration {
     origins: HashMap<TmuxOriginId, OriginState>,
     /// The launcher installed on this machine, once tried.
     local_launcher: Option<Option<String>>,
+    /// The last autosave loop generation handed out.
+    autosave_generation: u64,
 }
 
 impl Entity for TmuxIntegration {
@@ -95,6 +107,7 @@ impl TmuxIntegration {
             bundle: None,
             origins: HashMap::new(),
             local_launcher: None,
+            autosave_generation: 0,
         }
     }
 
@@ -225,6 +238,11 @@ impl TmuxIntegration {
         // A session switch lists the new session's panes again.
         state.listed = false;
         state.existing.clear();
+        state.autosave = None;
+        self.start_autosave(origin, ctx);
+        let Some(state) = self.origins.get_mut(&origin) else {
+            return;
+        };
         if !TmuxSettings::as_ref(ctx).integrate_panes_enabled() {
             state.token_known = true;
             self.release_queues(origin, ctx);
@@ -238,6 +256,19 @@ impl TmuxIntegration {
             Some(Box::new(move |reply, ctx| {
                 let token = parse_token(reply);
                 Self::handle(ctx).update(ctx, |me, ctx| me.on_token(origin, token, ctx));
+            })),
+            ctx,
+        );
+        send(
+            origin,
+            plugin_query(),
+            Some(Box::new(move |reply, ctx| {
+                let plugin = parse_plugin(reply);
+                Self::handle(ctx).update(ctx, |me, _| {
+                    if let Some(state) = me.origins.get_mut(&origin) {
+                        state.plugin = plugin;
+                    }
+                });
             })),
             ctx,
         );
@@ -468,6 +499,20 @@ impl TmuxIntegration {
             })),
             ctx,
         );
+        // The plugin may have been loaded since attach (`tmux source ~/.tmux.conf`).
+        send(
+            origin,
+            plugin_query(),
+            Some(Box::new(move |reply, ctx| {
+                let plugin = parse_plugin(reply);
+                Self::handle(ctx).update(ctx, |me, _| {
+                    if let Some(state) = me.origins.get_mut(&origin) {
+                        state.plugin = plugin;
+                    }
+                });
+            })),
+            ctx,
+        );
         send(
             origin,
             LIST_CLIENTS_QUERY.to_owned(),
@@ -513,7 +558,13 @@ impl TmuxIntegration {
         else {
             return;
         };
-        let plan = new_pane_plan(&pane, state.token.as_deref(), clients.as_deref(), integrate);
+        let plan = new_pane_plan(
+            &pane,
+            state.token.as_deref(),
+            clients.as_deref(),
+            state.plugin,
+            integrate,
+        );
         log::debug!("tmux: new pane {pane_id} on {origin:?}: {plan:?}");
         match plan {
             NewPanePlan::Off | NewPanePlan::Launcher => {}
@@ -526,6 +577,95 @@ impl TmuxIntegration {
                 });
             }
         }
+    }
+
+    /// Starts continuum's autosave for `origin` if continuum is set up on its server (KTD11).
+    fn start_autosave(&mut self, origin: TmuxOriginId, ctx: &mut ModelContext<Self>) {
+        self.autosave_generation += 1;
+        let generation = self.autosave_generation;
+        send(
+            origin,
+            CONTINUUM_QUERY.to_owned(),
+            Some(Box::new(move |reply, ctx| {
+                let configured = parse_continuum(reply).is_some();
+                Self::handle(ctx).update(ctx, |me, ctx| {
+                    let Some(state) = me.origins.get_mut(&origin) else {
+                        return;
+                    };
+                    if configured && state.autosave.is_none() {
+                        log::info!("tmux: running continuum's autosave on {origin:?}");
+                        state.autosave = Some(generation);
+                        me.schedule_autosave(origin, generation, ctx);
+                    }
+                });
+            })),
+            ctx,
+        );
+    }
+
+    fn schedule_autosave(
+        &mut self,
+        origin: TmuxOriginId,
+        generation: u64,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let _ = ctx.spawn(Timer::after(AUTOSAVE_TICK), move |me, _, ctx| {
+            me.autosave_tick(origin, generation, ctx);
+        });
+    }
+
+    /// One autosave tick: re-reads continuum's settings and the clients, and runs the save when
+    /// it is due and no plain client is attached. Stops when the session ended, a new attach
+    /// started another loop, or continuum was turned off.
+    fn autosave_tick(
+        &mut self,
+        origin: TmuxOriginId,
+        generation: u64,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let running = self
+            .origins
+            .get(&origin)
+            .is_some_and(|state| state.autosave == Some(generation));
+        if !running {
+            return;
+        }
+        let config: Arc<Mutex<Option<CommandReply>>> = Arc::default();
+        let config_slot = config.clone();
+        send(
+            origin,
+            CONTINUUM_QUERY.to_owned(),
+            Some(Box::new(move |reply, _| {
+                *config_slot.lock() = Some(reply.clone());
+            })),
+            ctx,
+        );
+        send(
+            origin,
+            LIST_CLIENTS_QUERY.to_owned(),
+            Some(Box::new(move |reply, ctx| {
+                let clients = plain_clients(reply);
+                let autosave = config.lock().take().as_ref().and_then(parse_continuum);
+                Self::handle(ctx).update(ctx, |me, ctx| {
+                    let Some(state) = me.origins.get_mut(&origin) else {
+                        return;
+                    };
+                    if state.autosave != Some(generation) {
+                        return;
+                    }
+                    let Some(autosave) = autosave else {
+                        log::info!("tmux: continuum is off on {origin:?}; autosave stopped");
+                        state.autosave = None;
+                        return;
+                    };
+                    if autosave_due(clients.as_deref()) {
+                        send(origin, autosave.save_command(), None, ctx);
+                    }
+                    me.schedule_autosave(origin, generation, ctx);
+                });
+            })),
+            ctx,
+        );
     }
 
     /// "Warpify this pane": reads the pane and the attached clients, then asks before typing.

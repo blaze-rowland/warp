@@ -404,7 +404,7 @@ fn helper_less_host_gets_the_launcher_over_the_control_channel() {
         current_command: Some("bash".to_owned()),
     };
     assert_eq!(
-        new_pane_plan(&pane, Some(token), Some(&[]), true),
+        new_pane_plan(&pane, Some(token), Some(&[]), false, true),
         NewPanePlan::Launcher
     );
 

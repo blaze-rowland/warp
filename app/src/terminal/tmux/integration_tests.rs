@@ -9,7 +9,7 @@ use warp_terminal::tmux::{CommandReply, PaneId};
 
 use super::*;
 
-fn reply(lines: &[&str]) -> CommandReply {
+pub(crate) fn reply(lines: &[&str]) -> CommandReply {
     CommandReply {
         time: 0,
         number: 0,
@@ -269,12 +269,18 @@ fn with_integration_off_existing_panes_stay_plain() {
 fn a_shared_session_never_gets_typed_into() {
     let clients = ["/dev/ttys004".to_owned()];
     assert_eq!(
-        new_pane_plan(&facts("bash", false), Some(TOKEN), Some(&clients), true),
+        new_pane_plan(
+            &facts("bash", false),
+            Some(TOKEN),
+            Some(&clients),
+            false,
+            true
+        ),
         NewPanePlan::Warpify(WarpifyAvailability::Available(ShellType::Bash))
     );
     // Unknown clients count as shared.
     assert_eq!(
-        new_pane_plan(&facts("bash", false), Some(TOKEN), None, true),
+        new_pane_plan(&facts("bash", false), Some(TOKEN), None, false, true),
         NewPanePlan::Warpify(WarpifyAvailability::Available(ShellType::Bash))
     );
 }
@@ -283,12 +289,12 @@ fn a_shared_session_never_gets_typed_into() {
 #[test]
 fn warp_alone_types_the_init_command_into_a_new_shell_pane() {
     assert_eq!(
-        new_pane_plan(&facts("zsh", false), Some(TOKEN), Some(&[]), true),
+        new_pane_plan(&facts("zsh", false), Some(TOKEN), Some(&[]), false, true),
         NewPanePlan::TypeInit(ShellType::Zsh)
     );
     // Before the token is known too: typing registers its own session id.
     assert_eq!(
-        new_pane_plan(&facts("fish", false), None, Some(&[]), true),
+        new_pane_plan(&facts("fish", false), None, Some(&[]), false, true),
         NewPanePlan::TypeInit(ShellType::Fish)
     );
 }
@@ -297,11 +303,11 @@ fn warp_alone_types_the_init_command_into_a_new_shell_pane() {
 #[test]
 fn a_program_pane_is_not_injected() {
     assert!(matches!(
-        new_pane_plan(&facts("htop", true), Some(TOKEN), Some(&[]), true),
+        new_pane_plan(&facts("htop", true), Some(TOKEN), Some(&[]), false, true),
         NewPanePlan::Warpify(WarpifyAvailability::Unavailable(_))
     ));
     assert!(matches!(
-        new_pane_plan(&facts("zsh", true), Some(TOKEN), Some(&[]), true),
+        new_pane_plan(&facts("zsh", true), Some(TOKEN), Some(&[]), false, true),
         NewPanePlan::Warpify(WarpifyAvailability::Unavailable(_))
     ));
 }
@@ -309,7 +315,7 @@ fn a_program_pane_is_not_injected() {
 #[test]
 fn a_launcher_pane_is_left_to_the_launcher() {
     assert_eq!(
-        new_pane_plan(&launcher_facts(TOKEN), Some(TOKEN), Some(&[]), true),
+        new_pane_plan(&launcher_facts(TOKEN), Some(TOKEN), Some(&[]), false, true),
         NewPanePlan::Launcher
     );
 }
@@ -321,11 +327,11 @@ fn a_launcher_pane_is_left_to_the_launcher() {
 fn a_default_shell_split_follows_the_typed_path_conditions() {
     let split = facts("zsh", false);
     assert_eq!(
-        new_pane_plan(&split, Some(TOKEN), Some(&[]), true),
+        new_pane_plan(&split, Some(TOKEN), Some(&[]), false, true),
         NewPanePlan::TypeInit(ShellType::Zsh)
     );
     assert!(matches!(
-        new_pane_plan(&split, Some(TOKEN), Some(&["tty".to_owned()]), true),
+        new_pane_plan(&split, Some(TOKEN), Some(&["tty".to_owned()]), false, true),
         NewPanePlan::Warpify(_)
     ));
 }
@@ -333,7 +339,7 @@ fn a_default_shell_split_follows_the_typed_path_conditions() {
 #[test]
 fn with_integration_off_nothing_is_typed() {
     assert_eq!(
-        new_pane_plan(&facts("zsh", false), Some(TOKEN), Some(&[]), false),
+        new_pane_plan(&facts("zsh", false), Some(TOKEN), Some(&[]), false, false),
         NewPanePlan::Off
     );
 }
@@ -390,6 +396,7 @@ fn the_bundle_holds_the_launcher_and_every_shells_bootstrap() {
         [
             LAUNCHER_FILE,
             WRAPPER_FILE,
+            PLUGIN_FILE,
             "zsh/.zshenv",
             "init.zsh",
             "init.bash",
@@ -434,6 +441,12 @@ fn a_local_install_verifies_and_is_reused() {
     let path = install_locally(&bundle, home.path()).unwrap();
     assert!(path.ends_with(LAUNCHER_FILE));
     assert!(path.starts_with(home.path().join(INSTALL_ROOT)));
+    // The plugin's stable path points at it.
+    let current = home.path().join(INSTALL_ROOT).join(CURRENT_DIR);
+    assert_eq!(
+        std::fs::read_link(&current).unwrap(),
+        PathBuf::from(bundle.version())
+    );
     // A second install finds it in place.
     assert_eq!(install_locally(&bundle, home.path()).unwrap(), path);
     // A tampered install is replaced... unless it is in place, in which case it fails closed.
@@ -444,14 +457,20 @@ fn a_local_install_verifies_and_is_reused() {
 // Live tests against a real tmux on an isolated socket. Each starts its own server with
 // `-f /dev/null` and a temporary $HOME, and kills it afterwards; the user's tmux is never touched.
 
-struct LiveTmux {
-    socket: String,
+pub(crate) struct LiveTmux {
+    pub(crate) socket: String,
     home: tempfile::TempDir,
 }
 
 impl LiveTmux {
     /// `None` (the test is skipped) without tmux 3.2 or newer.
     fn start(name: &str) -> Option<Self> {
+        Self::start_with_prefix("warp-u9", name)
+    }
+
+    /// A server on the socket `<prefix>-<pid>-<name>`. `prefix` must start with `warp-u`.
+    pub(crate) fn start_with_prefix(prefix: &str, name: &str) -> Option<Self> {
+        assert!(prefix.starts_with("warp-u"), "{prefix}");
         let version = Command::new("tmux").arg("-V").output().ok()?;
         let version = String::from_utf8_lossy(&version.stdout).to_string();
         let number: f32 = version
@@ -465,7 +484,7 @@ impl LiveTmux {
             return None;
         }
         let tmux = Self {
-            socket: format!("warp-u9-{}-{name}", std::process::id()),
+            socket: format!("{prefix}-{}-{name}", std::process::id()),
             home: tempfile::tempdir().ok()?,
         };
         std::fs::write(tmux.home.path().join(".zshrc"), "PS1='u9z> '\n").ok()?;
@@ -496,11 +515,11 @@ impl LiveTmux {
         Some(tmux)
     }
 
-    fn home(&self) -> &Path {
+    pub(crate) fn home(&self) -> &Path {
         self.home.path()
     }
 
-    fn command(&self) -> Command {
+    pub(crate) fn command(&self) -> Command {
         let mut command = Command::new("tmux");
         command
             .args(["-L", &self.socket, "-f", "/dev/null"])
@@ -510,15 +529,15 @@ impl LiveTmux {
         command
     }
 
-    fn run(&self, args: &[&str]) -> Output {
+    pub(crate) fn run(&self, args: &[&str]) -> Output {
         self.command().args(args).output().expect("tmux runs")
     }
 
-    fn stdout(&self, args: &[&str]) -> String {
+    pub(crate) fn stdout(&self, args: &[&str]) -> String {
         String::from_utf8_lossy(&self.run(args).stdout).to_string()
     }
 
-    fn reply(&self, args: &[&str]) -> CommandReply {
+    pub(crate) fn reply(&self, args: &[&str]) -> CommandReply {
         let output = self.run(args);
         CommandReply {
             error: !output.status.success(),
@@ -532,7 +551,7 @@ impl LiveTmux {
 
     /// Runs command lines as Warp sends them over the control channel. `source-file` parses
     /// them with the same command parser.
-    fn run_lines(&self, lines: &[String]) {
+    pub(crate) fn run_lines(&self, lines: &[String]) {
         let file = self.home.path().join("commands.tmux");
         std::fs::write(&file, lines.join("\n")).unwrap();
         let output = self.run(&["source-file", file.to_str().unwrap()]);
@@ -546,7 +565,7 @@ impl LiveTmux {
     }
 
     /// Installs the launcher the way Warp does over the control channel. Returns its path.
-    fn install(&self) -> Option<String> {
+    pub(crate) fn install(&self) -> Option<String> {
         let bundle = bundle();
         let [check, read] = install_check_commands(&bundle);
         self.run_lines(&[check]);
@@ -559,7 +578,7 @@ impl LiveTmux {
         parse_launcher_path(&self.reply(&split_args(&read)))
     }
 
-    fn set_token(&self) -> String {
+    pub(crate) fn set_token(&self) -> String {
         let token = new_hook_token();
         self.run_lines(&[ensure_token_command(&token)]);
         parse_token(&self.reply(&split_args(&read_token_query()))).expect("token set")
@@ -593,11 +612,11 @@ impl LiveTmux {
     }
 
     /// What a plain client sees in `pane`: its text, without escape sequences.
-    fn plain_view(&self, pane: PaneId) -> String {
+    pub(crate) fn plain_view(&self, pane: PaneId) -> String {
         self.stdout(&["capture-pane", "-p", "-t", &pane.to_string()])
     }
 
-    fn wait_for(&self, what: &str, mut done: impl FnMut() -> bool) {
+    pub(crate) fn wait_for(&self, what: &str, mut done: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
             if done() {
@@ -614,7 +633,7 @@ impl Drop for LiveTmux {
         let socket = self.stdout(&["display-message", "-p", "#{socket_path}"]);
         let _ = self.command().arg("kill-server").output();
         let socket = socket.trim();
-        if socket.contains("warp-u9-") {
+        if socket.contains("/warp-u") {
             let _ = std::fs::remove_file(socket);
         }
     }
@@ -622,12 +641,12 @@ impl Drop for LiveTmux {
 
 /// Splits a single-line tmux command built here into arguments for the tmux CLI. The commands
 /// split this way quote only single words.
-fn split_args(line: &str) -> Vec<&str> {
+pub(crate) fn split_args(line: &str) -> Vec<&str> {
     line.split(' ').map(|arg| arg.trim_matches('\'')).collect()
 }
 
 /// The JSON of each Warp hook in raw pane output.
-fn hooks(raw: &[u8]) -> Vec<serde_json::Value> {
+pub(crate) fn hooks(raw: &[u8]) -> Vec<serde_json::Value> {
     let mut hooks = Vec::new();
     let mut rest = raw;
     while let Some(start) = find(rest, b"\x1bP$d") {
@@ -651,7 +670,7 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-fn hook_names(hooks: &[serde_json::Value]) -> Vec<String> {
+pub(crate) fn hook_names(hooks: &[serde_json::Value]) -> Vec<String> {
     hooks
         .iter()
         .filter_map(|hook| hook["hook"].as_str().map(str::to_owned))
@@ -659,7 +678,7 @@ fn hook_names(hooks: &[serde_json::Value]) -> Vec<String> {
 }
 
 /// Text Warp's integration must never put on a plain client's screen.
-fn assert_no_debris(view: &str) {
+pub(crate) fn assert_no_debris(view: &str) {
     for debris in [
         "9278",
         "P$",
@@ -867,7 +886,7 @@ fn live_a_plain_clients_split_gets_warpify_and_no_typing() {
 
     let clients = plain_clients(&tmux.reply(&split_args(LIST_CLIENTS_QUERY)));
     let facts = parse_pane_facts(&tmux.reply(&split_args(&pane_facts_query(pane))));
-    let plan = new_pane_plan(&facts[0], Some(&token), clients.as_deref(), true);
+    let plan = new_pane_plan(&facts[0], Some(&token), clients.as_deref(), false, true);
     assert_eq!(
         plan,
         NewPanePlan::Warpify(WarpifyAvailability::Available(ShellType::Bash))
@@ -882,7 +901,7 @@ fn live_a_plain_clients_split_gets_warpify_and_no_typing() {
     let _ = plain.wait();
 }
 
-fn which(program: &str) -> Option<String> {
+pub(crate) fn which(program: &str) -> Option<String> {
     let output = Command::new("/bin/sh")
         .arg("-c")
         .arg(format!("command -v {program}"))
@@ -893,7 +912,7 @@ fn which(program: &str) -> Option<String> {
 }
 
 /// `tmux attach` on a pseudo-terminal from `script` (BSD or util-linux syntax).
-fn attach_plain_client(tmux: &LiveTmux) -> Option<std::process::Child> {
+pub(crate) fn attach_plain_client(tmux: &LiveTmux) -> Option<std::process::Child> {
     let attach = format!("tmux -L {} -f /dev/null attach -t s", tmux.socket);
     let mut command = Command::new("script");
     if cfg!(target_os = "macos") {

@@ -16,6 +16,7 @@ pub mod native_ui;
 pub mod pane_event_loop;
 #[cfg(feature = "local_tty")]
 pub mod pane_manager;
+pub mod plugins;
 pub mod popup;
 #[cfg(feature = "local_tty")]
 pub mod remote;

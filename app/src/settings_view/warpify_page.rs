@@ -31,6 +31,7 @@ use crate::appearance::Appearance;
 use crate::send_telemetry_from_ctx;
 use crate::server::telemetry::TelemetryEvent;
 use crate::settings::{ReuseExistingSshControlMaster, SshSettings};
+use crate::terminal::tmux::plugins::{plugin_install_line, plugin_install_text};
 use crate::terminal::tmux::settings::{TmuxControlModeSetting, TmuxSettings, TmuxToggle};
 use crate::terminal::warpify::settings::{
     EnableSshWarpification, SshExtensionInstallMode, SshExtensionInstallModeSetting,
@@ -409,6 +410,8 @@ pub enum WarpifyPageAction {
     SetSshExtensionInstallMode(SshExtensionInstallMode),
     /// Toggles one of the tmux control mode settings.
     ToggleTmuxSetting(TmuxToggle),
+    /// Copies the line that loads Warp's tmux plugin.
+    CopyTmuxPluginLine,
     OpenUrl(String),
 }
 
@@ -484,6 +487,12 @@ impl TypedActionView for WarpifyPageView {
                 TmuxSettings::handle(ctx).update(ctx, |tmux_settings, ctx| {
                     report_if_error!(toggle.toggle(tmux_settings, ctx));
                 });
+            }
+            CopyTmuxPluginLine => {
+                ctx.clipboard()
+                    .write(warpui::clipboard::ClipboardContent::plain_text(
+                        plugin_install_line(),
+                    ));
             }
             OpenUrl(url) => {
                 ctx.open_url(url.as_str());
@@ -789,6 +798,7 @@ impl SettingsWidget for SSHWidget {
 #[derive(Default)]
 struct TmuxWidget {
     switch_states: [SwitchStateHandle; 4],
+    copy_plugin_line_mouse_state: MouseStateHandle,
     local_only_icon_tooltip_states: RefCell<HashMap<String, MouseStateHandle>>,
 }
 
@@ -796,7 +806,7 @@ impl SettingsWidget for TmuxWidget {
     type View = WarpifyPageView;
 
     fn search_terms(&self) -> &str {
-        "tmux control mode native sessions panes key bindings warpify"
+        "tmux control mode native sessions panes key bindings warpify plugin resurrect continuum"
     }
 
     fn render(
@@ -838,6 +848,24 @@ impl SettingsWidget for TmuxWidget {
                 Some(toggle.page_description().to_owned()),
             ));
         }
+
+        // R9: the plugin that makes shells tmux starts on its own Warp-ready.
+        let plugin_interactive = master_on && *tmux_settings.integrate_panes.value();
+        column.add_child(render_body_item::<WarpifyPageAction>(
+            "tmux plugin".to_owned(),
+            None,
+            LocalOnlyIconState::Hidden,
+            plugin_interactive.into(),
+            appearance,
+            ui_builder
+                .copy_button(16., self.copy_plugin_line_mouse_state.clone())
+                .build()
+                .on_click(|ctx, _, _| {
+                    ctx.dispatch_typed_action(WarpifyPageAction::CopyTmuxPluginLine);
+                })
+                .finish(),
+            Some(plugin_install_text()),
+        ));
 
         Container::new(column.finish())
             .with_margin_bottom(ITEM_VERTICAL_SPACING)

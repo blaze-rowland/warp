@@ -14,8 +14,8 @@ use super::{
     GLOBAL_PATH_QUERY, HiddenPopupChange, HiddenPopupWatch, PopupSpec, PopupWindow,
     bound_popup_command, close_popup_command, hidden_popup_text, hidden_popups, parse_clients,
     parse_global_path, parse_pane_pids, parse_probe, parse_window_id, path_with_wrapper,
-    path_without_wrapper, popup_window_options_command, popup_windows, probe_commands,
-    set_global_path_command, wrapper_dir,
+    popup_window_options_command, popup_windows, probe_commands, set_global_path_command,
+    wrapper_dir,
 };
 use crate::terminal::tmux::TmuxOriginId;
 use crate::terminal::tmux::gateway::TmuxGateways;
@@ -116,7 +116,10 @@ impl TmuxPopups {
                 if with_wrapper != path {
                     send(origin, set_global_path_command(&with_wrapper), None, ctx);
                 }
-                let restore = set_global_path_command(&path_without_wrapper(&path));
+                // The plugin's own wrapper directory stays: the plugin keeps it while loaded.
+                let restore = set_global_path_command(
+                    &crate::terminal::tmux::plugins::path_after_detach(&path),
+                );
                 TmuxKeyRouter::handle(ctx).update(ctx, |router, ctx| {
                     router.set_extra_detach_commands(origin, vec![restore], ctx);
                 });
