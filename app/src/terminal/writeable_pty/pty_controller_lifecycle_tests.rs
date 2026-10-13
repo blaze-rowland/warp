@@ -265,3 +265,43 @@ fn rejected_queued_in_band_start_is_cancelled_without_writing_bytes() {
         drop(model_events_tx);
     });
 }
+
+#[test]
+fn a_tmux_pane_never_sends_the_prompt_mode_keys() {
+    App::test((), |mut app| async move {
+        let (model_events_tx, model_events_rx) = async_channel::unbounded();
+        let (_executor_command_tx, executor_command_rx) = async_channel::unbounded();
+        let sessions = app.add_model(|_| Sessions::new_for_test());
+        let model_events =
+            app.add_model(|ctx| ModelEventDispatcher::new(model_events_rx, sessions.clone(), ctx));
+        let line_editor_status =
+            app.add_model(|ctx| LineEditorStatus::new(model_events.clone(), sessions.clone(), ctx));
+        let sender = TestEventLoopSender::default();
+        let controller = app.add_model(|ctx| {
+            PtyController::new(
+                sender.clone(),
+                model_events,
+                line_editor_status,
+                sessions,
+                executor_command_rx,
+                terminal_model(),
+                ctx,
+            )
+        });
+
+        // A marker-only pane binds neither ESC-p nor ESC-w; in the user's own line editor they
+        // are history-search keys, so Warp must not type them (R10).
+        controller.update(&mut app, |controller, ctx| {
+            controller.set_is_tmux_pane();
+            controller.send_switch_to_ps1_bindkey(ctx);
+            controller.send_switch_to_warp_prompt_bindkey(ctx);
+        });
+
+        assert!(sender.messages.lock().is_empty());
+        controller.read(&app, |controller, _| {
+            assert!(controller.pending_writes.is_empty());
+        });
+
+        drop(model_events_tx);
+    });
+}

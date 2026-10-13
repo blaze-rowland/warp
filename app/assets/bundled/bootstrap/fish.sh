@@ -357,21 +357,27 @@ function warp_precmd --on-event fish_prompt --on-event fish_posterror
         return 0
     end
 
-    # Fish's vi mode causes a conflict with the input reporting binding.
-    # Set the bindings back for this session. Note that just calling fish_default_key_bindings
-    # affects other sessions so we do it this way instead.
-    set -g fish_key_bindings fish_default_key_bindings
+    # Warp's key bindings below are skipped in a tmux pane (marker-only mode): plain tmux
+    # clients type into the user's own line editor there, so the user's key binding mode and
+    # Ctrl-P, ESC-i, ESC-p and ESC-w stay theirs. Warp clears the line there with the default
+    # Ctrl-E Ctrl-U and never sends the other keys.
+    if not set -q WARP_TMUX_MARKER_ONLY
+        # Fish's vi mode causes a conflict with the input reporting binding.
+        # Set the bindings back for this session. Note that just calling fish_default_key_bindings
+        # affects other sessions so we do it this way instead.
+        set -g fish_key_bindings fish_default_key_bindings
 
-    # Do not use kill-line because of the kill ring interation.
-    bind \cP "commandline ''"
+        # Do not use kill-line because of the kill ring interation.
+        bind \cP "commandline ''"
 
-    # We use the ESC-p bindkey for this ("p" for PS1/custom prompt).
-    bind \ep warp_change_prompt_modes_to_ps1
+        # We use the ESC-p bindkey for this ("p" for PS1/custom prompt).
+        bind \ep warp_change_prompt_modes_to_ps1
 
-    # We use the ESC-w bindkey for this ("w" for Warp prompt).
-    bind \ew warp_change_prompt_modes_to_warp_prompt
+        # We use the ESC-w bindkey for this ("w" for Warp prompt).
+        bind \ew warp_change_prompt_modes_to_warp_prompt
 
-    bind \ei warp_report_input
+        bind \ei warp_report_input
+    end
 
     # Define local variables in appropriate outer block for fish variable scoping.
     # See https://stackoverflow.com/a/53685510.

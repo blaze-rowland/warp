@@ -669,29 +669,35 @@ if [ -z "$WARP_BOOTSTRAPPED" ]; then
         # Flush history
         history -a
 
-        # Reset the custom kill-whole-line binding as the user's bashrc (which is sourced after bashrc_warp)
-        # could have added another bind. This won't have any user-impact because these shortcuts are only run
-        # in the context of the bash editor, which isn't displayed in Warp.
-        bind -r '"\C-p"'
-        bind "\C-p":kill-whole-line
+        # Warp's key bindings below are skipped in a tmux pane (marker-only mode): plain tmux
+        # clients type into the user's own line editor there, so Ctrl-P, ESC-i, ESC-p and ESC-w
+        # must keep the user's bindings. Warp clears the line there with the default Ctrl-E
+        # Ctrl-U and never sends the other keys.
+        if [[ -z "${WARP_TMUX_MARKER_ONLY:-}" ]]; then
+          # Reset the custom kill-whole-line binding as the user's bashrc (which is sourced after bashrc_warp)
+          # could have added another bind. This won't have any user-impact because these shortcuts are only run
+          # in the context of the bash editor, which isn't displayed in Warp.
+          bind -r '"\C-p"'
+          bind "\C-p":kill-whole-line
 
-        # Reset the report-input binding in case the user's bashrc modified it.
-        # This is arbitrarily bound to ESC-i in all supported shells ("i" for input).
-        if [[ $WARP_INPUT_REPORTING_SUPPORTED == "1" ]]; then
-          bind -r '"\ei"'
-          bind -x '"\ei":"warp_report_input"'
+          # Reset the report-input binding in case the user's bashrc modified it.
+          # This is arbitrarily bound to ESC-i in all supported shells ("i" for input).
+          if [[ $WARP_INPUT_REPORTING_SUPPORTED == "1" ]]; then
+            bind -r '"\ei"'
+            bind -x '"\ei":"warp_report_input"'
+          fi
+
+          # We need to register bindkeys to enable intra-session switching of the prompt
+          # (these bindkeys are used by Warp to communicate the prompt mode switch to bash).
+          # We remove any existing bindkey for ESC-P ("p" for prompt/PS1) and register the bindkey
+          # to our custom function. Note that this specific keybinding is arbitrary.
+          bind -r '"\ep"'
+          bind -x '"\ep":"warp_change_prompt_modes_to_ps1"'
+          # We remove any existing bindkey for ESC-P ("w" for Warp prompt) and register the bindkey
+          # to our custom function. Note that this specific keybinding is arbitrary.
+          bind -r '"\ew"'
+          bind -x '"\ew":"warp_change_prompt_modes_to_warp_prompt"'
         fi
-        
-        # We need to register bindkeys to enable intra-session switching of the prompt 
-        # (these bindkeys are used by Warp to communicate the prompt mode switch to bash).
-        # We remove any existing bindkey for ESC-P ("p" for prompt/PS1) and register the bindkey
-        # to our custom function. Note that this specific keybinding is arbitrary.
-        bind -r '"\ep"'
-        bind -x '"\ep":"warp_change_prompt_modes_to_ps1"'
-        # We remove any existing bindkey for ESC-P ("w" for Warp prompt) and register the bindkey
-        # to our custom function. Note that this specific keybinding is arbitrary.
-        bind -r '"\ew"'
-        bind -x '"\ew":"warp_change_prompt_modes_to_warp_prompt"'
 
         local escaped_pwd
         if [ "$WARP_IN_MSYS2" = false ]; then

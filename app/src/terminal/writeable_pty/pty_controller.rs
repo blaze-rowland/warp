@@ -38,6 +38,12 @@ const SWITCH_TO_PS1_ESCAPE_SEQUENCE: &[u8] = &[escape_sequences::C0::ESC, b'p'];
 /// Used to let the shell know we are switching to the Warp prompt via a bindkey \ew. This will
 /// unset the PS1 to ensure we don't have a double prompt (PS1 and Warp prompt).
 const SWITCH_TO_WARP_PROMPT_ESCAPE_SEQUENCE: &[u8] = &[escape_sequences::C0::ESC, b'w'];
+/// Clears a partly typed line in a tmux pane before Warp writes a command: Ctrl-E (end of line)
+/// then Ctrl-U (kill back to the line start). The marker-only bootstrap installs no key bindings
+/// (R10), so this uses keys the user's unmodified line editor already has. In bash and zsh emacs
+/// mode and fish (default and vi insert) the pair kills the whole line. In bash and zsh vi insert
+/// mode Ctrl-E self-inserts and Ctrl-U then kills it with everything before the cursor.
+const TMUX_PANE_CLEAR_LINE: &[u8] = &[escape_sequences::C0::ENQ, escape_sequences::C0::NAK];
 
 /// Represents a single call to write bytes to the PTY asynchronously.
 enum PtyWrite {
@@ -91,7 +97,9 @@ pub struct PtyController<T: EventLoopSender> {
     /// This controller writes to a tmux pane (U9). A pane's shell sources Warp's bootstrap
     /// through the launcher, so a top-level `InitShell` writes nothing; only a subshell bootstrap
     /// Warp itself typed the init command for gets the bootstrap body. The user's prompt mode is
-    /// left alone, since plain tmux clients see it.
+    /// left alone, since plain tmux clients see it. The marker-only bootstrap binds no keys, so
+    /// commands are preceded by [`TMUX_PANE_CLEAR_LINE`] instead of the kill-buffer binding, and
+    /// the input-reporting and prompt-mode keys are never sent.
     is_tmux_pane: bool,
 }
 
@@ -213,6 +221,10 @@ impl<T: EventLoopSender> PtyController<T> {
     /// Sends bindkey to notify shell process to switch to PS1 logic for prompt
     /// with the combined prompt/command grid (we restore the saved PS1 value).
     pub fn send_switch_to_ps1_bindkey(&mut self, ctx: &mut ModelContext<Self>) {
+        // A tmux pane's shell has no ESC-p binding: it is the user's own key (R10).
+        if self.is_tmux_pane {
+            return;
+        }
         self.pending_writes.push_back(PtyWrite::Bytes {
             bytes: SWITCH_TO_PS1_ESCAPE_SEQUENCE.into(),
         });
@@ -239,6 +251,10 @@ impl<T: EventLoopSender> PtyController<T> {
     /// with the combined prompt/command grid (we unset the PS1, but save the value for potential
     /// future restoration).
     pub fn send_switch_to_warp_prompt_bindkey(&mut self, ctx: &mut ModelContext<Self>) {
+        // A tmux pane's shell has no ESC-w binding: it is the user's own key (R10).
+        if self.is_tmux_pane {
+            return;
+        }
         self.pending_writes.push_back(PtyWrite::Bytes {
             bytes: SWITCH_TO_WARP_PROMPT_ESCAPE_SEQUENCE.into(),
         });
@@ -646,6 +662,7 @@ impl<T: EventLoopSender> PtyController<T> {
                     command.as_str(),
                     shell_type,
                     self.is_bracketed_paste_enabled,
+                    self.is_tmux_pane,
                 )),
                 true,
                 on_write_fn,
@@ -670,6 +687,7 @@ impl<T: EventLoopSender> PtyController<T> {
                         command.as_str(),
                         shell_type,
                         self.is_bracketed_paste_enabled,
+                        self.is_tmux_pane,
                     )),
                     true,
                     Some(
@@ -769,8 +787,8 @@ impl<T: EventLoopSender> Entity for PtyController<T> {
 }
 
 /// Splits `shell_type`'s kill-buffer chord off the front of `bytes` (the output of
-/// `bytes_to_execute_command`, which prepends it), returning `Some((kill_buffer_bytes, rest))`, or
-/// `None` when there is nothing to split.
+/// `bytes_to_execute_command`, which prepends it outside tmux panes), returning
+/// `Some((kill_buffer_bytes, rest))`, or `None` when there is nothing to split.
 ///
 /// Only PowerShell needs this. Its kill-buffer chord is an ESC-prefixed sequence that PSReadLine
 /// can fail to disambiguate when it arrives in the same read as the command text, leaving the
@@ -793,13 +811,24 @@ fn split_kill_buffer_write(bytes: &[u8], shell_type: ShellType) -> Option<(&[u8]
     Some((kill_buffer_bytes, rest))
 }
 
+/// Returns the bytes that clear the shell's line before a command is written: Warp's kill-buffer
+/// binding, or in a tmux pane (whose marker-only bootstrap binds no keys) the default editor's
+/// [`TMUX_PANE_CLEAR_LINE`]. PowerShell has no marker-only mode and keeps its binding.
+fn clear_line_bytes(shell_type: ShellType, is_tmux_pane: bool) -> &'static [u8] {
+    match shell_type {
+        ShellType::Zsh | ShellType::Bash | ShellType::Fish if is_tmux_pane => TMUX_PANE_CLEAR_LINE,
+        _ => shell_type.kill_buffer_bytes(),
+    }
+}
+
 /// Returns the shell-dependent array of bytes to be written to the PTY to execute `command`.
 fn bytes_to_execute_command(
     command: &str,
     shell_type: ShellType,
     is_bracketed_paste_enabled: bool,
+    is_tmux_pane: bool,
 ) -> Vec<u8> {
-    let mut command_bytes = shell_type.kill_buffer_bytes().to_vec();
+    let mut command_bytes = clear_line_bytes(shell_type, is_tmux_pane).to_vec();
     let command = match ShellFamily::from(shell_type) {
         ShellFamily::Posix if cfg!(windows) => LINEFEED_REGEX.replace_all(command, "\n"),
         ShellFamily::PowerShell => LINEFEED_REGEX.replace_all(command, "\r"),
@@ -863,6 +892,9 @@ mod command_bytes_tests;
 #[cfg(test)]
 #[path = "pty_controller_lifecycle_tests.rs"]
 mod lifecycle_tests;
+#[cfg(all(test, unix))]
+#[path = "marker_only_bootstrap_tests.rs"]
+mod marker_only_bootstrap_tests;
 
 #[derive(Error, Debug)]
 pub enum EventLoopSendError {

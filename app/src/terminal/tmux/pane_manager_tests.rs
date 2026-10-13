@@ -317,8 +317,10 @@ fn running_ls_from_the_input_editor_sends_one_send_keys() {
             });
         assert!(outcome.is_accepted());
 
-        // The kill-buffer chord, the command, then the shell's Enter.
-        let expected = [ShellType::Bash.kill_buffer_bytes(), b"ls", b"\n"].concat();
+        // Ctrl-E Ctrl-U (the default editor's clear-line keys, not Warp's Ctrl-P binding, which a
+        // marker-only pane does not install), the command, then the shell's Enter.
+        let expected = [&b"\x05\x15"[..], b"ls", b"\n"].concat();
+        assert!(!expected.contains(&0x10), "no Ctrl-P");
         // The write waits for the line editor, then goes out as one pane input. Warp's own
         // writes (the input-reporting sequence, or a late bootstrap script whose text happens to
         // contain "ls") may surround it; exactly one input is the whole command.

@@ -354,41 +354,47 @@ if [[ -z $WARP_BOOTSTRAPPED ]]; then
           echo "" > $_WARP_GENERATOR_PIDS_COMPLETED_TMP_FILE
         fi
 
-      # Reset the custom kill-buffer binding as the user's zshrc (which is sourced after zshrc_warp)
-      # could have added a bindkey. This won't have any user-impact because these shortcuts are only run
-      # in the context of the zsh line editor, which isn't displayed in Warp.
-      #
-      # We explicitly rebind on every standard keymap (not just "main", which is only a link to
-      # whichever of emacs/viins is currently selected) because a user's rc file can switch editing
-      # modes after we've bound "main" (e.g. `bindkey -v`, as used by the "cursor_mode" zsh function
-      # and by prezto). `bindkey -v` re-links "main" to "viins" and leaves "vicmd" (vi command mode)
-      # bound to its default of up-history. If the active keymap when Warp sends its pre-command ^P
-      # ends up being one we didn't rebind, the clear becomes a no-op and any leftover bootstrap bytes
-      # still sitting in the line editor's buffer get echoed alongside the next command.
-      # See https://github.com/warpdotdev/warp/issues/7099.
-      local warp_keymap
-      for warp_keymap in main emacs viins vicmd; do
-        bindkey -M "$warp_keymap" '^P' warp_kill_buffer_and_reset_insert_mode 2>/dev/null || :
-      done
+      # Warp's key bindings below are skipped in a tmux pane (marker-only mode): plain tmux
+      # clients type into the user's own line editor there, so Ctrl-P, ESC-i, ESC-p and ESC-w
+      # must keep the user's bindings. Warp clears the line there with the default Ctrl-E Ctrl-U
+      # and never sends the other keys.
+      if [[ -z ${WARP_TMUX_MARKER_ONLY:-} ]]; then
+        # Reset the custom kill-buffer binding as the user's zshrc (which is sourced after zshrc_warp)
+        # could have added a bindkey. This won't have any user-impact because these shortcuts are only run
+        # in the context of the zsh line editor, which isn't displayed in Warp.
+        #
+        # We explicitly rebind on every standard keymap (not just "main", which is only a link to
+        # whichever of emacs/viins is currently selected) because a user's rc file can switch editing
+        # modes after we've bound "main" (e.g. `bindkey -v`, as used by the "cursor_mode" zsh function
+        # and by prezto). `bindkey -v` re-links "main" to "viins" and leaves "vicmd" (vi command mode)
+        # bound to its default of up-history. If the active keymap when Warp sends its pre-command ^P
+        # ends up being one we didn't rebind, the clear becomes a no-op and any leftover bootstrap bytes
+        # still sitting in the line editor's buffer get echoed alongside the next command.
+        # See https://github.com/warpdotdev/warp/issues/7099.
+        local warp_keymap
+        for warp_keymap in main emacs viins vicmd; do
+          bindkey -M "$warp_keymap" '^P' warp_kill_buffer_and_reset_insert_mode 2>/dev/null || :
+        done
 
-      # Reset the custom input-reporting binding as well, in case it was overridden
-      # by the user's zshrc.
-      # This is arbitrarily bound to ESC-i in all supported shells ("i" for input).
-      # Binding to ESC-1 caused bootstrap failures with vi keybindings.
-      bindkey -r '\ei'
-      bindkey '\ei' warp_report_input
+        # Reset the custom input-reporting binding as well, in case it was overridden
+        # by the user's zshrc.
+        # This is arbitrarily bound to ESC-i in all supported shells ("i" for input).
+        # Binding to ESC-1 caused bootstrap failures with vi keybindings.
+        bindkey -r '\ei'
+        bindkey '\ei' warp_report_input
 
-      # Introduce keybinding to switch prompt modes (PS1 vs built-in Warp prompt).
-      # This is arbitrarily bound to ESC-p in all supported shells ("p" for PS1),
-      # and we can change it to any other keybinding if needed.
-      bindkey -r '\ep'
-      bindkey '\ep' warp_change_prompt_modes_to_ps1
+        # Introduce keybinding to switch prompt modes (PS1 vs built-in Warp prompt).
+        # This is arbitrarily bound to ESC-p in all supported shells ("p" for PS1),
+        # and we can change it to any other keybinding if needed.
+        bindkey -r '\ep'
+        bindkey '\ep' warp_change_prompt_modes_to_ps1
 
-      # Introduce keybinding to switch prompt modes (PS1 vs built-in Warp prompt).
-      # This is arbitrarily bound to ESC-w in all supported shells ("w" for Warp prompt),
-      # and we can change it to any other keybinding if needed.
-      bindkey -r '\ew'
-      bindkey '\ew' warp_change_prompt_modes_to_warp_prompt
+        # Introduce keybinding to switch prompt modes (PS1 vs built-in Warp prompt).
+        # This is arbitrarily bound to ESC-w in all supported shells ("w" for Warp prompt),
+        # and we can change it to any other keybinding if needed.
+        bindkey -r '\ew'
+        bindkey '\ew' warp_change_prompt_modes_to_warp_prompt
+      fi
 
       local escaped_pwd
       if [ -n "${WSL_DISTRO_NAME:-}" ]; then
@@ -1464,7 +1470,10 @@ esac
   # with the bracketed-paste-magic plugin (included in oh-my-zsh by default), zsh's "allexport"
   # option (set -a), and Warp's bootstrapping code.
   # https://github.com/warpdotdev/warp/issues/11520
-  zle -A .bracketed-paste bracketed-paste
+  # In a tmux pane (marker-only mode) the user's widgets stay: plain tmux clients use them.
+  if [[ -z ${WARP_TMUX_MARKER_ONLY:-} ]]; then
+    zle -A .bracketed-paste bracketed-paste
+  fi
 
   precmd_functions+=(warp_precmd warp_update_prompt_vars)
   preexec_functions+=(warp_preexec)
@@ -1480,8 +1489,13 @@ esac
 
   warp_update_prompt_vars
 
-  # Set history to flush after every command
-  setopt share_history
+  # Set history to flush after every command. In a tmux pane (marker-only mode) only append:
+  # share_history would also change what a plain client's up-arrow and Ctrl-P recall.
+  if [[ -z ${WARP_TMUX_MARKER_ONLY:-} ]]; then
+    setopt share_history
+  else
+    setopt inc_append_history
+  fi
 
   # Overrides compadd so that we can hook into parts of the completion stack
   # where richer completions data is available.
