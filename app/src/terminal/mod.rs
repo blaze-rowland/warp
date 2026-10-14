@@ -288,6 +288,12 @@ impl SizeUpdate {
         self.natural_cols
     }
 
+    /// The new size with the pane-computed rows and columns: the size the view has room for.
+    pub fn natural_size(&self) -> SizeInfo {
+        self.new_size
+            .with_rows_and_columns(self.natural_rows, self.natural_cols)
+    }
+
     /// Returns true if this resize was caused by a sharer size change.
     pub fn is_sharer_size_change(&self) -> bool {
         matches!(

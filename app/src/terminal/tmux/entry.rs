@@ -160,6 +160,9 @@ pub struct PaneTmuxState {
     pub is_tmux_pane: bool,
     /// The tmux pane this pane shows.
     pub tmux_pane: Option<(TmuxOriginId, warp_terminal::tmux::PaneId)>,
+    /// The columns and rows tmux's layout gives the tmux pane. The grid always has this size,
+    /// whatever the size of the view.
+    pub grid_size: Option<(usize, usize)>,
     /// R8's "Warpify this pane", once the pane is known to need it: offered, or disabled with
     /// the reason.
     pub warpify: Option<super::integration::WarpifyAvailability>,

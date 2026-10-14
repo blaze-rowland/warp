@@ -1269,11 +1269,13 @@ impl SizeUpdateBuilder {
                 new_size.with_rows_and_columns(num_rows.max(1), num_cols.max(1))
             }
             _ => {
+                if let Some((columns, rows)) = view.tmux.grid_size {
+                    new_size.with_rows_and_columns(rows, columns)
                 // For a shared session viewer, we want to use the larger
                 // of our own size and the sharer's size.
                 // However, if the viewer is actively reporting its size to the sharer
                 // (viewer-driven sizing), skip the MAX — the PTY is already at our size.
-                if let Some(Viewer {
+                } else if let Some(Viewer {
                     sharer_size,
                     last_reported_natural_size,
                     ..
@@ -17047,6 +17049,19 @@ impl TerminalView {
     ) {
         self.tmux.is_tmux_pane = true;
         self.tmux.tmux_pane = Some((origin, pane_id));
+    }
+
+    /// Sizes the grid of a tmux pane to tmux's layout. The view keeps its own size: a larger
+    /// view leaves the extra area empty and a smaller one clips, so tmux's output never reflows.
+    pub fn set_tmux_grid_size(&mut self, columns: usize, rows: usize, ctx: &mut ViewContext<Self>) {
+        if columns == 0 || rows == 0 || self.tmux.grid_size == Some((columns, rows)) {
+            return;
+        }
+        self.tmux.grid_size = Some((columns, rows));
+        let size_update =
+            SizeUpdateBuilder::after_layout(*self.size_info, self.size_info.pane_size_px())
+                .build(self, ctx);
+        self.resize_internal(size_update, ctx);
     }
 
     /// The file explorer and code review state for a tmux pane, which skips the remote-server

@@ -10918,3 +10918,89 @@ fn visible_bootstrap_block_leaves_focus_on_tab_group_rename_editor() {
         }));
     });
 }
+
+/// The grid sizes of a view's block list and alternate screen, as (columns, rows).
+fn tmux_test_grid_sizes(view: &TerminalView) -> [(usize, usize); 3] {
+    let model = view.model.lock();
+    let block_list = model.block_list().size();
+    let alt_grid = model.alt_screen().grid_handler();
+    [
+        (view.size_info().columns(), view.size_info().rows()),
+        (block_list.columns(), block_list.rows()),
+        (alt_grid.columns(), alt_grid.visible_rows()),
+    ]
+}
+
+#[test]
+fn a_tmux_pane_grid_has_the_layout_size_not_the_view_size() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let large = vec2f(4000., 2000.);
+        terminal.update(&mut app, |view, ctx| {
+            view.after_terminal_view_layout(large, ctx);
+            let size = view.size_info();
+            assert!(size.columns() > 157 && size.rows() > 54, "{size:?}");
+            view.mark_as_tmux_pane(
+                TmuxOriginId::new_for_test(1),
+                warp_terminal::tmux::PaneId(3),
+            );
+            view.set_tmux_grid_size(157, 54, ctx);
+        });
+        terminal.read(&app, |view, _| {
+            assert_eq!(tmux_test_grid_sizes(view), [(157, 54); 3]);
+            assert_eq!(view.size_info().pane_size_px(), large);
+        });
+
+        // Resizing the view alone leaves the grid at tmux's size.
+        terminal.update(&mut app, |view, ctx| {
+            view.after_terminal_view_layout(vec2f(3000., 1500.), ctx);
+            view.after_terminal_view_layout(vec2f(600., 300.), ctx);
+        });
+        terminal.read(&app, |view, _| {
+            assert_eq!(tmux_test_grid_sizes(view), [(157, 54); 3]);
+            assert_eq!(view.size_info().pane_size_px(), vec2f(600., 300.));
+        });
+
+        // A layout change resizes it.
+        terminal.update(&mut app, |view, ctx| view.set_tmux_grid_size(120, 40, ctx));
+        terminal.read(&app, |view, _| {
+            assert_eq!(tmux_test_grid_sizes(view), [(120, 40); 3]);
+        });
+    });
+}
+
+#[test]
+fn a_tmux_pane_resize_reports_the_size_the_view_has_room_for() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        terminal.update(&mut app, |view, ctx| {
+            view.mark_as_tmux_pane(
+                TmuxOriginId::new_for_test(1),
+                warp_terminal::tmux::PaneId(3),
+            );
+            view.set_tmux_grid_size(157, 54, ctx);
+        });
+        let resizes = Rc::new(RefCell::new(Vec::new()));
+        let recorded = resizes.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&terminal, move |_, event, _| {
+                if let Event::Resize { size_update } = event {
+                    recorded.borrow_mut().push(*size_update);
+                }
+            });
+        });
+        terminal.update(&mut app, |view, ctx| {
+            view.after_terminal_view_layout(vec2f(4000., 2000.), ctx);
+        });
+        let size_update = *resizes.borrow().last().expect("the view resized");
+        assert_eq!(size_update.new_size().columns(), 157);
+        assert_eq!(size_update.new_size().rows(), 54);
+        let natural = size_update.natural_size();
+        assert!(
+            natural.columns() > 157 && natural.rows() > 54,
+            "{natural:?}"
+        );
+    });
+}

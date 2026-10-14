@@ -53,7 +53,8 @@ impl PaneRequestSink for DisconnectedSink {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TmuxPaneEventLoopEvent {
-    /// The pane's view changed size. Window sizing happens in [`super::pane_manager`].
+    /// The size the pane's view has room for changed. The grid keeps tmux's size; window
+    /// sizing happens in [`super::pane_manager`].
     Resized { columns: usize, rows: usize },
     /// The pane's queue closed: the pane or the whole session ended.
     Ended,

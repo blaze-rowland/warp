@@ -305,3 +305,52 @@ fn a_tmux_pane_never_sends_the_prompt_mode_keys() {
         drop(model_events_tx);
     });
 }
+
+#[test]
+fn a_tmux_pane_resize_carries_the_size_the_view_has_room_for() {
+    App::test((), |mut app| async move {
+        let (model_events_tx, model_events_rx) = async_channel::unbounded();
+        let (_executor_command_tx, executor_command_rx) = async_channel::unbounded();
+        let sessions = app.add_model(|_| Sessions::new_for_test());
+        let model_events =
+            app.add_model(|ctx| ModelEventDispatcher::new(model_events_rx, sessions.clone(), ctx));
+        let line_editor_status =
+            app.add_model(|ctx| LineEditorStatus::new(model_events.clone(), sessions.clone(), ctx));
+        let sender = TestEventLoopSender::default();
+        let controller = app.add_model(|ctx| {
+            PtyController::new(
+                sender.clone(),
+                model_events,
+                line_editor_status,
+                sessions,
+                executor_command_rx,
+                terminal_model(),
+                ctx,
+            )
+        });
+
+        // The grid keeps tmux's 157x54 while the view has room for 200x60.
+        let last_size = crate::terminal::SizeInfo::new_without_font_metrics(54, 157);
+        let size_update = crate::terminal::SizeUpdate {
+            update_reason: crate::terminal::SizeUpdateReason::AfterLayout,
+            last_size,
+            new_size: crate::terminal::SizeInfo::new_without_font_metrics(60, 200)
+                .with_rows_and_columns(54, 157),
+            new_gap_height: None,
+            natural_rows: 60,
+            natural_cols: 200,
+        };
+        controller.update(&mut app, |controller, ctx| {
+            controller.set_is_tmux_pane();
+            controller.resize_pty(size_update, ctx);
+        });
+
+        let messages = sender.messages.lock();
+        let [Message::Resize(size)] = messages.as_slice() else {
+            panic!("expected one resize");
+        };
+        assert_eq!((size.columns(), size.rows()), (200, 60));
+        drop(messages);
+        drop(model_events_tx);
+    });
+}

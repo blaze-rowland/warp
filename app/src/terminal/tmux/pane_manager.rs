@@ -5,10 +5,11 @@
 //! PTY; like `remote_tty` its `PtyController` writes into a channel. The pane's
 //! [`TmuxPaneEventLoop`] connects both ends to the session's gateway.
 //!
-//! [`TmuxWindowSizer`] turns pane sizes into one `refresh-client -C @W:WxH` per tmux window.
+//! [`TmuxWindowSizer`] turns pane sizes into one `refresh-client -C @W:WxH` per tmux window, and
+//! [`follow_layout_size`] keeps each pane's grid at the size tmux's layout gives the pane.
 
 use std::any::Any;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::mpsc::SyncSender;
 
@@ -17,7 +18,8 @@ use parking_lot::FairMutex;
 use pathfinder_geometry::vector::Vector2F;
 use warp_terminal::local_tty::tmux_gateway::TmuxRequest;
 use warp_terminal::tmux::{
-    ClientEvent, LayoutNode, PaneId, WindowId, WindowLayout, refresh_client_window_size_command,
+    ClientEvent, LayoutNode, PaneId, SessionModel, WindowId, WindowLayout,
+    refresh_client_size_command, refresh_client_window_size_command,
 };
 use warpui::{
     AppContext, Entity, ModelContext, ModelHandle, SingletonEntity, ViewHandle,
@@ -158,6 +160,7 @@ impl TmuxPaneTerminalManager {
         });
 
         view.update(ctx, |view, _| view.mark_as_tmux_pane(origin, pane_id));
+        follow_layout_size(origin, pane_id, &view, ctx);
 
         // The pane's output is parsed only once its session id is registered (U9, KTD8).
         let queue_event_loop = backend.event_loop.clone();
@@ -367,6 +370,56 @@ pub(super) fn connect_resizes(
     });
 }
 
+/// Keeps the pane's grid at the size tmux's layout gives the pane, from now on: tmux draws the
+/// pane at that size, so a grid sized from Warp's view would wrap and place the cursor
+/// differently than the program expects.
+pub(super) fn follow_layout_size(
+    origin: TmuxOriginId,
+    pane_id: PaneId,
+    view: &ViewHandle<TerminalView>,
+    ctx: &mut AppContext,
+) {
+    let gateways = TmuxGateways::handle(ctx);
+    let current = gateways.as_ref(ctx).model(origin).and_then(|model| {
+        model
+            .windows()
+            .filter_map(|window| window.layout.as_ref())
+            .find_map(|layout| pane_layout_size(layout, pane_id))
+    });
+    if let Some((columns, rows)) = current {
+        view.update(ctx, |view, ctx| view.set_tmux_grid_size(columns, rows, ctx));
+    }
+    let view = view.downgrade();
+    ctx.subscribe_to_model(&gateways, move |_, event, ctx| {
+        let TmuxGatewayEvent::Client {
+            origin: changed,
+            event: ClientEvent::LayoutChanged { layout, .. },
+        } = event
+        else {
+            return;
+        };
+        if *changed != origin {
+            return;
+        }
+        let Some((columns, rows)) = pane_layout_size(layout, pane_id) else {
+            return;
+        };
+        if let Some(view) = view.upgrade(ctx) {
+            view.update(ctx, |view, ctx| view.set_tmux_grid_size(columns, rows, ctx));
+        }
+    });
+}
+
+/// The columns and rows tmux gives `pane_id` in `layout`. A pane hidden by another pane's zoom
+/// keeps its size in the full layout.
+pub(super) fn pane_layout_size(layout: &WindowLayout, pane_id: PaneId) -> Option<(usize, usize)> {
+    [&layout.visible_layout, &layout.layout]
+        .into_iter()
+        .flat_map(LayoutNode::leaves)
+        .find(|leaf| leaf.pane_id == pane_id)
+        .map(|leaf| (leaf.width as usize, leaf.height as usize))
+}
+
 /// Hands the pane's queue to its event loop now if the gateway has it, and whenever the gateway
 /// opens a new one.
 pub(super) fn connect_queue(
@@ -410,20 +463,21 @@ pub(super) fn connect_queue(
     });
 }
 
-/// One tmux window as the sizer sees it.
-struct SizedWindow {
-    layout: WindowLayout,
-    /// The size last sent since tmux last reported this window's layout.
-    sent: Option<(usize, usize)>,
-}
-
-/// Sizes tmux windows to the Warp tabs that show them. Each pane reports its view size; once the
-/// current layout pass is done the sizer sends one `refresh-client -C @W:WxH` per window whose
-/// size changed. tmux's layout stays the source of truth for how panes split the window.
+/// Sizes tmux windows to the Warp tabs that show them. Each pane reports the size Warp has for
+/// it; once the current layout pass is done the sizer sends one `refresh-client -C @W:WxH` per
+/// window whose Warp size changed, plus one client-wide `refresh-client -C WxH` per session so
+/// tmux knows the control client's size at all. tmux's layout stays the source of truth for how
+/// panes split the window and for the size every pane's grid has.
+///
+/// Sizes are sent only when Warp's own size changes, never because tmux sized a window to
+/// another client: with `window-size latest` that would make the clients fight.
 pub struct TmuxWindowSizer {
     origins: HashMap<TmuxOriginId, Arc<dyn PaneRequestSink>>,
-    windows: HashMap<(TmuxOriginId, WindowId), SizedWindow>,
+    layouts: HashMap<(TmuxOriginId, WindowId), WindowLayout>,
+    /// Kept for panes whose window is not known yet; they count once its layout arrives.
     pane_sizes: HashMap<(TmuxOriginId, PaneId), (usize, usize)>,
+    sent: HashMap<(TmuxOriginId, WindowId), (usize, usize)>,
+    client_sized: HashSet<TmuxOriginId>,
     dirty: BTreeSet<(TmuxOriginId, WindowId)>,
     flush_scheduled: bool,
 }
@@ -437,8 +491,19 @@ impl SingletonEntity for TmuxWindowSizer {}
 impl TmuxWindowSizer {
     /// Follows every session's layouts through [`TmuxGateways`].
     pub fn new(ctx: &mut ModelContext<Self>) -> Self {
-        ctx.subscribe_to_model(&TmuxGateways::handle(ctx), |me, _, event, _| {
-            me.on_gateway_event(event);
+        ctx.subscribe_to_model(&TmuxGateways::handle(ctx), |me, gateways, event, ctx| {
+            let listed = match event {
+                TmuxGatewayEvent::Client {
+                    origin,
+                    event: ClientEvent::Attached { .. } | ClientEvent::SessionChanged { .. },
+                } => gateways
+                    .as_ref(ctx)
+                    .model(*origin)
+                    .map(window_layouts)
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            me.on_gateway_event(listed, event, ctx);
         });
         Self::empty()
     }
@@ -451,8 +516,10 @@ impl TmuxWindowSizer {
     fn empty() -> Self {
         Self {
             origins: HashMap::new(),
-            windows: HashMap::new(),
+            layouts: HashMap::new(),
             pane_sizes: HashMap::new(),
+            sent: HashMap::new(),
+            client_sized: HashSet::new(),
             dirty: BTreeSet::new(),
             flush_scheduled: false,
         }
@@ -463,40 +530,45 @@ impl TmuxWindowSizer {
         self.origins.insert(origin, requests);
     }
 
-    /// Records tmux's current layout for a window.
-    pub fn set_layout(&mut self, origin: TmuxOriginId, window_id: WindowId, layout: WindowLayout) {
-        let panes = layout.layout.pane_ids();
-        if let Some(previous) = self.windows.get(&(origin, window_id)) {
-            for pane_id in previous.layout.layout.pane_ids() {
-                if !panes.contains(&pane_id) {
-                    self.pane_sizes.remove(&(origin, pane_id));
-                }
-            }
+    /// Records tmux's current layout for a window. Sizes its panes reported before it was known
+    /// go out after the current layout pass.
+    pub fn set_layout(
+        &mut self,
+        origin: TmuxOriginId,
+        window_id: WindowId,
+        layout: WindowLayout,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let has_sizes = layout
+            .visible_layout
+            .pane_ids()
+            .iter()
+            .any(|pane_id| self.pane_sizes.contains_key(&(origin, *pane_id)));
+        self.layouts.insert((origin, window_id), layout);
+        if has_sizes {
+            self.mark_dirty(origin, window_id, ctx);
         }
-        // tmux reported the window anew; a size sent before it no longer counts as current.
-        self.windows
-            .insert((origin, window_id), SizedWindow { layout, sent: None });
     }
 
     /// Forgets a closed window.
     pub fn remove_window(&mut self, origin: TmuxOriginId, window_id: WindowId) {
-        if let Some(window) = self.windows.remove(&(origin, window_id)) {
-            for pane_id in window.layout.layout.pane_ids() {
-                self.pane_sizes.remove(&(origin, pane_id));
-            }
-        }
+        self.layouts.remove(&(origin, window_id));
+        self.sent.remove(&(origin, window_id));
         self.dirty.remove(&(origin, window_id));
     }
 
     /// Forgets everything about an origin whose session ended.
     pub fn remove_origin(&mut self, origin: TmuxOriginId) {
         self.origins.remove(&origin);
-        self.windows.retain(|(o, _), _| *o != origin);
+        self.layouts.retain(|(o, _), _| *o != origin);
         self.pane_sizes.retain(|(o, _), _| *o != origin);
+        self.sent.retain(|(o, _), _| *o != origin);
+        self.client_sized.remove(&origin);
         self.dirty.retain(|(o, _)| *o != origin);
     }
 
-    /// Records a pane's view size; its window's size goes out after the current layout pass.
+    /// Records the size Warp has for a pane; its window's size goes out after the current layout
+    /// pass, or once the window's layout is known.
     pub fn pane_resized(
         &mut self,
         origin: TmuxOriginId,
@@ -508,11 +580,21 @@ impl TmuxWindowSizer {
         if columns == 0 || rows == 0 {
             return;
         }
-        let Some(window_id) = self.window_of(origin, pane_id) else {
-            log::debug!("tmux: pane {pane_id} resized before its window's layout is known");
-            return;
-        };
         self.pane_sizes.insert((origin, pane_id), (columns, rows));
+        match self.window_of(origin, pane_id) {
+            Some(window_id) => self.mark_dirty(origin, window_id, ctx),
+            None => {
+                log::debug!("tmux: pane {pane_id} resized before its window's layout is known")
+            }
+        }
+    }
+
+    fn mark_dirty(
+        &mut self,
+        origin: TmuxOriginId,
+        window_id: WindowId,
+        ctx: &mut ModelContext<Self>,
+    ) {
         self.dirty.insert((origin, window_id));
         if !self.flush_scheduled {
             // Every pane of a resized tab reports in the same layout pass; send once after it.
@@ -521,46 +603,59 @@ impl TmuxWindowSizer {
         }
     }
 
-    /// Sends the size of every window whose size changed.
+    /// Sends the size of every window whose Warp size changed.
     pub fn flush(&mut self) {
         self.flush_scheduled = false;
         for (origin, window_id) in std::mem::take(&mut self.dirty) {
-            let Some(window) = self.windows.get_mut(&(origin, window_id)) else {
+            let Some(layout) = self.layouts.get(&(origin, window_id)) else {
                 continue;
             };
-            let pane_sizes = &self.pane_sizes;
-            let size = node_size(&window.layout.visible_layout, &|pane_id| {
-                pane_sizes.get(&(origin, *pane_id)).copied()
-            });
-            let current = node_size(&window.layout.visible_layout, &|_| None);
-            if size == current || window.sent == Some(size) {
-                continue;
-            }
             let Some(requests) = self.origins.get(&origin) else {
                 continue;
             };
-            let (columns, rows) = size;
-            let line = refresh_client_window_size_command(window_id, columns, rows);
-            window.sent = Some(size);
-            requests.send(TmuxRequest::Command {
-                tag: WINDOW_SIZE_COMMAND_TAG,
-                line: line.trim_end().to_owned(),
+            let pane_sizes = &self.pane_sizes;
+            let size = node_size(&layout.visible_layout, &|pane_id| {
+                pane_sizes.get(&(origin, *pane_id)).copied()
             });
+            if self.sent.get(&(origin, window_id)) == Some(&size) {
+                continue;
+            }
+            let (columns, rows) = size;
+            if self.client_sized.insert(origin) {
+                send_size_command(
+                    requests.as_ref(),
+                    refresh_client_size_command(columns, rows),
+                );
+            }
+            send_size_command(
+                requests.as_ref(),
+                refresh_client_window_size_command(window_id, columns, rows),
+            );
+            self.sent.insert((origin, window_id), size);
         }
     }
 
     fn window_of(&self, origin: TmuxOriginId, pane_id: PaneId) -> Option<WindowId> {
-        self.windows
+        self.layouts
             .iter()
-            .find(|((o, _), window)| {
-                *o == origin && window.layout.visible_layout.pane_ids().contains(&pane_id)
+            .find(|((o, _), layout)| {
+                *o == origin && layout.visible_layout.pane_ids().contains(&pane_id)
             })
             .map(|((_, window_id), _)| *window_id)
     }
 
-    fn on_gateway_event(&mut self, event: &TmuxGatewayEvent) {
+    /// Handles a gateway event. `listed` holds every window's layout when the event is an attach
+    /// or a session switch: those list the windows without a `%layout-change` for each.
+    fn on_gateway_event(
+        &mut self,
+        listed: Vec<(WindowId, WindowLayout)>,
+        event: &TmuxGatewayEvent,
+        ctx: &mut ModelContext<Self>,
+    ) {
         match event {
-            TmuxGatewayEvent::Client { origin, event } => self.on_client_event(*origin, event),
+            TmuxGatewayEvent::Client { origin, event } => {
+                self.on_client_event(*origin, event, listed, ctx)
+            }
             TmuxGatewayEvent::Ended { origin } => self.remove_origin(*origin),
             TmuxGatewayEvent::Starting { .. }
             | TmuxGatewayEvent::ConfirmPending { .. }
@@ -571,15 +666,26 @@ impl TmuxWindowSizer {
         }
     }
 
-    fn on_client_event(&mut self, origin: TmuxOriginId, event: &ClientEvent) {
+    fn on_client_event(
+        &mut self,
+        origin: TmuxOriginId,
+        event: &ClientEvent,
+        listed: Vec<(WindowId, WindowLayout)>,
+        ctx: &mut ModelContext<Self>,
+    ) {
         match event {
             ClientEvent::LayoutChanged { window_id, layout } => {
-                self.set_layout(origin, *window_id, layout.clone());
+                self.set_layout(origin, *window_id, layout.clone(), ctx);
             }
             ClientEvent::WindowClosed { window_id } => self.remove_window(origin, *window_id),
+            ClientEvent::Attached { .. } => {
+                for (window_id, layout) in listed {
+                    self.set_layout(origin, window_id, layout, ctx);
+                }
+            }
             ClientEvent::SessionChanged { .. } => {
                 let windows: Vec<_> = self
-                    .windows
+                    .layouts
                     .keys()
                     .filter(|(o, _)| *o == origin)
                     .map(|(_, window_id)| *window_id)
@@ -587,9 +693,11 @@ impl TmuxWindowSizer {
                 for window_id in windows {
                     self.remove_window(origin, window_id);
                 }
+                for (window_id, layout) in listed {
+                    self.set_layout(origin, window_id, layout, ctx);
+                }
             }
-            ClientEvent::Attached { .. }
-            | ClientEvent::UnsupportedVersion { .. }
+            ClientEvent::UnsupportedVersion { .. }
             | ClientEvent::KeyConfigLoaded(_)
             | ClientEvent::SessionRenamed { .. }
             | ClientEvent::WindowAdded { .. }
@@ -612,6 +720,21 @@ impl TmuxWindowSizer {
             | ClientEvent::Desync { .. } => {}
         }
     }
+}
+
+/// Every window's layout in `model`.
+fn window_layouts(model: &SessionModel) -> Vec<(WindowId, WindowLayout)> {
+    model
+        .windows()
+        .filter_map(|window| Some((window.id, window.layout.clone()?)))
+        .collect()
+}
+
+fn send_size_command(requests: &dyn PaneRequestSink, line: String) {
+    requests.send(TmuxRequest::Command {
+        tag: WINDOW_SIZE_COMMAND_TAG,
+        line: line.trim_end().to_owned(),
+    });
 }
 
 /// Columns and rows of `node` with each pane at `pane_size` (tmux's size when `None`), plus

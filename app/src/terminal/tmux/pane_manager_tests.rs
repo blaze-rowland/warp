@@ -7,8 +7,8 @@ use warp_terminal::local_tty::tmux_gateway::{
     GatewayEvent, PaneChunk, TestPaneQueueSender, TmuxRequest, test_pane_queue,
 };
 use warp_terminal::tmux::{
-    PaneId, PaneSnapshot, SnapshotKind, WindowFlags, WindowId, WindowLayout, layout_checksum,
-    parse_layout_change, send_keys_command,
+    ClientEvent, PaneId, PaneSnapshot, SessionId as TmuxSessionId, SessionModel, SnapshotKind,
+    WindowFlags, WindowId, WindowLayout, layout_checksum, parse_layout_change, send_keys_command,
 };
 use warpui::r#async::executor::Background;
 use warpui::{App, ModelHandle};
@@ -414,13 +414,14 @@ fn a_pane_resize_sends_one_refresh_client_for_its_window() {
         let sizer = app.add_singleton_model(|_| TmuxWindowSizer::new_for_test());
         let origin = TmuxOriginId::new_for_test(1);
         let window_requests = RecordingSink::default();
-        sizer.update(&mut app, |sizer, _| {
+        sizer.update(&mut app, |sizer, ctx| {
             sizer.register_origin(origin, Arc::new(window_requests.clone()));
             // Two panes side by side in @2: %3 and %4, 80 + 1 + 79 columns.
             sizer.set_layout(
                 origin,
                 WindowId(2),
                 layout("160x24,0,0{80x24,0,0,3,79x24,81,0,4}"),
+                ctx,
             );
         });
 
@@ -444,11 +445,8 @@ fn a_pane_resize_sends_one_refresh_client_for_its_window() {
             "the window size is sent"
         );
         assert_eq!(
-            window_requests.requests(),
-            vec![TmuxRequest::Command {
-                tag: WINDOW_SIZE_COMMAND_TAG,
-                line: "refresh-client -C @2:200x30".to_owned(),
-            }]
+            size_lines(&window_requests),
+            vec!["refresh-client -C 200x30", "refresh-client -C @2:200x30"]
         );
         // Nothing went to the pane itself.
         assert!(pane.requests.requests().is_empty());
@@ -458,25 +456,168 @@ fn a_pane_resize_sends_one_refresh_client_for_its_window() {
             sizer.pane_resized(origin, PaneId(4), 99, 30, ctx);
         });
         sizer.update(&mut app, |sizer, _| sizer.flush());
-        assert_eq!(window_requests.requests().len(), 1);
+        assert_eq!(window_requests.requests().len(), 2);
     });
 }
 
+fn size_lines(sink: &RecordingSink) -> Vec<String> {
+    sink.requests()
+        .into_iter()
+        .map(|request| match request {
+            TmuxRequest::Command { tag, line } => {
+                assert_eq!(tag, WINDOW_SIZE_COMMAND_TAG);
+                line
+            }
+            other => panic!("unexpected request {other:?}"),
+        })
+        .collect()
+}
+
 #[test]
-fn a_size_matching_the_layout_sends_nothing() {
+fn a_size_matching_the_layout_is_still_sent_once() {
     App::test((), |mut app| async move {
         let sizer = app.add_singleton_model(|_| TmuxWindowSizer::new_for_test());
         let origin = TmuxOriginId::new_for_test(1);
         let window_requests = RecordingSink::default();
         sizer.update(&mut app, |sizer, ctx| {
             sizer.register_origin(origin, Arc::new(window_requests.clone()));
-            sizer.set_layout(origin, WindowId(2), layout("80x24,0,0,3"));
+            sizer.set_layout(origin, WindowId(2), layout("80x24,0,0,3"), ctx);
             sizer.pane_resized(origin, PaneId(3), 80, 24, ctx);
-            sizer.pane_resized(origin, PaneId(9), 50, 50, ctx);
             sizer.flush();
         });
-        assert!(window_requests.requests().is_empty());
+        // tmux had no size for the control client; matching its layout does not tell it one.
+        assert_eq!(
+            size_lines(&window_requests),
+            vec!["refresh-client -C 80x24", "refresh-client -C @2:80x24"]
+        );
     });
+}
+
+#[test]
+fn sizes_reported_before_the_layout_are_sent_once_it_arrives() {
+    App::test((), |mut app| async move {
+        let sizer = app.add_singleton_model(|_| TmuxWindowSizer::new_for_test());
+        let origin = TmuxOriginId::new_for_test(1);
+        let window_requests = RecordingSink::default();
+        sizer.update(&mut app, |sizer, ctx| {
+            sizer.register_origin(origin, Arc::new(window_requests.clone()));
+            // At attach every pane lays out before tmux's layout reaches the sizer.
+            sizer.pane_resized(origin, PaneId(3), 200, 60, ctx);
+        });
+        sizer.update(&mut app, |sizer, _| sizer.flush());
+        assert!(window_requests.requests().is_empty());
+
+        sizer.update(&mut app, |sizer, ctx| {
+            sizer.set_layout(origin, WindowId(1), layout("157x54,0,0,3"), ctx);
+        });
+        assert_eventually!(
+            !window_requests.requests().is_empty(),
+            "the queued size is sent"
+        );
+        assert_eq!(
+            size_lines(&window_requests),
+            vec!["refresh-client -C 200x60", "refresh-client -C @1:200x60"]
+        );
+    });
+}
+
+#[test]
+fn a_layout_from_another_client_does_not_resend_an_unchanged_size() {
+    App::test((), |mut app| async move {
+        let sizer = app.add_singleton_model(|_| TmuxWindowSizer::new_for_test());
+        let origin = TmuxOriginId::new_for_test(1);
+        let window_requests = RecordingSink::default();
+        sizer.update(&mut app, |sizer, ctx| {
+            sizer.register_origin(origin, Arc::new(window_requests.clone()));
+            sizer.set_layout(origin, WindowId(1), layout("157x54,0,0,3"), ctx);
+            sizer.pane_resized(origin, PaneId(3), 200, 60, ctx);
+            sizer.flush();
+        });
+        assert_eq!(window_requests.requests().len(), 2);
+
+        // tmux follows us, then the other client becomes the latest and takes the window back.
+        sizer.update(&mut app, |sizer, ctx| {
+            sizer.set_layout(origin, WindowId(1), layout("200x60,0,0,3"), ctx);
+            sizer.set_layout(origin, WindowId(1), layout("157x54,0,0,3"), ctx);
+            // The grid follows tmux; the view, and so Warp's size, stays the same.
+            sizer.pane_resized(origin, PaneId(3), 200, 60, ctx);
+            sizer.flush();
+        });
+        assert_eq!(window_requests.requests().len(), 2);
+
+        // Warp's own size changes: only the window's size goes out again.
+        sizer.update(&mut app, |sizer, ctx| {
+            sizer.pane_resized(origin, PaneId(3), 180, 50, ctx);
+            sizer.flush();
+        });
+        assert_eq!(
+            size_lines(&window_requests)[2..],
+            ["refresh-client -C @1:180x50".to_owned()]
+        );
+    });
+}
+
+#[test]
+fn attaching_sizes_the_windows_the_handshake_listed() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+        let gateways = app.add_singleton_model(TmuxGateways::new);
+        let sizer = app.add_singleton_model(TmuxWindowSizer::new);
+        let (tx, _rx) = mio_channel::channel();
+        let (origin, _link) = gateways.update(&mut app, |gateways, _| {
+            gateways.link_for_new_origin(tx, &HashMap::new())
+        });
+        let window_requests = RecordingSink::default();
+        sizer.update(&mut app, |sizer, ctx| {
+            sizer.register_origin(origin, Arc::new(window_requests.clone()));
+            sizer.pane_resized(origin, PaneId(3), 200, 60, ctx);
+        });
+
+        // The handshake's `list-windows` fills the model; no `%layout-change` comes with it.
+        let mut model = SessionModel::default();
+        model.set_session(TmuxSessionId(1), "work".to_owned());
+        model.add_window(WindowId(1));
+        model.apply_layout(WindowId(1), layout("157x54,0,0,3"));
+        gateways.update(&mut app, |gateways, ctx| {
+            gateways.deliver_for_test(origin, GatewayEvent::Model(Box::new(model)), ctx);
+            gateways.deliver_for_test(
+                origin,
+                GatewayEvent::Client(ClientEvent::Attached {
+                    session_id: TmuxSessionId(1),
+                    session_name: "work".to_owned(),
+                }),
+                ctx,
+            );
+        });
+
+        assert_eventually!(
+            !window_requests.requests().is_empty(),
+            "the window size is sent on attach"
+        );
+        assert_eq!(
+            size_lines(&window_requests),
+            vec!["refresh-client -C 200x60", "refresh-client -C @1:200x60"]
+        );
+    });
+}
+
+#[test]
+fn a_pane_layout_size_comes_from_tmux() {
+    let split = layout("157x54,0,0{78x54,0,0,3,78x54,79,0,4}");
+    assert_eq!(pane_layout_size(&split, PaneId(4)), Some((78, 54)));
+    assert_eq!(pane_layout_size(&split, PaneId(9)), None);
+
+    // While %4 is zoomed, %3 keeps its size in the full layout.
+    let body = "157x54,0,0{78x54,0,0,3,78x54,79,0,4}";
+    let visible = "157x54,0,0,4";
+    let zoomed = parse_layout_change(
+        &format!("{:04x},{body}", layout_checksum(body)),
+        Some(&format!("{:04x},{visible}", layout_checksum(visible))),
+        &WindowFlags::new("*Z"),
+    )
+    .unwrap();
+    assert_eq!(pane_layout_size(&zoomed, PaneId(4)), Some((157, 54)));
+    assert_eq!(pane_layout_size(&zoomed, PaneId(3)), Some((78, 54)));
 }
 
 #[test]
@@ -839,5 +980,276 @@ fn a_launcher_pane_from_before_attach_gets_blocks_from_its_next_prompt() {
         );
         warpui::r#async::Timer::after(std::time::Duration::from_millis(100)).await;
         assert_eq!(pane.pane_inputs(), Vec::<Vec<u8>>::new(), "nothing typed");
+    });
+}
+
+/// A tmux server on an isolated socket, killed (and its socket removed) on drop.
+struct LiveSizeServer {
+    socket: String,
+    plain_client: Option<std::process::Child>,
+}
+
+impl LiveSizeServer {
+    fn command(&self) -> command::blocking::Command {
+        let mut command = command::blocking::Command::new("tmux");
+        command
+            .args(["-L", &self.socket, "-f", "/dev/null"])
+            .env_remove("TMUX")
+            .stdin(std::process::Stdio::null());
+        command
+    }
+
+    fn stdout(&self, args: &[&str]) -> String {
+        let output = self.command().args(args).output().expect("tmux runs");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    fn clients(&self) -> String {
+        self.stdout(&[
+            "list-clients",
+            "-F",
+            "#{client_control_mode} #{client_width}x#{client_height}",
+        ])
+    }
+}
+
+fn tmux_pane_size(server: &LiveSizeServer, pane: PaneId) -> (usize, usize) {
+    let pane = pane.to_string();
+    let size = server.stdout(&[
+        "display-message",
+        "-p",
+        "-t",
+        &pane,
+        "#{pane_width} #{pane_height}",
+    ]);
+    let mut parts = size.split(' ').map(|part| part.parse::<usize>().unwrap());
+    (parts.next().unwrap(), parts.next().unwrap())
+}
+
+impl Drop for LiveSizeServer {
+    fn drop(&mut self) {
+        let socket = self.stdout(&["display-message", "-p", "#{socket_path}"]);
+        let _ = self.command().arg("kill-server").output();
+        if let Some(mut client) = self.plain_client.take() {
+            let _ = client.kill();
+            let _ = client.wait();
+        }
+        if socket.contains("/warp-size-") {
+            let _ = std::fs::remove_file(socket);
+        }
+    }
+}
+
+/// With another client attached at 157x55 and `window-size latest`, the control client tells
+/// tmux its size once attached, and the pane grid size follows whatever size tmux picks without
+/// the control client sending its size again.
+#[test]
+fn live_the_control_client_reports_its_size_and_grids_follow_tmux() {
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use instant::Instant;
+    use warp_terminal::tmux::{CONTROL_MODE_DCS, ClientConfig, ControlClient};
+
+    let Some(version) = command::blocking::Command::new("tmux")
+        .arg("-V")
+        .output()
+        .ok()
+        .and_then(|out| {
+            warp_terminal::tmux::TmuxVersion::parse(&String::from_utf8_lossy(&out.stdout))
+        })
+    else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+    if !version.supports_client_key_commands() {
+        eprintln!("skipping: tmux is older than 3.4");
+        return;
+    }
+
+    let mut server = LiveSizeServer {
+        socket: format!("warp-size-{}", std::process::id()),
+        plain_client: None,
+    };
+    let created = server
+        .command()
+        .args(["new-session", "-d", "-s", "s", "-x", "100", "-y", "30"])
+        .arg("sleep 600")
+        .status()
+        .expect("tmux runs");
+    assert!(created.success());
+    let pane = PaneId::parse(&server.stdout(&["display-message", "-p", "-t", "s", "#{pane_id}"]))
+        .expect("pane id");
+
+    // A plain client in a 157x55 terminal, as another terminal attached to the same session.
+    let plain = command::blocking::Command::new("script")
+        .args(["-q", "/dev/null", "sh", "-c"])
+        .arg(format!(
+            "stty cols 157 rows 55; exec tmux -L {} -f /dev/null attach -t s",
+            server.socket
+        ))
+        .env_remove("TMUX")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn script");
+    server.plain_client = Some(plain);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !server.clients().contains("0 157x55") {
+        assert!(
+            Instant::now() < deadline,
+            "plain client never attached: {}",
+            server.clients()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        server.stdout(&[
+            "display-message",
+            "-p",
+            "-t",
+            "s",
+            "#{window_width}x#{window_height}"
+        ]),
+        "157x54"
+    );
+
+    let mut child = server
+        .command()
+        .args(["-C", "attach", "-t", "s"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn control client");
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match stdout.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
+    App::test((), |mut app| async move {
+        let sizer = app.add_singleton_model(|_| TmuxWindowSizer::new_for_test());
+        let origin = TmuxOriginId::new_for_test(1);
+        let sink = RecordingSink::default();
+        sizer.update(&mut app, |sizer, ctx| {
+            sizer.register_origin(origin, Arc::new(sink.clone()));
+            // The pane's view lays out before the attach finishes: Warp has 200x60 for it.
+            sizer.pane_resized(origin, pane, 200, 60, ctx);
+        });
+
+        let start = Instant::now();
+        let mut client = ControlClient::new(ClientConfig::default());
+        client.receive_bytes(CONTROL_MODE_DCS, start.elapsed());
+        let mut forwarded = 0;
+        let mut layout_size = None;
+        // Runs the control client for `duration`, handing events to the sizer and its commands
+        // to tmux.
+        let mut pump = |app: &mut App, duration: Duration| {
+            let until = start.elapsed() + duration;
+            while start.elapsed() < until {
+                for line in client.take_outgoing() {
+                    stdin.write_all(line.as_bytes()).unwrap();
+                }
+                stdin.flush().unwrap();
+                match rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(bytes) => {
+                        client.receive_bytes(&bytes, start.elapsed());
+                    }
+                    Err(_) => client.tick(start.elapsed()),
+                }
+                for event in client.take_events() {
+                    let listed = match &event {
+                        ClientEvent::Attached { .. } => window_layouts(client.model()),
+                        _ => Vec::new(),
+                    };
+                    if let ClientEvent::LayoutChanged { layout, .. } = &event {
+                        layout_size = pane_layout_size(layout, pane);
+                    }
+                    if matches!(event, ClientEvent::Attached { .. }) {
+                        layout_size = client
+                            .model()
+                            .windows()
+                            .filter_map(|window| window.layout.as_ref())
+                            .find_map(|layout| pane_layout_size(layout, pane));
+                    }
+                    sizer.update(app, |sizer, ctx| {
+                        sizer.on_client_event(origin, &event, listed, ctx);
+                    });
+                }
+                sizer.update(app, |sizer, _| sizer.flush());
+                for request in &sink.requests()[forwarded..] {
+                    if let TmuxRequest::Command { line, .. } = request {
+                        client.send_command(line, start.elapsed()).unwrap();
+                    }
+                }
+                forwarded = sink.requests().len();
+            }
+            layout_size
+        };
+
+        let grid = pump(&mut app, Duration::from_secs(2));
+        assert_eq!(
+            size_lines(&sink),
+            vec!["refresh-client -C 200x60", "refresh-client -C @0:200x60"]
+        );
+        // tmux lists a control client's width but never its height.
+        let clients = server.clients();
+        assert!(clients.lines().any(|line| line == "1 200x"), "{clients}");
+        assert_eq!(
+            server.stdout(&[
+                "display-message",
+                "-p",
+                "-t",
+                "s",
+                "#{window_width}x#{window_height}"
+            ]),
+            "200x60"
+        );
+        assert_eq!(
+            grid,
+            Some(tmux_pane_size(&server, pane)),
+            "the grid has tmux's size"
+        );
+
+        // The plain client types: it becomes the latest client and tmux sizes the window to it.
+        let plain_stdin = server
+            .plain_client
+            .as_mut()
+            .unwrap()
+            .stdin
+            .as_mut()
+            .unwrap();
+        plain_stdin.write_all(b"x").unwrap();
+        plain_stdin.flush().unwrap();
+        let grid = pump(&mut app, Duration::from_secs(2));
+        assert_eq!(tmux_pane_size(&server, pane), (157, 54));
+        assert_eq!(grid, Some((157, 54)), "the grid follows tmux");
+        assert_eq!(
+            sink.requests().len(),
+            2,
+            "the control client does not resend its size"
+        );
+
+        client.detach();
+        for line in client.take_outgoing() {
+            let _ = stdin.write_all(line.as_bytes());
+        }
+        let _ = child.kill();
+        let _ = child.wait();
     });
 }

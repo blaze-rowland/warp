@@ -604,7 +604,13 @@ impl<T: EventLoopSender> PtyController<T> {
             || size_update.is_refresh()
             || size_update.rows_or_columns_changed()
         {
-            self.send_message_to_event_loop(Message::Resize(size_update.new_size), ctx);
+            // A tmux pane's grid has tmux's size; tmux needs to hear the size Warp has room for.
+            let size = if self.is_tmux_pane {
+                size_update.natural_size()
+            } else {
+                size_update.new_size
+            };
+            self.send_message_to_event_loop(Message::Resize(size), ctx);
         }
     }
 
