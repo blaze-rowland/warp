@@ -22,8 +22,12 @@ use warpui::{
 };
 
 use super::TmuxOriginId;
+use super::integration::TmuxIntegration;
 use super::keys::{KeyRoute, TmuxKeyRouter, escape_hatch_keystroke};
+use super::launcher_bindings::{LauncherBinding, launcher_binding};
 use super::native_ui::TmuxNativeUi;
+use super::settings::TmuxSettings;
+use super::workspace_sync::TmuxSessions;
 use crate::pane_group::PaneGroup;
 use crate::util::bindings::trigger_to_keystroke;
 
@@ -193,16 +197,48 @@ pub fn init(app: &mut AppContext) {
     );
 }
 
+/// [`launcher_binding`] for `origin`, with its installed launcher and the pane-integration
+/// setting.
+fn launcher_binding_for(
+    origin: TmuxOriginId,
+    pane_id: PaneId,
+    command: &str,
+    app: &AppContext,
+) -> Option<LauncherBinding> {
+    if !app.has_singleton_model::<TmuxIntegration>() || !app.has_singleton_model::<TmuxSettings>() {
+        return None;
+    }
+    let launcher = TmuxIntegration::as_ref(app).launcher_path(origin, app);
+    let integrate = TmuxSettings::as_ref(app).integrate_panes_enabled();
+    launcher_binding(command, pane_id, launcher.as_deref(), integrate)
+}
+
 fn route_key(pane_group: &PaneGroup, routed: &RoutedKey, ctx: &mut ViewContext<PaneGroup>) {
     let origin = routed.origin;
     let router = TmuxKeyRouter::handle(ctx);
+    let bound = router.as_ref(ctx).bound_command(origin, &routed.key);
     // U14, KTD10: a binding that opens tmux UI is drawn by Warp instead of reaching tmux.
-    if let Some(command) = router.as_ref(ctx).bound_command(origin, &routed.key)
+    if let Some(command) = &bound
         && ctx.has_singleton_model::<TmuxNativeUi>()
         && TmuxNativeUi::handle(ctx).update(ctx, |ui, ctx| {
-            ui.intercept(origin, routed.key.pane_id, &command, ctx)
+            ui.intercept(origin, routed.key.pane_id, command, ctx)
         })
     {
+        router.update(ctx, |router, ctx| router.key_intercepted(origin, ctx));
+        return;
+    }
+    // A binding that starts tmux's default shell starts it through Warp's launcher instead.
+    if let Some(command) = &bound
+        && let Some(binding) = launcher_binding_for(origin, routed.key.pane_id, command, ctx)
+    {
+        log::debug!(
+            "tmux: {} bound to {} starts through Warp's launcher",
+            binding.name,
+            routed.key.key
+        );
+        TmuxSessions::handle(ctx).update(ctx, |sessions, ctx| {
+            sessions.send_command(origin, binding.line, None, ctx);
+        });
         router.update(ctx, |router, ctx| router.key_intercepted(origin, ctx));
         return;
     }

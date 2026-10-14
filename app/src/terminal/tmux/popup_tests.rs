@@ -287,6 +287,15 @@ pub(crate) struct LiveTmux {
 impl LiveTmux {
     /// `None` (the test is skipped) without tmux 3.4 or newer.
     pub fn start(name: &str) -> Option<Self> {
+        Self::start_on_socket(format!("warp-u14-{}-{name}", std::process::id()))
+    }
+
+    /// [`Self::start`] on the isolated socket `socket`, which must start with `warp-`.
+    pub fn start_on_socket(socket: String) -> Option<Self> {
+        assert!(
+            socket.starts_with("warp-"),
+            "{socket} is not an isolated socket"
+        );
         let version = Command::new("tmux").arg("-V").output().ok()?;
         let version = String::from_utf8_lossy(&version.stdout).to_string();
         let number: f32 = version
@@ -301,7 +310,7 @@ impl LiveTmux {
         }
         let dir = tempfile::tempdir().ok()?;
         let mut tmux = Self {
-            socket: format!("warp-u14-{}-{name}", std::process::id()),
+            socket,
             socket_path: String::new(),
             client_name: String::new(),
             dir,
@@ -559,7 +568,7 @@ impl Drop for LiveTmux {
             let _ = child.wait();
         }
         let _ = self.command().arg("kill-server").output();
-        if self.socket_path.contains("warp-u14-") {
+        if self.socket.starts_with("warp-") && self.socket_path.ends_with(&self.socket) {
             let _ = std::fs::remove_file(&self.socket_path);
         }
     }

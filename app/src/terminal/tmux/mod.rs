@@ -10,6 +10,7 @@ pub mod key_capture;
 pub mod key_tables;
 #[cfg(feature = "local_tty")]
 pub mod keys;
+pub mod launcher_bindings;
 pub mod layout_snapshot;
 pub mod native_ui;
 #[cfg(feature = "local_tty")]
