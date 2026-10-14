@@ -18472,7 +18472,7 @@ impl TerminalView {
             }
 
             let current_shell = model.shell_launch_state().available_shell();
-            let pane_context_menu_items = self.pane_context_menu_items(current_shell, ctx);
+            let pane_context_menu_items = self.pane_context_menu_items(&model, current_shell, ctx);
             // Only add the separator if there's something before and after it.
             if !items.is_empty() && !pane_context_menu_items.is_empty() {
                 items.push(MenuItem::Separator);
@@ -18566,8 +18566,11 @@ impl TerminalView {
         items
     }
 
+    /// `model` is the caller's lock on this view's terminal model; locking it again here would
+    /// deadlock, since every caller builds its menu while holding it.
     fn pane_context_menu_items(
         &self,
+        model: &TerminalModel,
         shell: Option<AvailableShell>,
         ctx: &mut ViewContext<Self>,
     ) -> Vec<MenuItem<TerminalAction>> {
@@ -18576,7 +18579,7 @@ impl TerminalView {
         // R8: a tmux pane whose shell is not integrated offers "Warpify this pane", disabled with
         // the reason when the pane does not run a shell at its prompt (U9).
         if let Some(warpify) = &self.tmux.warpify
-            && self.is_tmux_plain_terminal(&self.model.lock())
+            && self.is_tmux_plain_terminal(model)
         {
             use crate::terminal::tmux::integration::WarpifyAvailability;
             let item = MenuItemFields::new("Warpify this pane")
@@ -18912,7 +18915,7 @@ impl TerminalView {
         }
         // Section 5: All Pane related
         let current_shell = model.shell_launch_state().available_shell();
-        let pane_context_menu_items = self.pane_context_menu_items(current_shell, ctx);
+        let pane_context_menu_items = self.pane_context_menu_items(&model, current_shell, ctx);
         if !pane_context_menu_items.is_empty() {
             items.push(MenuItem::Separator);
             items.extend(pane_context_menu_items);
@@ -19085,7 +19088,7 @@ impl TerminalView {
             ));
         }
         let current_shell = model.shell_launch_state().available_shell();
-        let mut pane_context_menu_items = self.pane_context_menu_items(current_shell, ctx);
+        let mut pane_context_menu_items = self.pane_context_menu_items(&model, current_shell, ctx);
         if !menu_items.is_empty() && !pane_context_menu_items.is_empty() {
             menu_items.push(MenuItem::Separator);
         }
