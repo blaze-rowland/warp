@@ -5305,7 +5305,12 @@ impl PaneGroup {
     /// The resolved display title for this pane group —
     /// custom title if set, otherwise the focused pane's title.
     pub fn display_title(&self, ctx: &AppContext) -> String {
-        self.custom_title(ctx).unwrap_or_else(|| self.title(ctx))
+        let title = self.custom_title(ctx).unwrap_or_else(|| self.title(ctx));
+        // A tmux tab leads with tmux's window index, so `prefix N` is always readable.
+        match self.tmux_window_index(ctx) {
+            Some(index) => format!("{index} {title}"),
+            None => title,
+        }
     }
 
     /// The tab-level custom title, if one has been set via the rename-tab flow.

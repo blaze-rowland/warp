@@ -80,6 +80,23 @@ impl PaneGroup {
         self.tmux_tab.is_some()
     }
 
+    /// tmux's `#{window_index}` for this tab's window, when it is a tmux tab.
+    pub fn tmux_window_index(&self, ctx: &AppContext) -> Option<u32> {
+        let tab = self.tmux_tab.as_ref()?;
+        #[cfg(feature = "local_tty")]
+        {
+            use crate::terminal::tmux::gateway::TmuxGateways;
+            if ctx.has_singleton_model::<TmuxGateways>() {
+                return TmuxGateways::as_ref(ctx)
+                    .model(tab.origin)?
+                    .window(tab.window_id)?
+                    .index;
+            }
+        }
+        let _ = (tab, ctx);
+        None
+    }
+
     /// Marks this pane group as the tab for `window_id`, whose panes were built from `layout`.
     pub(crate) fn bind_tmux_window(
         &mut self,

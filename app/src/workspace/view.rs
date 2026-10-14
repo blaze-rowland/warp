@@ -1574,8 +1574,9 @@ impl Workspace {
                 let changed = self.tabs[tab_index]
                     .pane_group
                     .as_ref(ctx)
-                    .display_title(ctx)
-                    != title;
+                    .custom_title(ctx)
+                    .as_deref()
+                    != Some(title.as_str());
                 if changed && !title.trim().is_empty() {
                     self.tmux_rename_tab(tab_index, &title, ctx);
                 }
@@ -5792,7 +5793,15 @@ impl Workspace {
 
     pub fn rename_tab(&mut self, index: usize, ctx: &mut ViewContext<Self>) {
         let tab = &self.tabs[index];
-        let title = tab.pane_group.as_ref(ctx).display_title(ctx);
+        let pane_group = tab.pane_group.as_ref(ctx);
+        // A tmux tab's displayed title leads with its window index; rename the name alone.
+        let title = if pane_group.is_tmux_tab() {
+            pane_group
+                .custom_title(ctx)
+                .unwrap_or_else(|| pane_group.display_title(ctx))
+        } else {
+            pane_group.display_title(ctx)
+        };
 
         self.rename_tab_internal(index, &title, ctx);
         send_telemetry_from_ctx!(

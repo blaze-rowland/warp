@@ -2185,7 +2185,7 @@ fn render_tab_group_internal(
     // custom title is still the right thing to show.
     // A tmux tab is one tmux window, so its window name is the title in every mode.
     let displayed_tab_title_override = if pane_group.is_tmux_tab() {
-        pane_group.custom_title(app)
+        Some(pane_group.display_title(app))
     } else if in_tab_group && matches!(display_granularity, VerticalTabsDisplayGranularity::Panes) {
         None
     } else {
