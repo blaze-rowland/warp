@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use instant::Instant;
 use parking_lot::{FairMutex, Mutex};
+use warp_core::safe_info;
 use warp_terminal::tmux::{CommandReply, PaneId};
 use warpui::r#async::Timer;
 use warpui::{AppContext, Entity, ModelContext, SingletonEntity, WeakViewHandle};
@@ -71,14 +72,26 @@ struct OriginState {
     existing: HashMap<PaneId, ExistingPanePlan>,
     panes: HashMap<PaneId, PaneEntry>,
     /// Pane queues held until the token is known, so no hook is parsed before its id is
-    /// registered.
-    held_queues: Vec<ConnectQueue>,
+    /// registered, with the hold each belongs to.
+    held_queues: HashMap<PaneId, (u64, ConnectQueue)>,
+    /// The last hold handed out.
+    last_hold: u64,
+    /// Panes that had a view since attach. A view made again for one (after a zoom or a move)
+    /// is not a new pane.
+    seen: HashSet<PaneId>,
     /// New panes being watched for their first idle moment.
     watching: HashSet<PaneId>,
     /// Warp's tmux plugin was loaded at attach (re-read before each new pane is planned).
     plugin: bool,
     /// The running continuum autosave loop, by generation; a new attach starts a new one.
     autosave: Option<u64>,
+}
+
+impl OriginState {
+    /// Whether a view for `pane_id` shows a pane created after attach that was never planned.
+    fn is_new_pane(&self, pane_id: PaneId) -> bool {
+        self.listed && !self.existing.contains_key(&pane_id) && !self.seen.contains(&pane_id)
+    }
 }
 
 /// See the module docs.
@@ -165,7 +178,8 @@ impl TmuxIntegration {
             return;
         }
         let state = self.origins.entry(origin).or_default();
-        let is_new = state.listed && !state.existing.contains_key(&pane_id);
+        let is_new = state.is_new_pane(pane_id);
+        state.seen.insert(pane_id);
         let warpify = match state.existing.get(&pane_id) {
             Some(ExistingPanePlan::Warpify(availability)) => Some(availability.clone()),
             _ => None,
@@ -184,14 +198,7 @@ impl TmuxIntegration {
                 .lock()
                 .register_session_id(derive_session_id(token, pane_id));
         }
-        if state.token_known {
-            connect_queue(ctx);
-        } else {
-            state.held_queues.push(connect_queue);
-            let _ = ctx.spawn(Timer::after(TOKEN_WAIT), move |me, _, ctx| {
-                me.release_queues(origin, ctx);
-            });
-        }
+        self.connect_when_token_known(origin, pane_id, connect_queue, ctx);
         if is_new {
             self.watch_new_pane(origin, pane_id, ctx);
         } else if let Some(availability) = warpify
@@ -205,6 +212,38 @@ impl TmuxIntegration {
                 view.set_tmux_warpify(Some(availability), ctx)
             });
         }
+    }
+
+    /// Runs `connect_queue` once `origin`'s token is known, or after [`TOKEN_WAIT`] without it.
+    fn connect_when_token_known(
+        &mut self,
+        origin: TmuxOriginId,
+        pane_id: PaneId,
+        connect_queue: ConnectQueue,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let state = self.origins.entry(origin).or_default();
+        if state.token_known {
+            connect_queue(ctx);
+            return;
+        }
+        state.last_hold += 1;
+        let hold = state.last_hold;
+        state.held_queues.insert(pane_id, (hold, connect_queue));
+        let _ = ctx.spawn(Timer::after(TOKEN_WAIT), move |me, _, ctx| {
+            let Some(state) = me.origins.get_mut(&origin) else {
+                return;
+            };
+            if state
+                .held_queues
+                .get(&pane_id)
+                .is_some_and(|(held, _)| *held == hold)
+                && let Some((_, connect)) = state.held_queues.remove(&pane_id)
+            {
+                log::info!("tmux: no hook token yet on {origin:?}; parsing pane {pane_id} without it");
+                connect(ctx);
+            }
+        });
     }
 
     /// Forgets a pane whose view is gone.
@@ -238,6 +277,7 @@ impl TmuxIntegration {
         // A session switch lists the new session's panes again.
         state.listed = false;
         state.existing.clear();
+        state.seen.clear();
         state.autosave = None;
         self.start_autosave(origin, ctx);
         let Some(state) = self.origins.get_mut(&origin) else {
@@ -315,7 +355,7 @@ impl TmuxIntegration {
         let Some(state) = self.origins.get_mut(&origin) else {
             return;
         };
-        for connect in std::mem::take(&mut state.held_queues) {
+        for (_, (_, connect)) in std::mem::take(&mut state.held_queues) {
             connect(ctx);
         }
     }
@@ -357,7 +397,10 @@ impl TmuxIntegration {
             return;
         };
         match &path {
-            Some(path) => log::info!("tmux: launcher installed at {path}"),
+            Some(path) => safe_info!(
+                safe: ("tmux: launcher installed on origin {origin:?}"),
+                full: ("tmux: launcher installed at {path}")
+            ),
             None => log::warn!(
                 "tmux: could not install the launcher on origin {origin:?}; Warp's panes start \
                  the default shell"
@@ -545,26 +588,21 @@ impl TmuxIntegration {
         let Some(view) = entry.view.upgrade(ctx) else {
             return;
         };
-        if entry.model.upgrade().is_some_and(|model| {
+        let integrating = entry.model.upgrade().is_some_and(|model| {
             let model = model.lock();
             model.block_list().is_bootstrapped() || model.pending_session_id().is_some()
-        }) {
-            return;
-        }
-        let Some(pane) = facts
-            .as_ref()
-            .map(parse_pane_facts)
-            .and_then(|panes| panes.into_iter().find(|pane| pane.pane_id == pane_id))
-        else {
-            return;
-        };
-        let plan = new_pane_plan(
-            &pane,
-            state.token.as_deref(),
+        });
+        let Some(plan) = new_pane_action(
+            pane_id,
+            integrating,
+            facts.as_ref(),
             clients.as_deref(),
+            state.token.as_deref(),
             state.plugin,
             integrate,
-        );
+        ) else {
+            return;
+        };
         log::debug!("tmux: new pane {pane_id} on {origin:?}: {plan:?}");
         match plan {
             NewPanePlan::Off | NewPanePlan::Launcher => {}
@@ -616,7 +654,8 @@ impl TmuxIntegration {
 
     /// One autosave tick: re-reads continuum's settings and the clients, and runs the save when
     /// it is due and no plain client is attached. Stops when the session ended, a new attach
-    /// started another loop, or continuum was turned off.
+    /// started another loop, or continuum was turned off. A failed or lost reply only skips this
+    /// tick.
     fn autosave_tick(
         &mut self,
         origin: TmuxOriginId,
@@ -630,6 +669,7 @@ impl TmuxIntegration {
         if !running {
             return;
         }
+        self.schedule_autosave(origin, generation, ctx);
         let config: Arc<Mutex<Option<CommandReply>>> = Arc::default();
         let config_slot = config.clone();
         send(
@@ -644,8 +684,7 @@ impl TmuxIntegration {
             origin,
             LIST_CLIENTS_QUERY.to_owned(),
             Some(Box::new(move |reply, ctx| {
-                let clients = plain_clients(reply);
-                let autosave = config.lock().take().as_ref().and_then(parse_continuum);
+                let step = autosave_step(config.lock().take().as_ref(), reply);
                 Self::handle(ctx).update(ctx, |me, ctx| {
                     let Some(state) = me.origins.get_mut(&origin) else {
                         return;
@@ -653,15 +692,20 @@ impl TmuxIntegration {
                     if state.autosave != Some(generation) {
                         return;
                     }
-                    let Some(autosave) = autosave else {
-                        log::info!("tmux: continuum is off on {origin:?}; autosave stopped");
-                        state.autosave = None;
-                        return;
-                    };
-                    if autosave_due(clients.as_deref()) {
-                        send(origin, autosave.save_command(), None, ctx);
+                    match step {
+                        AutosaveStep::Save(command) => {
+                            // This runs inside the session registry's reply dispatch, which
+                            // cannot take another command until it returns.
+                            let _ = ctx.spawn(async {}, move |_, _, ctx| {
+                                send(origin, command, None, ctx);
+                            });
+                        }
+                        AutosaveStep::Wait => {}
+                        AutosaveStep::Stop => {
+                            log::info!("tmux: continuum is off on {origin:?}; autosave stopped");
+                            state.autosave = None;
+                        }
                     }
-                    me.schedule_autosave(origin, generation, ctx);
                 });
             })),
             ctx,
@@ -730,6 +774,52 @@ impl TmuxIntegration {
     }
 }
 
+/// What an autosave tick does with its replies.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AutosaveStep {
+    /// Run continuum's save.
+    Save(String),
+    /// Nothing this tick: a plain client is attached (continuum saves from its status line), or
+    /// a reply failed or never came.
+    Wait,
+    /// Continuum is no longer set up.
+    Stop,
+}
+
+fn autosave_step(config: Option<&CommandReply>, clients: &CommandReply) -> AutosaveStep {
+    let Some(config) = config.filter(|config| !config.error) else {
+        return AutosaveStep::Wait;
+    };
+    let Some(autosave) = parse_continuum(config) else {
+        return AutosaveStep::Stop;
+    };
+    if autosave_due(plain_clients(clients).as_deref()) {
+        AutosaveStep::Save(autosave.save_command())
+    } else {
+        AutosaveStep::Wait
+    }
+}
+
+/// What to do with a new pane once its facts and the clients are read. `None` when the pane
+/// integrated meanwhile (`integrating`) or its facts are missing.
+fn new_pane_action(
+    pane_id: PaneId,
+    integrating: bool,
+    facts: Option<&CommandReply>,
+    clients: Option<&[String]>,
+    token: Option<&str>,
+    plugin: bool,
+    integrate: bool,
+) -> Option<NewPanePlan> {
+    if integrating {
+        return None;
+    }
+    let pane = parse_pane_facts(facts?)
+        .into_iter()
+        .find(|pane| pane.pane_id == pane_id)?;
+    Some(new_pane_plan(&pane, token, clients, plugin, integrate))
+}
+
 type Reply = Box<dyn FnOnce(&CommandReply, &mut AppContext)>;
 
 /// Sends one command through the session registry, which routes its reply.
@@ -762,3 +852,7 @@ fn confirm_warpify(
         ctx,
     );
 }
+
+#[cfg(test)]
+#[path = "app_model_tests.rs"]
+mod tests;

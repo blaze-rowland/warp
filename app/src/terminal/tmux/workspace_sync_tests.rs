@@ -728,3 +728,73 @@ fn reattach_waits_for_the_old_control_client_to_end() {
         assert!(sessions.update(&mut app, |s, ctx| s.request_reattach(origin, ctx)));
     });
 }
+
+// Warp focus to tmux (R14-R18): bindings act on tmux's active pane.
+
+#[test]
+fn focus_sync_selects_only_what_tmux_does_not_already_have_active() {
+    // @1 is active with %1; @2's active pane is %3.
+    let model = two_window_model();
+    assert_eq!(
+        focus_sync_commands(&model, WindowId(1), Some(PaneId(1))),
+        Vec::<String>::new(),
+        "tmux already shows this; a tmux-originated focus change sends nothing back"
+    );
+    assert_eq!(
+        focus_sync_commands(&model, WindowId(2), Some(PaneId(3))),
+        vec!["select-window -t @2".to_owned()]
+    );
+    assert_eq!(
+        focus_sync_commands(&model, WindowId(2), Some(PaneId(2))),
+        vec!["select-window -t @2".to_owned(), "select-pane -t %2".to_owned()]
+    );
+    assert_eq!(
+        focus_sync_commands(&model, WindowId(2), None),
+        vec!["select-window -t @2".to_owned()]
+    );
+    // A pane that is not in the window (a stale focus) is left alone.
+    assert_eq!(
+        focus_sync_commands(&model, WindowId(1), Some(PaneId(3))),
+        Vec::<String>::new()
+    );
+    // Windows tmux does not know are left alone.
+    assert_eq!(
+        focus_sync_commands(&model, WindowId(9), Some(PaneId(1))),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn warp_focus_is_sent_to_tmux_and_tmux_focus_is_not_echoed() {
+    let _flag = FeatureFlag::TmuxControlMode.override_enabled(true);
+    App::test((), |mut app| async move {
+        let (gateways, sessions) = sessions(&mut app);
+        let (origin, rx) = attach(&mut app, &gateways);
+        let sent = |rx: &mio_channel::Receiver<Message>| {
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .filter_map(|message| match message {
+                    Message::Tmux(TmuxRequest::Command { line, .. }) => Some(line),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        sent(&rx);
+
+        // The user focused %2 in the tab for @2.
+        sessions.update(&mut app, |s, ctx| {
+            s.sync_focus(origin, WindowId(2), Some(PaneId(2)), ctx)
+        });
+        assert_eq!(sent(&rx), ["select-window -t @2", "select-pane -t %2"]);
+
+        // tmux switched to @1 itself; the model has it before Warp follows, so nothing goes back.
+        let mut model = two_window_model();
+        model.set_active_window(WindowId(1));
+        gateways.update(&mut app, |g, ctx| {
+            g.deliver_for_test(origin, GatewayEvent::Model(Box::new(model)), ctx);
+        });
+        sessions.update(&mut app, |s, ctx| {
+            s.sync_focus(origin, WindowId(1), Some(PaneId(1)), ctx)
+        });
+        assert!(sent(&rx).is_empty());
+    });
+}

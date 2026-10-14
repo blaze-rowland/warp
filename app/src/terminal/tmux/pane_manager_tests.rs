@@ -363,37 +363,24 @@ fn keystrokes_are_forwarded_as_pane_input() {
 }
 
 #[test]
-fn a_device_attributes_query_is_answered_through_the_pane() {
+fn terminal_queries_in_pane_output_are_left_to_tmux() {
     App::test((), |mut app| async move {
         let pane = harness(&mut app, ShellType::Bash);
-        // vim asks for primary device attributes while starting.
-        pane.output(b"\x1b[c");
-
+        // DA1, DA2, CPR, OSC 11 and the kitty keyboard query, as vim or fish send at startup.
+        // tmux is the terminal the program talks to and answers these itself; a second answer
+        // from Warp would arrive as typed input.
+        pane.output(b"\x1b[c\x1b[>c\x1b[6n\x1b]11;?\x07\x1b[?u");
+        pane.output(b"after the queries\r\n");
         assert_eventually!(
-            !pane.pane_inputs().is_empty(),
-            "the reply is written back to the pane"
+            pane.text().contains("after the queries"),
+            "the output is parsed: {:?}",
+            pane.text()
         );
-        let inputs = pane.pane_inputs();
-        assert_eq!(inputs.len(), 1);
         assert!(
-            inputs[0].starts_with(b"\x1b[?"),
-            "a DA reply: {:?}",
-            String::from_utf8_lossy(&inputs[0])
+            pane.requests.requests().is_empty(),
+            "nothing is sent back: {:?}",
+            pane.requests.requests()
         );
-    });
-}
-
-#[test]
-fn a_cursor_position_query_is_answered_through_the_pane() {
-    App::test((), |mut app| async move {
-        let pane = harness(&mut app, ShellType::Bash);
-        pane.output(b"\x1b[6n");
-        assert_eventually!(
-            !pane.pane_inputs().is_empty(),
-            "the reply is written back to the pane"
-        );
-        let reply = pane.pane_inputs().remove(0);
-        assert!(reply.starts_with(b"\x1b[") && reply.ends_with(b"R"));
     });
 }
 
@@ -648,6 +635,75 @@ fn a_queue_ready_before_the_pane_is_attached_at_once() {
             "the waiting queue feeds the pane: {:?}",
             pane.text()
         );
+    });
+}
+
+#[test]
+fn a_view_recreated_for_a_dropped_pane_asks_tmux_for_its_content() {
+    App::test((), |mut app| async move {
+        let pane = harness_fed_by_gateways(&mut app);
+        let gateways = app.add_singleton_model(TmuxGateways::new);
+        let (requests_tx, requests_rx) = mio_channel::channel();
+        let (origin, _link) = gateways.update(&mut app, |g, ctx| {
+            let (origin, link) = g.link_for_new_origin(requests_tx, &HashMap::new());
+            g.deliver_for_test(origin, GatewayEvent::Starting, ctx);
+            (origin, link)
+        });
+        let resyncs = move || {
+            std::iter::from_fn(|| requests_rx.try_recv().ok())
+                .filter(|message| {
+                    matches!(message, Message::Tmux(TmuxRequest::ResyncPane(pane)) if *pane == PANE)
+                })
+                .count()
+        };
+
+        // A brand-new pane waits for its first output; nothing is asked.
+        app.update(|ctx| connect_queue(origin, PANE, &pane.backend.event_loop.clone(), ctx));
+        assert_eq!(resyncs(), 0);
+
+        // The pane's view was dropped (zoomed out, or moved to another tab) and comes back: the
+        // old queue went with the old view, so the gateway is asked for a new one.
+        gateways.update(&mut app, |g, _| g.pane_view_released(origin, PANE));
+        app.update(|ctx| connect_queue(origin, PANE, &pane.backend.event_loop.clone(), ctx));
+        assert_eq!(resyncs(), 1);
+        // Asked once per drop.
+        app.update(|ctx| connect_queue(origin, PANE, &pane.backend.event_loop.clone(), ctx));
+        assert_eq!(resyncs(), 0);
+    });
+}
+
+#[test]
+fn a_dropped_pane_whose_queue_was_reopened_takes_it_without_asking() {
+    App::test((), |mut app| async move {
+        let mut pane = harness_fed_by_gateways(&mut app);
+        assert_eventually!(
+            !pane
+                .event_loop()
+                .read(&app, |event_loop, _| event_loop.is_draining()),
+            "the test queue is done"
+        );
+        let gateways = app.add_singleton_model(TmuxGateways::new);
+        let (requests_tx, requests_rx) = mio_channel::channel();
+        let (origin, mut link) = gateways.update(&mut app, |g, ctx| {
+            let (origin, link) = g.link_for_new_origin(requests_tx, &HashMap::new());
+            g.deliver_for_test(origin, GatewayEvent::Starting, ctx);
+            (origin, link)
+        });
+        gateways.update(&mut app, |g, _| g.pane_view_released(origin, PANE));
+        // Output while the pane was hidden reopened its queue (with a snapshot) in the gateway.
+        let (queue_tx, queue_rx) = test_pane_queue(PANE);
+        (link.sink)(GatewayEvent::PaneQueueOpened { queue: queue_rx });
+        pane.queue = Some(queue_tx);
+        pane.output(b"while hidden\r\n");
+        warpui::r#async::Timer::after(std::time::Duration::from_millis(20)).await;
+
+        app.update(|ctx| connect_queue(origin, PANE, &pane.backend.event_loop.clone(), ctx));
+        assert_eventually!(
+            pane.text().contains("while hidden"),
+            "the reopened queue feeds the new view: {:?}",
+            pane.text()
+        );
+        assert!(requests_rx.try_recv().is_err(), "nothing else is asked");
     });
 }
 

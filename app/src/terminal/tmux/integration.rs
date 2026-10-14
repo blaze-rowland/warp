@@ -21,6 +21,7 @@
 //! hook printed by a program (`cat` of a log) with any other id is rejected.
 
 use sha2::{Digest, Sha256};
+use warp_core::safe_warn;
 use warp_terminal::tmux::{CommandReply, PaneId};
 
 use super::plugins::{CURRENT_DIR, PLUGIN_FILE};
@@ -521,6 +522,13 @@ pub(crate) fn run_shell(script: &str) -> String {
     format!("run-shell '{{ {script}; }} >/dev/null 2>&1 || true'")
 }
 
+/// [`run_shell`] as a background job: tmux answers at once and runs the next command without
+/// waiting for the script.
+pub(crate) fn run_shell_background(script: &str) -> String {
+    debug_assert!(!script.contains('#') && !script.contains('\''));
+    format!("run-shell -b '{{ {script}; }} >/dev/null 2>&1 || true'")
+}
+
 /// Where launchers look for a request to announce themselves again, under the host's `$HOME`.
 /// It is beside the versioned install directories, so a pane started by an older Warp's
 /// launcher still finds it.
@@ -677,9 +685,9 @@ fn link_current(bundle: &LauncherBundle, home: &std::path::Path) {
         .and_then(|()| std::fs::rename(&staging, &link));
     if let Err(error) = linked {
         let _ = std::fs::remove_file(&staging);
-        log::warn!(
-            "tmux: could not point {} at the launcher: {error}",
-            link.display()
+        safe_warn!(
+            safe: ("tmux: could not point the launcher link at the launcher: {error}"),
+            full: ("tmux: could not point {} at the launcher: {error}", link.display())
         );
     }
 }

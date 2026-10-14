@@ -518,3 +518,157 @@ fn confirm_requests_without_a_held_entry_leave_a_running_session_alone() {
     assert!(gateway.take_shell_bytes().is_empty());
     assert_eq!(event_names(&events), ["Starting", "TransportLost", "Ended"]);
 }
+
+/// tmux's answer to one command line Warp wrote, for a session with one window holding `panes`.
+fn tmux_reply(line: &str, panes: &[u32]) -> Vec<String> {
+    let checked = |body: &str| format!("{:04x},{body}", crate::tmux::layout_checksum(body));
+    if line.starts_with("display-message -p '#{version}") {
+        vec!["3.7c\tclient-7".to_owned()]
+    } else if line.starts_with("list-windows") {
+        let body = match panes {
+            [pane] => format!("80x24,0,0,{pane}"),
+            panes => format!(
+                "80x24,0,0{{{}}}",
+                panes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, pane)| format!("39x24,{},0,{pane}", i * 40))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        };
+        let layout = checked(&body);
+        vec![format!("@1\t1\t1\t{layout}\t{layout}\t*\tmain")]
+    } else if line.starts_with("list-panes") {
+        panes
+            .iter()
+            .map(|pane| format!("%{pane}\t@1\t1\t0\t0\t80\t24\t\t"))
+            .collect()
+    } else if line.starts_with("show -gv prefix2") {
+        vec!["None".to_owned()]
+    } else if line.starts_with("show -gv prefix") {
+        vec!["C-b".to_owned()]
+    } else if line.starts_with("capture-pane") {
+        vec!["fresh".to_owned()]
+    } else if line.starts_with("display-message -p -t") {
+        vec!["0\t0".to_owned()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Answers everything in `writes` as tmux would, until Warp writes nothing more.
+fn answer_all(gateway: &mut Gateway, writes: &mut VecDeque<Cow<'static, [u8]>>, panes: &[u32]) {
+    // tmux numbers each command it runs, across the whole session.
+    static NEXT_NUMBER: AtomicUsize = AtomicUsize::new(300);
+    while let Some(line) = writes.pop_front() {
+        let number = NEXT_NUMBER.fetch_add(1, Ordering::Relaxed);
+        let line = String::from_utf8_lossy(&line).into_owned();
+        let mut text = format!("%begin 1 {number} 1\n");
+        for reply in tmux_reply(&line, panes) {
+            text.push_str(&reply);
+            text.push('\n');
+        }
+        text.push_str(&format!("%end 1 {number} 1\n"));
+        gateway.route(text.as_bytes(), writes);
+    }
+}
+
+/// A gateway attached to a session with one window holding `panes`, every seed answered.
+fn attached_gateway(panes: &[u32]) -> (Gateway, Arc<Mutex<Vec<GatewayEvent>>>) {
+    let (mut gateway, events) = gateway(true);
+    let mut writes = VecDeque::new();
+    gateway.route(
+        b"\x1bP1000p%begin 1 280 0\n%end 1 280 0\n%window-add @1\n%sessions-changed\n\
+          %session-changed $0 main\n",
+        &mut writes,
+    );
+    answer_all(&mut gateway, &mut writes, panes);
+    assert!(
+        event_names(&events).iter().any(|name| name == "Attached"),
+        "{:?}",
+        event_names(&events)
+    );
+    (gateway, events)
+}
+
+/// Takes the queues opened so far, by pane.
+fn opened_queues(events: &Arc<Mutex<Vec<GatewayEvent>>>) -> Vec<PaneQueueReceiver> {
+    let mut events = events.lock().unwrap();
+    let (opened, rest): (Vec<_>, Vec<_>) = events
+        .drain(..)
+        .partition(|event| matches!(event, GatewayEvent::PaneQueueOpened { .. }));
+    *events = rest;
+    opened
+        .into_iter()
+        .filter_map(|event| match event {
+            GatewayEvent::PaneQueueOpened { queue } => Some(queue),
+            _ => None,
+        })
+        .collect()
+}
+
+fn drain(queue: &PaneQueueReceiver) -> Vec<PaneChunk> {
+    std::iter::from_fn(|| queue.try_recv()).collect()
+}
+
+#[test]
+fn a_queue_whose_reader_is_gone_is_reopened_with_a_resync() {
+    let (mut gateway, events) = attached_gateway(&[1, 2]);
+    let queues = opened_queues(&events);
+    assert_eq!(queues.len(), 2);
+    // The view showing %1 is dropped (zoomed out, or moved to another tab).
+    drop(queues.into_iter().find(|queue| queue.pane_id() == PaneId(1)));
+
+    let mut writes = VecDeque::new();
+    gateway.route(b"%output %1 hidden\n", &mut writes);
+    let reopened = opened_queues(&events);
+    assert_eq!(
+        reopened.iter().map(PaneQueueReceiver::pane_id).collect::<Vec<_>>(),
+        [PaneId(1)],
+        "the pane's next output opens a new queue"
+    );
+    assert!(
+        writes
+            .iter()
+            .any(|line| line.starts_with(b"capture-pane -p -e -J -S -2000 -t %1")),
+        "the new queue gets a resync: {writes:?}"
+    );
+    answer_all(&mut gateway, &mut writes, &[1, 2]);
+    let chunks = drain(&reopened[0]);
+    assert_eq!(chunks[0], PaneChunk::Output(b"hidden".to_vec()));
+    assert!(
+        matches!(&chunks[1], PaneChunk::Snapshot(snapshot) if snapshot.lines == [b"fresh".to_vec()]),
+        "{chunks:?}"
+    );
+
+    // The reopened queue is live: more output goes to it without another resync.
+    gateway.route(b"%output %1 more\n", &mut writes);
+    assert!(writes.is_empty());
+    assert!(opened_queues(&events).is_empty());
+    assert_eq!(drain(&reopened[0]), [PaneChunk::Output(b"more".to_vec())]);
+}
+
+#[test]
+fn a_resync_request_replaces_the_queue_and_sends_a_snapshot() {
+    let (mut gateway, events) = attached_gateway(&[1]);
+    // An old view still holds the queue while a new view for the same pane asks for content.
+    let old = opened_queues(&events).pop().unwrap();
+    let mut writes = VecDeque::new();
+    gateway.request(TmuxRequest::ResyncPane(PaneId(1)), &mut writes);
+    assert!(old.is_closed(), "the old view's queue is closed");
+    assert!(opened_queues(&events).is_empty());
+    answer_all(&mut gateway, &mut writes, &[1]);
+
+    let new = opened_queues(&events);
+    assert_eq!(new.len(), 1);
+    assert!(
+        matches!(&drain(&new[0])[..], [PaneChunk::Snapshot(snapshot)] if snapshot.lines == [b"fresh".to_vec()])
+    );
+    gateway.route(b"%output %1 after\n", &mut writes);
+    assert_eq!(drain(&new[0]), [PaneChunk::Output(b"after".to_vec())]);
+
+    // A pane tmux does not know is left alone.
+    gateway.request(TmuxRequest::ResyncPane(PaneId(9)), &mut writes);
+    assert!(writes.is_empty());
+}

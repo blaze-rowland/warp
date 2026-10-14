@@ -6,7 +6,9 @@
 //! - The queue is drained and parsed on a background executor, never on the UI thread, and only
 //!   the pane's own model is locked while parsing. The origin model is never touched here.
 //! - Input, including whole commands from the input editor, becomes [`TmuxRequest::PaneInput`]
-//!   (`send-keys -H`). So do the parser's replies to terminal queries (DA, DSR, OSC 10/11).
+//!   (`send-keys -H`). Terminal queries in pane output (DA, DSR, OSC 10/11, ...) are not
+//!   answered: tmux is the terminal the pane's program talks to and answers them itself, so a
+//!   second answer from Warp would reach the program as typed input.
 //! - A resize is reported as [`TmuxPaneEventLoopEvent::Resized`]; the window sizer turns the
 //!   sizes of a window's panes into one `refresh-client -C @W:WxH`.
 //! - `Shutdown` and `ChildExited` only release this view's state. Dropping a Warp pane sends
@@ -148,7 +150,6 @@ impl TmuxPaneEventLoop {
             queue,
             self.model.clone(),
             self.channel_event_listener.clone(),
-            self.requests.clone(),
             self.released.clone(),
             self.release_rx.clone(),
             self.last_output.clone(),
@@ -195,7 +196,7 @@ impl TmuxPaneEventLoop {
             Message::Shutdown | Message::ChildExited => self.release(),
             // Session-level requests go through the origin PTY's own event loop.
             Message::Tmux(request) => {
-                log::warn!("tmux: pane {} ignoring {request:?}", self.pane_id);
+                log::warn!("tmux: pane {} ignoring a {} request", self.pane_id, request.name());
             }
         }
     }
@@ -216,7 +217,6 @@ async fn drain(
     queue: PaneQueueReceiver,
     model: Arc<FairMutex<TerminalModel>>,
     channel_event_listener: ChannelEventListener,
-    requests: Arc<dyn PaneRequestSink>,
     released: Arc<AtomicBool>,
     release_rx: Receiver<()>,
     last_output: Arc<Mutex<Option<Instant>>>,
@@ -227,7 +227,6 @@ async fn drain(
         Released,
     }
 
-    let pane_id = queue.pane_id();
     let mut parser = Processor::new();
     loop {
         let next = futures_lite::future::or(
@@ -252,30 +251,18 @@ async fn drain(
         if released.load(Ordering::Acquire) {
             return DrainEnd::Released;
         }
-        let replies = apply_chunk(&mut parser, &model, chunk);
+        apply_chunk(&mut parser, &model, chunk);
         *last_output.lock() = Some(Instant::now());
         channel_event_listener.send_wakeup_event();
-        // The model is unlocked again before anything is sent.
-        if !replies.is_empty() && !released.load(Ordering::Acquire) {
-            requests.send(TmuxRequest::PaneInput {
-                pane_id,
-                bytes: replies,
-            });
-        }
     }
 }
 
-/// Applies one chunk to the pane's model, holding only that model's lock. Returns the parser's
-/// replies to terminal queries, which belong to the program in the pane.
-fn apply_chunk(
-    parser: &mut Processor,
-    model: &FairMutex<TerminalModel>,
-    chunk: PaneChunk,
-) -> Vec<u8> {
-    let mut replies = Vec::new();
+/// Applies one chunk to the pane's model, holding only that model's lock. The parser's replies
+/// to terminal queries are dropped; tmux already answered them (see the module docs).
+fn apply_chunk(parser: &mut Processor, model: &FairMutex<TerminalModel>, chunk: PaneChunk) {
     let mut model = model.lock();
     match chunk {
-        PaneChunk::Output(bytes) => parser.parse_bytes(&mut *model, &bytes, &mut replies),
+        PaneChunk::Output(bytes) => parser.parse_bytes(&mut *model, &bytes, &mut std::io::sink()),
         PaneChunk::Snapshot(snapshot) => {
             // Whatever the parser was in the middle of is stale now.
             *parser = Processor::new();
@@ -288,5 +275,4 @@ fn apply_chunk(
             parser.parse_bytes(&mut *model, &snapshot.to_vt_bytes(), &mut std::io::sink());
         }
     }
-    replies
 }

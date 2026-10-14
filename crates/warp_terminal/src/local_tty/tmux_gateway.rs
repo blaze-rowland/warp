@@ -206,6 +206,9 @@ pub enum TmuxRequest {
     Command { tag: u64, line: String },
     /// A pane's queue drained below its low-water mark; resume and resync it.
     ResumePane(PaneId),
+    /// A new view shows a pane whose earlier view dropped its queue: close the old queue and
+    /// open a new one that starts with a fresh snapshot.
+    ResyncPane(PaneId),
     /// Detach the control client (the final bare newline).
     Detach,
     /// The user accepted [`GatewayEvent::ConfirmPending`]: start the session.
@@ -214,6 +217,22 @@ pub enum TmuxRequest {
     /// as plain output and the PTY stays the shell's. Nothing is written, since the stream may
     /// not be tmux; a real `tmux -CC` left running there ends with `detach` or Ctrl-C.
     ConfirmDismiss,
+}
+
+impl TmuxRequest {
+    /// The variant's name, for logs. Unlike `Debug`, it never includes keystrokes or commands.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::PaneInput { .. } => "PaneInput",
+            Self::ClientKey(_) => "ClientKey",
+            Self::Command { .. } => "Command",
+            Self::ResumePane(_) => "ResumePane",
+            Self::ResyncPane(_) => "ResyncPane",
+            Self::Detach => "Detach",
+            Self::ConfirmOpen => "ConfirmOpen",
+            Self::ConfirmDismiss => "ConfirmDismiss",
+        }
+    }
 }
 
 /// What the gateway reports to the app.
@@ -317,6 +336,10 @@ struct PaneQueueSender {
 }
 
 impl PaneQueueSender {
+    fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+
     fn push(&self, chunk: PaneChunk) -> Pushed {
         let len = chunk.byte_len();
         let queued = self.shared.bytes.load(Ordering::Acquire);
@@ -657,10 +680,11 @@ impl Gateway {
             | TmuxRequest::ClientKey(_)
             | TmuxRequest::Command { .. }
             | TmuxRequest::ResumePane(_)
+            | TmuxRequest::ResyncPane(_)
             | TmuxRequest::Detach => {}
         }
         let State::Session(session) = &mut self.state else {
-            log::debug!("tmux: dropping {request:?} with no session running");
+            log::debug!("tmux: dropping a {} request with no session running", request.name());
             return;
         };
         let client = &mut session.client;
@@ -674,6 +698,14 @@ impl Gateway {
             }),
             TmuxRequest::ResumePane(pane_id) => {
                 client.resume_pane(pane_id, now);
+                Ok(())
+            }
+            TmuxRequest::ResyncPane(pane_id) => {
+                if client.model().pane(pane_id).is_some() {
+                    // Whoever holds the old queue is going away; the snapshot opens a new one.
+                    session.queues.remove(&pane_id);
+                    client.resync_pane(pane_id, now);
+                }
                 Ok(())
             }
             TmuxRequest::Detach => {
@@ -915,6 +947,19 @@ impl Gateway {
         chunk: PaneChunk,
         now: Duration,
     ) {
+        if session
+            .queues
+            .get(&pane_id)
+            .is_some_and(PaneQueueSender::is_closed)
+        {
+            // The view that read this queue was dropped (a zoomed-out or moved pane). Open a new
+            // queue for the next view, starting from a snapshot of what it missed.
+            log::debug!("tmux: pane {pane_id} queue has no reader; reopening it");
+            session.queues.remove(&pane_id);
+            if !matches!(chunk, PaneChunk::Snapshot(_)) {
+                session.client.resync_pane(pane_id, now);
+            }
+        }
         let queue = session.queues.entry(pane_id).or_insert_with(|| {
             let (sender, queue) = pane_queue(pane_id, limits, requester.clone());
             sink(GatewayEvent::PaneQueueOpened { queue });

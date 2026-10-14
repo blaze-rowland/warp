@@ -6,27 +6,32 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
+use instant::Instant;
 use warp_terminal::tmux::CommandReply;
 use warpui::r#async::Timer;
 use warpui::{Entity, ModelContext, SingletonEntity, WindowId as UiWindowId};
 
 use super::{
-    GLOBAL_PATH_QUERY, HiddenPopupChange, HiddenPopupWatch, PopupSpec, PopupWindow,
-    bound_popup_command, close_popup_command, hidden_popup_text, hidden_popups, parse_clients,
-    parse_global_path, parse_pane_pids, parse_probe, parse_window_id, path_with_wrapper,
-    popup_window_options_command, popup_windows, probe_commands, set_global_path_command,
-    wrapper_dir,
+    CONFIRM_DELAY, GLOBAL_PATH_QUERY, HiddenPopupChange, HiddenPopupWatch, PopupSpec,
+    PopupWindow, ProbeState, bound_popup_command, close_popup_command, hidden_popup_text,
+    hidden_popups, parse_clients, parse_global_path, parse_pane_pids, parse_probe,
+    parse_window_id, path_with_wrapper, popup_window_options_command, popup_windows,
+    probe_read_commands, probe_start_command, set_global_path_command, wrapper_dir,
 };
 use crate::terminal::tmux::TmuxOriginId;
 use crate::terminal::tmux::gateway::TmuxGateways;
-use crate::terminal::tmux::keys::TmuxKeyRouter;
+use crate::terminal::tmux::keys::{TmuxKeyRouter, TmuxKeyRouterEvent};
 use crate::terminal::tmux::native_ui::{client_name, send, show_toast_with};
 use crate::terminal::tmux::workspace_sync::{SessionStatus, TmuxSessionEvent, TmuxSessions};
 use crate::view_components::DismissibleToast;
 use crate::workspace::ToastStack;
 
-/// How often an attached session is probed for a hidden popup.
-pub const PROBE_INTERVAL: Duration = Duration::from_secs(3);
+/// How long after starting a probe its record is first read, and between reads while the
+/// background job has not written it yet.
+const PROBE_READ_DELAY: Duration = Duration::from_millis(300);
+
+/// Reads of a probe's record before it is given up.
+const PROBE_READ_ATTEMPTS: u32 = 10;
 
 /// How long the hidden-popup toast stays; it is removed earlier when the popup goes away.
 const HIDDEN_POPUP_TOAST_TIME: Duration = Duration::from_secs(60);
@@ -35,8 +40,9 @@ const HIDDEN_POPUP_TOAST_TIME: Duration = Duration::from_secs(60);
 struct OriginPopups {
     popups: Vec<PopupWindow>,
     watch: HiddenPopupWatch,
-    probing: bool,
-    polling: bool,
+    probe: ProbeState,
+    /// A follow-up probe is scheduled.
+    follow_up: bool,
     /// The hidden-popup toast, removed when the popup goes away.
     toast: Option<(String, UiWindowId)>,
 }
@@ -64,6 +70,14 @@ impl TmuxPopups {
         ctx.subscribe_to_model(&TmuxSessions::handle(ctx), |me, _, event, ctx| {
             me.on_session_event(event, ctx);
         });
+        if ctx.has_singleton_model::<TmuxKeyRouter>() {
+            // A key that tmux never answers is the sign of a popup taking keys.
+            ctx.subscribe_to_model(&TmuxKeyRouter::handle(ctx), |me, _, event, ctx| {
+                if let TmuxKeyRouterEvent::Stalled { origin, .. } = event {
+                    me.probe(*origin, ctx);
+                }
+            });
+        }
         Self::default()
     }
 
@@ -134,17 +148,14 @@ impl TmuxPopups {
             return;
         };
         send(origin, close_popup_command(&client), None, ctx);
+        self.schedule_probe(origin, CONFIRM_DELAY, ctx);
     }
 
     fn on_session_event(&mut self, event: &TmuxSessionEvent, ctx: &mut ModelContext<Self>) {
         match event {
             TmuxSessionEvent::Attached { origin } => {
                 self.sync_popups(*origin, ctx);
-                let state = self.origins.entry(*origin).or_default();
-                if !state.polling {
-                    state.polling = true;
-                    self.schedule_probe(*origin, ctx);
-                }
+                self.probe(*origin, ctx);
             }
             TmuxSessionEvent::WindowsChanged { origin } => self.sync_popups(*origin, ctx),
             TmuxSessionEvent::Ended { origin, .. } => {
@@ -179,68 +190,122 @@ impl TmuxPopups {
         }
     }
 
-    fn schedule_probe(&mut self, origin: TmuxOriginId, ctx: &mut ModelContext<Self>) {
-        let _ = ctx.spawn(Timer::after(PROBE_INTERVAL), move |me, _, ctx| {
-            if !me.origins.contains_key(&origin) {
+    /// Probes again after `delay`, unless a follow-up is already scheduled. While no Warp window
+    /// is active the probe waits for the next tick.
+    fn schedule_probe(&mut self, origin: TmuxOriginId, delay: Duration, ctx: &mut ModelContext<Self>) {
+        let Some(state) = self.origins.get_mut(&origin) else {
+            return;
+        };
+        if std::mem::replace(&mut state.follow_up, true) {
+            return;
+        }
+        let _ = ctx.spawn(Timer::after(delay), move |me, _, ctx| {
+            let Some(state) = me.origins.get_mut(&origin) else {
+                return;
+            };
+            state.follow_up = false;
+            if ctx.windows().active_window().is_none() {
+                me.schedule_probe(origin, delay, ctx);
                 return;
             }
             me.probe(origin, ctx);
-            me.schedule_probe(origin, ctx);
         });
     }
 
+    /// Looks for a hidden popup on `origin`'s server: starts the background job, then reads its
+    /// record.
     fn probe(&mut self, origin: TmuxOriginId, ctx: &mut ModelContext<Self>) {
         if TmuxSessions::as_ref(ctx).status(origin) != Some(SessionStatus::Attached) {
             return;
         }
-        let Some(state) = self.origins.get_mut(&origin) else {
+        let Some(token) = self
+            .origins
+            .entry(origin)
+            .or_default()
+            .probe
+            .start(Instant::now())
+        else {
             return;
         };
-        if state.probing {
+        send(origin, probe_start_command(token), None, ctx);
+        self.read_probe(origin, token, PROBE_READ_ATTEMPTS, ctx);
+    }
+
+    fn read_probe(
+        &mut self,
+        origin: TmuxOriginId,
+        token: u64,
+        attempts: u32,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let _ = ctx.spawn(Timer::after(PROBE_READ_DELAY), move |_, _, ctx| {
+            let replies: Rc<RefCell<Vec<CommandReply>>> = Rc::default();
+            let commands = probe_read_commands();
+            let count = commands.len();
+            for line in commands {
+                let replies = replies.clone();
+                send(
+                    origin,
+                    line,
+                    Some(Box::new(move |reply, ctx| {
+                        replies.borrow_mut().push(reply.clone());
+                        if replies.borrow().len() == count {
+                            let replies = std::mem::take(&mut *replies.borrow_mut());
+                            Self::handle(ctx).update(ctx, |me, ctx| {
+                                me.on_probe_read(origin, token, attempts, &replies, ctx);
+                            });
+                        }
+                    })),
+                    ctx,
+                );
+            }
+        });
+    }
+
+    fn on_probe_read(
+        &mut self,
+        origin: TmuxOriginId,
+        token: u64,
+        attempts: u32,
+        replies: &[CommandReply],
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let [record, panes, clients] = replies else {
             return;
-        }
-        state.probing = true;
-        let replies: Rc<RefCell<Vec<CommandReply>>> = Rc::default();
-        let commands = probe_commands();
-        let count = commands.len();
-        for (index, line) in commands.into_iter().enumerate() {
-            let replies = replies.clone();
-            send(
-                origin,
-                line,
-                Some(Box::new(move |reply, ctx| {
-                    replies.borrow_mut().push(reply.clone());
-                    if index + 1 == count {
-                        let replies = std::mem::take(&mut *replies.borrow_mut());
-                        Self::handle(ctx).update(ctx, |me, ctx| {
-                            me.on_probed(origin, &replies, ctx);
-                        });
-                    }
-                })),
-                ctx,
-            );
+        };
+        match parse_probe(record, token) {
+            Some(children) => {
+                let found = hidden_popups(
+                    &children,
+                    &parse_pane_pids(panes),
+                    &parse_clients(clients),
+                );
+                self.on_probed(origin, token, found, ctx);
+            }
+            None if attempts > 1 => self.read_probe(origin, token, attempts - 1, ctx),
+            None => {
+                log::debug!("tmux: the hidden-popup probe did not finish; giving up");
+                if let Some(state) = self.origins.get_mut(&origin) {
+                    state.probe.abandon(token);
+                }
+            }
         }
     }
 
     fn on_probed(
         &mut self,
         origin: TmuxOriginId,
-        replies: &[CommandReply],
+        token: u64,
+        found: Vec<super::ServerChild>,
         ctx: &mut ModelContext<Self>,
     ) {
         let Some(state) = self.origins.get_mut(&origin) else {
             return;
         };
-        state.probing = false;
-        // The first reply is the `run-shell`'s, which carries nothing.
-        let [_, probe, panes, clients] = replies else {
+        if !state.probe.finish(token) {
             return;
-        };
-        let found = hidden_popups(
-            &parse_probe(probe),
-            &parse_pane_pids(panes),
-            &parse_clients(clients),
-        );
+        }
+        let found_any = !found.is_empty();
         match state.watch.on_probe(found) {
             Some(HiddenPopupChange::Found(child)) => {
                 log::info!("tmux: hidden popup {} ({})", child.pid, child.command);
@@ -263,6 +328,10 @@ impl TmuxPopups {
                 }
             }
             None => {}
+        }
+        let offered = state.watch.offered().is_some();
+        if let Some(delay) = state.probe.next_delay(found_any, offered) {
+            self.schedule_probe(origin, delay, ctx);
         }
     }
 }

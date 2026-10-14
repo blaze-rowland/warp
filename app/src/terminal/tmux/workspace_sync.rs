@@ -345,6 +345,32 @@ pub fn select_pane_command(pane_id: PaneId) -> String {
     format!("select-pane -t {pane_id}")
 }
 
+/// The commands that make tmux's active window and pane the ones Warp shows (`window_id`, with
+/// `pane_id` focused), as far as `model` knows. Empty when tmux already agrees, which is always
+/// the case when the focus change came from tmux, so nothing is echoed back.
+pub fn focus_sync_commands(
+    model: &SessionModel,
+    window_id: WindowId,
+    pane_id: Option<PaneId>,
+) -> Vec<String> {
+    let Some(window) = model.window(window_id) else {
+        return Vec::new();
+    };
+    let mut commands = Vec::new();
+    if model.active_window() != Some(window_id) {
+        commands.push(select_window_command(window_id));
+    }
+    if let Some(pane_id) = pane_id
+        && window.active_pane != Some(pane_id)
+        && model
+            .pane(pane_id)
+            .is_some_and(|pane| pane.window_id == window_id)
+    {
+        commands.push(select_pane_command(pane_id));
+    }
+    commands
+}
+
 /// Asks for the foreground command of every pane in a window.
 pub fn window_commands_query(window_id: WindowId) -> String {
     format!("list-panes -t {window_id} -F '#{{pane_current_command}}'")
@@ -517,6 +543,23 @@ impl TmuxSessions {
 
     pub fn status(&self, origin: TmuxOriginId) -> Option<SessionStatus> {
         self.sessions.get(&origin).map(|session| session.status)
+    }
+
+    /// Makes tmux's active window and pane match what Warp shows for `origin`, so tmux bindings
+    /// act on the pane the user is looking at.
+    pub fn sync_focus(
+        &mut self,
+        origin: TmuxOriginId,
+        window_id: WindowId,
+        pane_id: Option<PaneId>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let Some(model) = TmuxGateways::as_ref(ctx).model(origin) else {
+            return;
+        };
+        for line in focus_sync_commands(model, window_id, pane_id) {
+            self.send_command(origin, line, None, ctx);
+        }
     }
 
     /// Sends one command line to `origin`'s session. `on_reply` runs once with its reply.

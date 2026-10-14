@@ -5566,6 +5566,8 @@ impl Workspace {
             self.set_active_tab_index(index, ctx);
             self.focus_active_tab(ctx);
             self.update_window_title(ctx);
+            #[cfg(feature = "local_tty")]
+            self.sync_tmux_focus(ctx);
         }
     }
 
@@ -16839,6 +16841,8 @@ impl Workspace {
             // If focused pane contains an object, then set selected state in WD to that object
             pane_group::Event::PaneFocused => {
                 self.current_workspace_state.close_all_modals();
+                #[cfg(feature = "local_tty")]
+                self.sync_tmux_focus(ctx);
 
                 // Re-evaluate which region is focused and update pane dimming accordingly.
                 self.update_pane_dimming_for_current_focus_region(ctx);

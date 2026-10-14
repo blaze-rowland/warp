@@ -18,7 +18,9 @@
 //! session's tab rather than as tabs of their own.
 
 use std::collections::HashSet;
+use std::time::Duration;
 
+use instant::Instant;
 use warp_terminal::tmux::{CommandReply, PaneId, quote_argument};
 
 use super::native_ui::PopupSpec;
@@ -51,7 +53,8 @@ pub fn popup_window_name(title: Option<&str>) -> String {
 }
 
 /// Runs a bound `display-popup`'s command in a detached window and prints the window's id.
-/// The arguments are spliced as bound, so tmux parses them exactly as the binding would.
+/// The arguments are spliced as bound, so tmux parses them exactly as the binding would; one
+/// that could end the command or run past its own word is quoted instead.
 pub fn bound_popup_command(spec: &PopupSpec) -> String {
     let mut command = format!(
         "new-window -d -P -F '#{{window_id}}' -n {}",
@@ -59,17 +62,57 @@ pub fn bound_popup_command(spec: &PopupSpec) -> String {
     );
     if let Some(directory) = &spec.directory_raw {
         command.push_str(" -c ");
-        command.push_str(directory);
+        command.push_str(&splice_argument(directory));
     }
     for environment in &spec.environment_raw {
         command.push_str(" -e ");
-        command.push_str(environment);
+        command.push_str(&splice_argument(environment));
     }
     for argument in &spec.command_raw {
         command.push(' ');
-        command.push_str(argument);
+        command.push_str(&splice_argument(argument));
     }
     command
+}
+
+/// `raw` when tmux would read it as exactly one plain argument, or else `raw` double-quoted
+/// with control characters removed.
+fn splice_argument(raw: &str) -> String {
+    if is_one_plain_word(raw) {
+        raw.to_owned()
+    } else {
+        let text: String = raw.chars().filter(|c| !c.is_control()).collect();
+        quote_argument(&text)
+    }
+}
+
+/// Whether tmux reads `raw` as one argument that is not a command block and does not end the
+/// command: no control characters, no whitespace outside quotes, balanced quotes, and no
+/// trailing `;` (which tmux treats as a separator, escaped or not).
+fn is_one_plain_word(raw: &str) -> bool {
+    if raw.is_empty()
+        || raw.starts_with('{')
+        || raw.ends_with(';')
+        || raw.chars().any(char::is_control)
+    {
+        return false;
+    }
+    let mut chars = raw.chars();
+    let mut quote = None;
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (None, '\\') | (Some('"'), '\\') => {
+                if chars.next().is_none() {
+                    return false;
+                }
+            }
+            (None, '\'' | '"') => quote = Some(c),
+            (None, c) if c.is_whitespace() => return false,
+            (Some(open), c) if c == open => quote = None,
+            _ => {}
+        }
+    }
+    quote.is_none()
 }
 
 /// The window id in a [`bound_popup_command`] reply.
@@ -159,19 +202,25 @@ pub fn set_global_path_command(path: &str) -> String {
 /// The server option the probe records the server's terminal children in.
 pub const PROBE_OPTION: &str = "@warp-popup-probe";
 
-/// Commands whose replies [`hidden_popups`] needs, in order: record the tmux server's children
-/// that have a terminal, read the record, list every pane's process, and list the clients.
+/// Records the tmux server's children that have a terminal in [`PROBE_OPTION`], prefixed with
+/// `token;` so [`parse_probe`] can tell this run's record from an earlier one.
 ///
-/// The probe runs on the server's host through `run-shell`, whose job is a child of the server,
-/// so `$PPID` is the server. `ps` prints `?`/`??` for a process without a terminal.
-pub fn probe_commands() -> [String; 4] {
+/// The script runs on the server's host as a background `run-shell` job, so a slow `ps` never
+/// holds up tmux's command queue. The job is a child of the server, so `$PPID` is the server.
+/// `ps` prints `?`/`??` for a process without a terminal.
+pub fn probe_start_command(token: u64) -> String {
     let script = format!(
-        "tmux set-option -g {PROBE_OPTION} \"$(ps -A -o ppid= -o pid= -o tty= -o comm= \
+        "tmux set-option -g {PROBE_OPTION} \"{token};$(ps -A -o ppid= -o pid= -o tty= -o comm= \
          | awk -v s=\"$PPID\" \"\\$1 == s && \\$3 !~ /^[?]/ {{ print \\$2 \\\" \\\" \\$4 }}\" \
          | tr \"\\n\" \",\")\""
     );
+    super::integration::run_shell_background(&script)
+}
+
+/// Commands whose replies [`hidden_popups`] needs once [`probe_start_command`]'s job finished,
+/// in order: read the record, list every pane's process, and list the clients.
+pub fn probe_read_commands() -> [String; 3] {
     [
-        super::integration::run_shell(&script),
         format!("show-options -gqv {PROBE_OPTION}"),
         "list-panes -a -F '#{pane_pid}'".to_owned(),
         "list-clients -F '#{client_control_mode}\t#{client_activity}\t#{client_name}'".to_owned(),
@@ -186,10 +235,11 @@ pub struct ServerChild {
     pub command: String,
 }
 
-/// The children in the probe's record.
-pub fn parse_probe(reply: &CommandReply) -> Vec<ServerChild> {
+/// The children in the probe's record, or `None` when the record is not `token`'s run (its job
+/// has not finished yet).
+pub fn parse_probe(reply: &CommandReply, token: u64) -> Option<Vec<ServerChild>> {
     if reply.error {
-        return Vec::new();
+        return None;
     }
     let text: String = reply
         .lines
@@ -197,7 +247,12 @@ pub fn parse_probe(reply: &CommandReply) -> Vec<ServerChild> {
         .map(|line| String::from_utf8_lossy(line).into_owned())
         .collect::<Vec<_>>()
         .join(",");
-    text.split(',')
+    let (record_token, text) = text.split_once(';')?;
+    if record_token.trim().parse::<u64>().ok()? != token {
+        return None;
+    }
+    let children = text
+        .split(',')
         .filter_map(|entry| {
             let (pid, command) = entry.trim().split_once(' ')?;
             let command = command.trim();
@@ -207,7 +262,70 @@ pub fn parse_probe(reply: &CommandReply) -> Vec<ServerChild> {
                 command: command.chars().filter(|c| !c.is_control()).collect(),
             })
         })
-        .collect()
+        .collect();
+    Some(children)
+}
+
+/// Past this a probe that never got its replies (a dropped or rejected command) is given up.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How soon to look again when a probe saw a popup that [`HiddenPopupWatch`] has yet to confirm.
+pub const CONFIRM_DELAY: Duration = Duration::from_secs(1);
+
+/// The first delay while watching an offered popup for it to go; it doubles up to
+/// [`MAX_WATCH_DELAY`].
+pub const WATCH_DELAY: Duration = Duration::from_secs(3);
+pub const MAX_WATCH_DELAY: Duration = Duration::from_secs(15);
+
+/// One session's probe runs: at most one at a time, each with its own token.
+#[derive(Clone, Debug, Default)]
+pub struct ProbeState {
+    running: Option<(u64, Instant)>,
+    next_token: u64,
+    watch_delay: Option<Duration>,
+}
+
+impl ProbeState {
+    /// Starts a probe and returns its token, unless one is running and not yet given up.
+    pub fn start(&mut self, now: Instant) -> Option<u64> {
+        if let Some((_, started)) = self.running
+            && now.saturating_duration_since(started) < PROBE_TIMEOUT
+        {
+            return None;
+        }
+        self.next_token += 1;
+        self.running = Some((self.next_token, now));
+        Some(self.next_token)
+    }
+
+    /// Whether `token` is the probe running now; it no longer is.
+    pub fn finish(&mut self, token: u64) -> bool {
+        if self.running.is_some_and(|(running, _)| running == token) {
+            self.running = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Gives up the probe `token` (its record never appeared).
+    pub fn abandon(&mut self, token: u64) {
+        self.finish(token);
+    }
+
+    /// When to probe again after one that `found` candidates while `offered` a popup. `None`
+    /// waits for an on-demand probe.
+    pub fn next_delay(&mut self, found: bool, offered: bool) -> Option<Duration> {
+        if offered {
+            let delay = self
+                .watch_delay
+                .map_or(WATCH_DELAY, |delay| (delay * 2).min(MAX_WATCH_DELAY));
+            self.watch_delay = Some(delay);
+            return Some(delay);
+        }
+        self.watch_delay = None;
+        found.then_some(CONFIRM_DELAY)
+    }
 }
 
 /// The pane processes in a `list-panes -F '#{pane_pid}'` reply.

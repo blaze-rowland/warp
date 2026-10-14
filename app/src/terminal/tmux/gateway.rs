@@ -11,7 +11,7 @@
 //! - It receives every [`GatewayEvent`] on the main thread, logs it, holds pane queues until the
 //!   pane backend takes them, and re-emits the rest as [`TmuxGatewayEvent`]s for the workspace.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::sync::Arc;
 
@@ -81,6 +81,8 @@ struct Origin {
     flags: WeakOriginFlags,
     requests: TmuxRequestSender,
     pane_queues: HashMap<PaneId, PaneQueueReceiver>,
+    /// Panes whose view was dropped with the queue it was reading (a zoomed-out or moved pane).
+    released_panes: HashSet<PaneId>,
     /// The engine's session model as of its last report, while a session runs.
     model: Option<SessionModel>,
     /// Between `Starting` and `Ended`.
@@ -163,6 +165,7 @@ impl TmuxGateways {
                 flags: flags.downgrade(),
                 requests: TmuxRequestSender(requests),
                 pane_queues: HashMap::new(),
+                released_panes: HashSet::new(),
                 model: None,
                 in_session: false,
                 detach_commands: Vec::new(),
@@ -197,7 +200,29 @@ impl TmuxGateways {
         origin: TmuxOriginId,
         pane_id: PaneId,
     ) -> Option<PaneQueueReceiver> {
-        self.origins.get_mut(&origin)?.pane_queues.remove(&pane_id)
+        let origin = self.origins.get_mut(&origin)?;
+        let queue = origin.pane_queues.remove(&pane_id)?;
+        origin.released_panes.remove(&pane_id);
+        Some(queue)
+    }
+
+    /// A pane's view was dropped while tmux keeps the pane, taking the queue it was reading.
+    pub fn pane_view_released(&mut self, origin: TmuxOriginId, pane_id: PaneId) {
+        if let Some(origin) = self.origins.get_mut(&origin)
+            && origin.in_session
+        {
+            origin.released_panes.insert(pane_id);
+        }
+    }
+
+    /// A new view for a pane found no queue waiting. If an earlier view took the pane's queue
+    /// with it, asks the gateway for a new queue that starts with a snapshot.
+    pub fn request_queue_for_returning_pane(&mut self, origin: TmuxOriginId, pane_id: PaneId) {
+        if let Some(origin) = self.origins.get_mut(&origin)
+            && origin.released_panes.remove(&pane_id)
+        {
+            origin.requests.send(TmuxRequest::ResyncPane(pane_id));
+        }
     }
 
     /// The session model of `origin`'s running session, as the engine last reported it. Tabs are
@@ -342,6 +367,7 @@ impl TmuxGateways {
                 log::info!("tmux: control mode ended on origin {origin:?}");
                 if let Some(entry) = self.origins.get_mut(&origin) {
                     entry.pane_queues.clear();
+                    entry.released_panes.clear();
                     entry.in_session = false;
                     entry.model = None;
                     entry.detach_commands.clear();

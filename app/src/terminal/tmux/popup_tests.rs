@@ -10,7 +10,7 @@ use instant::Instant;
 use warp_terminal::tmux::{CommandReply, PaneId};
 
 use super::*;
-use crate::terminal::tmux::native_ui::{Classified, Interactive, classify};
+use crate::terminal::tmux::native_ui::{Classified, Interactive, PopupSpec, classify};
 
 fn reply(lines: &[&str]) -> CommandReply {
     CommandReply {
@@ -62,6 +62,34 @@ fn a_bound_popup_runs_in_a_detached_named_window() {
 }
 
 #[test]
+fn bound_popup_arguments_that_could_break_the_command_line_are_requoted() {
+    let spec = PopupSpec {
+        command_raw: vec![
+            "fzf;".to_owned(),
+            "'unterminated".to_owned(),
+            "a\nb".to_owned(),
+            "x\u{7}".to_owned(),
+            "{ kill-server }".to_owned(),
+            "two words".to_owned(),
+            "'#{pane_id}'".to_owned(),
+        ],
+        directory_raw: Some("/tmp\\;".to_owned()),
+        environment_raw: vec!["A=1 ; kill-server".to_owned()],
+        title: None,
+    };
+    let command = bound_popup_command(&spec);
+    assert_eq!(
+        command,
+        "new-window -d -P -F '#{window_id}' -n \"warp-popup\" -c \"/tmp\\\\;\" \
+         -e \"A=1 ; kill-server\" \"fzf;\" \"'unterminated\" \"ab\" \"x\" \
+         \"{ kill-server }\" \"two words\" '#{pane_id}'"
+    );
+    // tmux reads it back as one command.
+    let commands = crate::terminal::tmux::native_ui::split_commands(&command);
+    assert_eq!(commands.len(), 1, "{commands:?}");
+}
+
+#[test]
 fn the_wrapper_dir_goes_first_on_path_once() {
     let dir = "/home/me/.cache/warp/tmux/0123456789abcdef/bin";
     let old = "/home/me/.cache/warp/tmux/fedcba9876543210/bin";
@@ -98,21 +126,73 @@ fn the_wrapper_dir_goes_first_on_path_once() {
 }
 
 #[test]
-fn the_probe_is_one_safe_tmux_line_each() {
-    let commands = probe_commands();
-    let script = commands[0]
-        .strip_prefix("run-shell '")
+fn the_probe_is_one_safe_tmux_line_each_and_runs_in_the_background() {
+    let start = probe_start_command(7);
+    let script = start
+        .strip_prefix("run-shell -b '")
         .and_then(|rest| rest.strip_suffix('\''))
-        .expect("run-shell");
+        .expect("a background run-shell, so ps never holds up tmux's command queue");
     assert!(!script.contains('#') && !script.contains('\''), "{script}");
-    for command in &commands {
+    assert!(script.contains("\"7;"), "the record starts with the token: {script}");
+    for command in std::iter::once(&start).chain(&probe_read_commands()) {
         assert!(!command.contains('\n'), "{command}");
     }
 }
 
 #[test]
+fn a_probe_record_from_another_run_is_not_read_as_this_ones() {
+    let record = reply(&["7;100 fzf,"]);
+    assert_eq!(
+        parse_probe(&record, 7),
+        Some(vec![ServerChild {
+            pid: 100,
+            command: "fzf".into()
+        }])
+    );
+    // The background job has not written this run's record yet.
+    assert_eq!(parse_probe(&record, 8), None);
+    assert_eq!(parse_probe(&reply(&[]), 8), None);
+}
+
+#[test]
+fn only_one_probe_runs_and_a_lost_one_is_given_up() {
+    let now = Instant::now();
+    let mut state = ProbeState::default();
+    let first = state.start(now).expect("nothing is running");
+    assert_eq!(state.start(now + Duration::from_secs(1)), None);
+    // A reply never came (a dropped or rejected command): the probe is not stuck forever.
+    let second = state
+        .start(now + PROBE_TIMEOUT + Duration::from_millis(1))
+        .expect("a lost probe is given up");
+    assert_ne!(first, second);
+    assert!(!state.finish(first), "a late reply to the lost probe is ignored");
+    assert!(state.finish(second));
+    assert!(state.start(now + PROBE_TIMEOUT * 2).is_some());
+}
+
+#[test]
+fn probes_follow_up_only_while_a_popup_is_suspected_or_shown() {
+    let mut state = ProbeState::default();
+    // Nothing found: no timer; the next probe waits for a stalled key, an attach or a close.
+    assert_eq!(state.next_delay(false, false), None);
+    // Something to confirm: look again soon.
+    assert_eq!(state.next_delay(true, false), Some(CONFIRM_DELAY));
+    // A popup is offered: watch for it to go, backing off.
+    assert_eq!(state.next_delay(true, true), Some(WATCH_DELAY));
+    assert_eq!(state.next_delay(true, true), Some(WATCH_DELAY * 2));
+    for _ in 0..10 {
+        state.next_delay(true, true);
+    }
+    assert_eq!(state.next_delay(true, true), Some(MAX_WATCH_DELAY));
+    // Once it is gone the backoff starts over.
+    assert_eq!(state.next_delay(false, false), None);
+    assert_eq!(state.next_delay(true, true), Some(WATCH_DELAY));
+}
+
+#[test]
 fn hidden_popups_are_terminal_children_that_are_not_panes() {
-    let children = parse_probe(&reply(&["100 /usr/local/bin/fzf,200 -zsh,300 bash,"]));
+    let children =
+        parse_probe(&reply(&["1;100 /usr/local/bin/fzf,200 -zsh,300 bash,"]), 1).unwrap();
     assert_eq!(
         children,
         vec![
@@ -440,18 +520,29 @@ impl LiveTmux {
 
     /// Runs the hidden-popup probe over the control client, as Warp does.
     pub fn probe(&mut self) -> Vec<ServerChild> {
-        let replies: Vec<CommandReply> = probe_commands()
-            .iter()
-            .map(|line| {
-                self.control(line, Duration::from_secs(5))
-                    .expect("probe answers")
-            })
-            .collect();
-        hidden_popups(
-            &parse_probe(&replies[1]),
-            &parse_pane_pids(&replies[2]),
-            &parse_clients(&replies[3]),
-        )
+        static NEXT_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let token = NEXT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.control(&probe_start_command(token), Duration::from_secs(5))
+            .expect("the probe starts");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let replies: Vec<CommandReply> = probe_read_commands()
+                .iter()
+                .map(|line| {
+                    self.control(line, Duration::from_secs(5))
+                        .expect("probe answers")
+                })
+                .collect();
+            if let Some(children) = parse_probe(&replies[0], token) {
+                return hidden_popups(
+                    &children,
+                    &parse_pane_pids(&replies[1]),
+                    &parse_clients(&replies[2]),
+                );
+            }
+            assert!(Instant::now() < deadline, "the probe never finished");
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 

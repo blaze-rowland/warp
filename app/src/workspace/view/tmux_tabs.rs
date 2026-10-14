@@ -106,6 +106,33 @@ impl Workspace {
         }
     }
 
+    /// Tells tmux which window and pane the user is looking at in the active tab, so tmux
+    /// bindings act on them. Changes that came from tmux find tmux already agreeing and send
+    /// nothing.
+    pub(super) fn sync_tmux_focus(&mut self, ctx: &mut ViewContext<Self>) {
+        if !ctx.has_singleton_model::<TmuxSessions>() {
+            return;
+        }
+        let Some(tab) = self.tabs.get(self.active_tab_index) else {
+            return;
+        };
+        let pane_group = tab.pane_group.as_ref(ctx);
+        let Some(tmux_tab) = pane_group.tmux_tab() else {
+            return;
+        };
+        let (origin, window_id) = (tmux_tab.origin, tmux_tab.window_id);
+        let pane_id = pane_group
+            .focused_tmux_pane(ctx)
+            .filter(|(pane_origin, _)| *pane_origin == origin)
+            .map(|(_, pane_id)| pane_id);
+        if !self.tmux_session_shows_tabs(origin, ctx) {
+            return;
+        }
+        TmuxSessions::handle(ctx).update(ctx, |sessions, ctx| {
+            sessions.sync_focus(origin, window_id, pane_id, ctx);
+        });
+    }
+
     fn tmux_session_shows_tabs(&self, origin: TmuxOriginId, ctx: &ViewContext<Self>) -> bool {
         TmuxSessions::as_ref(ctx)
             .session(origin)

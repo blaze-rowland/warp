@@ -693,6 +693,19 @@ impl ControlClient {
         self.continue_and_resync(pane_id, now);
     }
 
+    /// Sends a fresh snapshot of a pane tmux knows, resuming it first if the app paused it.
+    pub fn resync_pane(&mut self, pane_id: PaneId, now: Duration) {
+        if self.check_open().is_err() || self.model.pane(pane_id).is_none() {
+            return;
+        }
+        if self.paused_by_app.remove(&pane_id) {
+            self.continue_and_resync(pane_id, now);
+        } else if self.panes_listed {
+            let kind = self.resync_kind(pane_id);
+            self.start_sync(pane_id, kind, true, now);
+        }
+    }
+
     /// Detaches by writing the final bare newline. Nothing is written after it.
     pub fn detach(&mut self) {
         if self.closed

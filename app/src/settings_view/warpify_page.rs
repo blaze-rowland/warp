@@ -186,7 +186,7 @@ impl WarpifyPageView {
             categories.push(Category::with_header(
                 CategoryHeader::new("tmux")
                     .with_subtitle("Run tmux sessions natively with Warp features in every pane."),
-                vec![Box::new(TmuxWidget::default())],
+                tmux_widgets(),
             ));
         }
 
@@ -795,18 +795,62 @@ impl SettingsWidget for SSHWidget {
     }
 }
 
-#[derive(Default)]
-struct TmuxWidget {
-    switch_states: [SwitchStateHandle; 4],
-    copy_plugin_line_mouse_state: MouseStateHandle,
+/// One widget per tmux setting row, so a search shows only the rows it names.
+fn tmux_widgets() -> Vec<Box<dyn SettingsWidget<View = WarpifyPageView>>> {
+    let mut widgets: Vec<Box<dyn SettingsWidget<View = WarpifyPageView>>> = Vec::new();
+    for toggle in TmuxToggle::iter() {
+        widgets.push(Box::new(TmuxToggleWidget::new(toggle)));
+    }
+    widgets.push(Box::new(TmuxPluginWidget::default()));
+    widgets
+}
+
+fn tmux_toggle_widget_id(toggle: TmuxToggle) -> &'static str {
+    match toggle {
+        TmuxToggle::ControlMode => "warpify_page::TmuxToggleWidget::ControlMode",
+        TmuxToggle::AutoConvert => "warpify_page::TmuxToggleWidget::AutoConvert",
+        TmuxToggle::IntegratePanes => "warpify_page::TmuxToggleWidget::IntegratePanes",
+        TmuxToggle::BindingsTakePrecedence => {
+            "warpify_page::TmuxToggleWidget::BindingsTakePrecedence"
+        }
+    }
+}
+
+fn tmux_toggle_search_terms(toggle: TmuxToggle) -> &'static str {
+    match toggle {
+        TmuxToggle::ControlMode => "tmux control mode native sessions windows tabs",
+        TmuxToggle::AutoConvert => "tmux automatic auto convert conversion attach new",
+        TmuxToggle::IntegratePanes => "tmux warp integration panes shell blocks warpify",
+        TmuxToggle::BindingsTakePrecedence => "tmux key bindings keys precedence shortcuts",
+    }
+}
+
+/// One tmux setting's switch.
+struct TmuxToggleWidget {
+    toggle: TmuxToggle,
+    switch_state: SwitchStateHandle,
     local_only_icon_tooltip_states: RefCell<HashMap<String, MouseStateHandle>>,
 }
 
-impl SettingsWidget for TmuxWidget {
+impl TmuxToggleWidget {
+    fn new(toggle: TmuxToggle) -> Self {
+        Self {
+            toggle,
+            switch_state: SwitchStateHandle::default(),
+            local_only_icon_tooltip_states: RefCell::default(),
+        }
+    }
+}
+
+impl SettingsWidget for TmuxToggleWidget {
     type View = WarpifyPageView;
 
+    fn widget_id(&self) -> &'static str {
+        tmux_toggle_widget_id(self.toggle)
+    }
+
     fn search_terms(&self) -> &str {
-        "tmux control mode native sessions panes key bindings warpify plugin resurrect continuum"
+        tmux_toggle_search_terms(self.toggle)
     }
 
     fn render(
@@ -815,49 +859,69 @@ impl SettingsWidget for TmuxWidget {
         appearance: &Appearance,
         app: &AppContext,
     ) -> Box<dyn Element> {
-        let mut column = Flex::column();
-        let ui_builder = appearance.ui_builder();
+        let toggle = self.toggle;
         let tmux_settings = TmuxSettings::as_ref(app);
-        let master_on = TmuxToggle::ControlMode.value(tmux_settings);
+        // The other settings only matter while the master setting is on.
+        let interactive =
+            toggle == TmuxToggle::ControlMode || TmuxToggle::ControlMode.value(tmux_settings);
+        render_body_item::<WarpifyPageAction>(
+            toggle.label().to_owned(),
+            None,
+            LocalOnlyIconState::for_setting(
+                toggle.storage_key(),
+                TmuxControlModeSetting::sync_to_cloud(),
+                &mut self.local_only_icon_tooltip_states.borrow_mut(),
+                app,
+            ),
+            interactive.into(),
+            appearance,
+            appearance
+                .ui_builder()
+                .switch(self.switch_state.clone())
+                .check(toggle.value(tmux_settings))
+                .with_disabled(!interactive)
+                .build()
+                .on_click(move |ctx, _, _| {
+                    if interactive {
+                        ctx.dispatch_typed_action(WarpifyPageAction::ToggleTmuxSetting(toggle));
+                    }
+                })
+                .finish(),
+            Some(toggle.page_description().to_owned()),
+        )
+    }
+}
 
-        for (toggle, switch_state) in TmuxToggle::iter().zip(self.switch_states.iter()) {
-            // The delta settings only matter while the master setting is on.
-            let interactive = toggle == TmuxToggle::ControlMode || master_on;
-            column.add_child(render_body_item::<WarpifyPageAction>(
-                toggle.label().to_owned(),
-                None,
-                LocalOnlyIconState::for_setting(
-                    toggle.storage_key(),
-                    TmuxControlModeSetting::sync_to_cloud(),
-                    &mut self.local_only_icon_tooltip_states.borrow_mut(),
-                    app,
-                ),
-                interactive.into(),
-                appearance,
-                ui_builder
-                    .switch(switch_state.clone())
-                    .check(toggle.value(tmux_settings))
-                    .with_disabled(!interactive)
-                    .build()
-                    .on_click(move |ctx, _, _| {
-                        if interactive {
-                            ctx.dispatch_typed_action(WarpifyPageAction::ToggleTmuxSetting(toggle));
-                        }
-                    })
-                    .finish(),
-                Some(toggle.page_description().to_owned()),
-            ));
-        }
+/// R9: the plugin that makes shells tmux starts on its own Warp-ready.
+#[derive(Default)]
+struct TmuxPluginWidget {
+    copy_plugin_line_mouse_state: MouseStateHandle,
+}
 
-        // R9: the plugin that makes shells tmux starts on its own Warp-ready.
-        let plugin_interactive = master_on && *tmux_settings.integrate_panes.value();
-        column.add_child(render_body_item::<WarpifyPageAction>(
+impl SettingsWidget for TmuxPluginWidget {
+    type View = WarpifyPageView;
+
+    fn search_terms(&self) -> &str {
+        "tmux plugin resurrect continuum tmux.conf"
+    }
+
+    fn render(
+        &self,
+        _view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let tmux_settings = TmuxSettings::as_ref(app);
+        let interactive = TmuxToggle::ControlMode.value(tmux_settings)
+            && *tmux_settings.integrate_panes.value();
+        let row = render_body_item::<WarpifyPageAction>(
             "tmux plugin".to_owned(),
             None,
             LocalOnlyIconState::Hidden,
-            plugin_interactive.into(),
+            interactive.into(),
             appearance,
-            ui_builder
+            appearance
+                .ui_builder()
                 .copy_button(16., self.copy_plugin_line_mouse_state.clone())
                 .build()
                 .on_click(|ctx, _, _| {
@@ -865,9 +929,8 @@ impl SettingsWidget for TmuxWidget {
                 })
                 .finish(),
             Some(plugin_install_text()),
-        ));
-
-        Container::new(column.finish())
+        );
+        Container::new(row)
             .with_margin_bottom(ITEM_VERTICAL_SPACING)
             .finish()
     }
@@ -881,3 +944,7 @@ mod styles {
     /// The space after a description.
     pub const DESCRIPTION_LINE_MARGIN_BOTTOM: f32 = 18.;
 }
+
+#[cfg(test)]
+#[path = "warpify_page_tests.rs"]
+mod tests;

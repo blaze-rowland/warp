@@ -232,8 +232,13 @@ impl TerminalManager for TmuxPaneTerminalManager {
             self.event_loop.update(app, |event_loop, ctx| {
                 event_loop.handle_message(Message::Shutdown, ctx);
             });
+            let (origin, pane_id) = (self.origin, self.pane_id);
+            if app.has_singleton_model::<TmuxGateways>() {
+                TmuxGateways::handle(app).update(app, |gateways, _| {
+                    gateways.pane_view_released(origin, pane_id);
+                });
+            }
             if app.has_singleton_model::<TmuxIntegration>() {
-                let (origin, pane_id) = (self.origin, self.pane_id);
                 TmuxIntegration::handle(app).update(app, |integration, _| {
                     integration.pane_dropped(origin, pane_id);
                 });
@@ -374,11 +379,17 @@ pub(super) fn connect_queue(
     let attach = move |event_loop: &ModelHandle<TmuxPaneEventLoop>, ctx: &mut AppContext| {
         let queue = TmuxGateways::handle(ctx)
             .update(ctx, |gateways, _| gateways.take_pane_queue(origin, pane_id));
+        let attached = queue.is_some();
         if let Some(queue) = queue {
             event_loop.update(ctx, |event_loop, ctx| event_loop.attach_queue(queue, ctx));
         }
+        attached
     };
-    attach(event_loop, ctx);
+    if !attach(event_loop, ctx) {
+        gateways.update(ctx, |gateways, _| {
+            gateways.request_queue_for_returning_pane(origin, pane_id);
+        });
+    }
     let event_loop = event_loop.downgrade();
     ctx.subscribe_to_model(&gateways, move |_, event, ctx| {
         let TmuxGatewayEvent::PaneQueueReady {
