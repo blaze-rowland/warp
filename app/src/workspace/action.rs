@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use session_sharing_protocol::common::SessionId;
 use ui_components::lightbox;
+use warp_terminal::tmux::WindowId as TmuxWindowId;
 use warp_util::path::LineAndColumnArg;
 use warpui::accessibility::AccessibilityVerbosity;
 use warpui::geometry::rect::RectF;
@@ -41,6 +42,7 @@ use crate::settings_view::{SettingsAction as SettingsTabAction, SettingsSection}
 use crate::tab::{NewSessionMenuItem, SelectedTabColor};
 use crate::tab_configs::TabConfig;
 use crate::terminal::available_shells::AvailableShell;
+use crate::terminal::tmux::TmuxOriginId;
 use crate::terminal::tmux::session_menu::TmuxMenuAction;
 use crate::terminal::view::inline_banner::ZeroStatePromptSuggestionType;
 use crate::themes::theme::AnsiColorIdentifier;
@@ -270,6 +272,11 @@ pub enum WorkspaceAction {
     SelectNewSessionMenuItem(NewSessionMenuItem),
     /// A tmux session menu entry: New, list sessions to attach, or attach one (R2).
     TmuxSessionMenu(TmuxMenuAction),
+    /// A window entry clicked in a tmux tab's status strip: activate that window's tab.
+    ActivateTmuxWindow {
+        origin: TmuxOriginId,
+        window_id: TmuxWindowId,
+    },
     AutoupdateFailureLink,
     ApplyUpdate,
     LogOut,
@@ -1054,6 +1061,7 @@ impl WorkspaceAction {
             | ToggleNewSessionMenu { .. }
             | SelectNewSessionMenuItem(_)
             | TmuxSessionMenu(_)
+            | ActivateTmuxWindow { .. }
             | ToggleTabBarOverflowMenu
             | CheckForUpdate
             | SetA11yVerbosityLevel(_)

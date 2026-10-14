@@ -24,6 +24,8 @@ pub mod remote;
 pub mod session_menu;
 pub mod settings;
 #[cfg(feature = "local_tty")]
+pub mod status_strip;
+#[cfg(feature = "local_tty")]
 pub mod workspace_sync;
 
 /// Identifies one origin PTY event loop. A respawned shell gets a new id.

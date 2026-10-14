@@ -1063,6 +1063,10 @@ pub struct Workspace {
     pub(crate) tab_groups: HashMap<TabGroupId, TabGroup>,
     /// Per-group hover state for the horizontal tab bar.
     horizontal_tab_group_mouse_states: RefCell<HashMap<TabGroupId, HorizontalTabGroupMouseStates>>,
+    /// Per-window hover state for the tmux status strip.
+    #[cfg_attr(not(feature = "local_tty"), allow(dead_code))]
+    tmux_status_strip_mouse_states:
+        RefCell<HashMap<warp_terminal::tmux::WindowId, MouseStateHandle>>,
     tab_rename_editor: ViewHandle<EditorView>,
     pane_rename_editor: ViewHandle<EditorView>,
     tab_group_rename_editor: ViewHandle<EditorView>,
@@ -3478,6 +3482,7 @@ impl Workspace {
             traffic_light_mouse_states: Default::default(),
             tab_groups: HashMap::new(),
             horizontal_tab_group_mouse_states: RefCell::default(),
+            tmux_status_strip_mouse_states: RefCell::default(),
             tab_rename_editor: Self::tab_rename_editor(ctx),
             pane_rename_editor: Self::pane_rename_editor(ctx),
             tab_group_rename_editor: Self::tab_group_rename_editor(ctx),
@@ -22527,12 +22532,24 @@ impl Workspace {
     ) -> Box<dyn Element> {
         let active_tab_data = &self.tabs[self.active_tab_index];
 
-        let active_content = if FeatureFlag::AgentManagementView.is_enabled()
-            && self.current_workspace_state.is_agent_management_view_open
-        {
+        let showing_agent_management = FeatureFlag::AgentManagementView.is_enabled()
+            && self.current_workspace_state.is_agent_management_view_open;
+        let active_content = if showing_agent_management {
             ChildView::new(&self.agent_management_view).finish()
         } else {
             ChildView::new(&active_tab_data.pane_group).finish()
+        };
+
+        // The tmux status strip runs along the bottom of a tmux tab's panes while the vertical
+        // tabs panel, which otherwise lists the session's windows, is closed.
+        #[cfg(feature = "local_tty")]
+        let active_content = match self.render_tmux_status_strip(app) {
+            Some(strip) if !showing_agent_management => Flex::column()
+                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                .with_child(Shrinkable::new(1., active_content).finish())
+                .with_child(strip)
+                .finish(),
+            _ => active_content,
         };
 
         let terminal_content = match self.maybe_render_workspace_banner(app, appearance) {
@@ -24651,6 +24668,12 @@ impl TypedActionView for Workspace {
                 self.handle_tmux_menu_action(action.clone(), ctx);
                 #[cfg(not(feature = "local_tty"))]
                 let _ = action;
+            }
+            ActivateTmuxWindow { origin, window_id } => {
+                #[cfg(feature = "local_tty")]
+                self.activate_tmux_window(*origin, *window_id, ctx);
+                #[cfg(not(feature = "local_tty"))]
+                let _ = (origin, window_id);
             }
             SelectTabConfig(tab_config) => {
                 self.open_tab_config(tab_config.clone(), ctx);

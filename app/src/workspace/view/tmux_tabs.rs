@@ -8,10 +8,17 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use warp_core::features::FeatureFlag;
 use warp_terminal::tmux::{SessionModel, WindowId};
-use warpui::{SingletonEntity as _, ViewContext, ViewHandle};
+use warpui::elements::{
+    Border, Clipped, Container, CornerRadius, CrossAxisAlignment, Flex, Hoverable,
+    ParentElement as _, Radius, Text,
+};
+use warpui::platform::Cursor;
+use warpui::{AppContext, Element, SingletonEntity as _, ViewContext, ViewHandle};
 
 use super::{TabConfigsMenuOpenSource, Workspace};
+use crate::appearance::Appearance;
 use crate::menu::{MenuItem, MenuItemFields};
 use crate::pane_group::{PaneGroup, PanesLayout};
 use crate::tab::TabData;
@@ -27,14 +34,24 @@ use crate::terminal::tmux::session_menu::{
     command_for_with_launcher, list_outcome, list_sessions_command,
 };
 use crate::terminal::tmux::settings::TmuxSettings;
+use crate::terminal::tmux::status_strip::{ELLIPSIS, build_status_strip, tab_for_window};
 use crate::terminal::tmux::workspace_sync::{
     OpenTab, SessionStatus, TmuxSessionEvent, TmuxSessions, WindowOp, busy_commands,
     close_confirmation_text, insertion_offset, kill_window_command, new_window_command,
     plan_window_sync, reattach_command, rename_window_command, show_kill_confirmation,
     window_commands_query,
 };
+use crate::themes::theme::Fill;
 use crate::ui_components::icons;
 use crate::workspace::action::WorkspaceAction;
+use crate::workspace::tab_settings::TabSettings;
+
+/// The status strip's side padding, in pixels.
+const STRIP_HORIZONTAL_PADDING: f32 = 8.;
+/// The space between status strip entries, in pixels.
+const STRIP_ENTRY_GAP: f32 = 8.;
+/// A UI font character's rough width, in ems, for the status strip's character budget.
+const CHAR_WIDTH_EM: f32 = 0.65;
 
 impl Workspace {
     /// Follows tmux sessions whose origin tab is in this workspace.
@@ -68,6 +85,8 @@ impl Workspace {
                 if self.tmux_session_shows_tabs(*origin, ctx) {
                     self.sync_tmux_session(*origin, false, ctx);
                 }
+                // The status strip lists the session's windows.
+                ctx.notify();
             }
             TmuxSessionEvent::ActiveWindowChanged { origin, window_id } => {
                 // Follow tmux's window switches only while the user is in this session.
@@ -180,10 +199,151 @@ impl Workspace {
         window_id: WindowId,
         ctx: &ViewContext<Self>,
     ) -> Option<usize> {
-        self.tmux_tabs_of(origin, ctx)
-            .into_iter()
-            .find(|(_, window)| *window == window_id)
-            .map(|(index, _)| index)
+        tab_for_window(
+            self.tabs.iter().enumerate().map(|(index, tab)| {
+                let shown = tab
+                    .pane_group
+                    .as_ref(ctx)
+                    .tmux_tab()
+                    .map(|tmux| (tmux.origin, tmux.window_id));
+                (index, shown)
+            }),
+            origin,
+            window_id,
+        )
+    }
+
+    /// Activates the tab showing `origin`'s `window_id`, as a click in the tmux status strip
+    /// asks. Tab activation tells tmux about the switch, like cmd+N.
+    pub(super) fn activate_tmux_window(
+        &mut self,
+        origin: TmuxOriginId,
+        window_id: WindowId,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if let Some(index) = self.tmux_tab_index(origin, window_id, ctx) {
+            self.activate_tab(index, ctx);
+        }
+    }
+
+    /// The tmux-style status strip under the active tmux tab: `[session]` and the session's
+    /// windows, current one highlighted. Shown only while the vertical tabs panel, which lists
+    /// the windows otherwise, is closed.
+    pub(super) fn render_tmux_status_strip(&self, app: &AppContext) -> Option<Box<dyn Element>> {
+        if !TmuxSettings::as_ref(app).control_mode_enabled()
+            || (FeatureFlag::VerticalTabs.is_enabled()
+                && *TabSettings::as_ref(app).use_vertical_tabs
+                && self.vertical_tabs_panel_open)
+            || !app.has_singleton_model::<TmuxGateways>()
+        {
+            return None;
+        }
+        let tmux = self
+            .tabs
+            .get(self.active_tab_index)?
+            .pane_group
+            .as_ref(app)
+            .tmux_tab()?;
+        let (origin, current) = (tmux.origin, tmux.window_id);
+        let model = TmuxGateways::as_ref(app).model(origin)?;
+        let session = app
+            .has_singleton_model::<TmuxSessions>()
+            .then(|| TmuxSessions::as_ref(app).session(origin))
+            .flatten()
+            .map(|session| session.name.clone())
+            .filter(|name| !name.is_empty())
+            .or_else(|| model.session().map(|session| session.name.clone()))
+            .unwrap_or_default();
+
+        let appearance = Appearance::as_ref(app);
+        let theme = appearance.theme();
+        let font_family = appearance.ui_font_family();
+        let font_size = appearance.ui_font_size();
+        // A rough character budget for the window width; anything past it is clipped.
+        let budget = app
+            .window_bounds(&self.window_id)
+            .map(|bounds| {
+                ((bounds.width() - 2. * STRIP_HORIZONTAL_PADDING) / (font_size * CHAR_WIDTH_EM))
+                    .max(0.) as usize
+            })
+            .unwrap_or(usize::MAX);
+        let strip = build_status_strip(&session, model.windows(), current, budget);
+
+        let text = |label: String, color: Fill| {
+            Text::new_inline(label, font_family, font_size)
+                .with_color(color.into())
+                .finish()
+        };
+        let mut row = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
+        row.add_child(
+            Container::new(text(
+                format!("[{}]", strip.session),
+                theme.active_ui_text_color(),
+            ))
+            .with_margin_right(STRIP_ENTRY_GAP)
+            .finish(),
+        );
+        if strip.hidden_before {
+            row.add_child(
+                Container::new(text(ELLIPSIS.to_string(), theme.nonactive_ui_text_color()))
+                    .with_margin_right(STRIP_ENTRY_GAP)
+                    .finish(),
+            );
+        }
+        let mut mouse_states = self.tmux_status_strip_mouse_states.borrow_mut();
+        mouse_states.retain(|window_id, _| model.window(*window_id).is_some());
+        for (position, entry) in strip.entries.iter().enumerate() {
+            let Some((origin, window_id)) = strip.click_target(origin, position) else {
+                continue;
+            };
+            let mouse_state = mouse_states.entry(window_id).or_default().clone();
+            let label = entry.label.clone();
+            let is_current = entry.current;
+            let item = Hoverable::new(mouse_state, |state| {
+                let (background, color) = if is_current {
+                    (Some(theme.accent_overlay()), theme.active_ui_text_color())
+                } else if state.is_hovered() {
+                    (
+                        Some(theme.surface_overlay_1()),
+                        theme.active_ui_text_color(),
+                    )
+                } else {
+                    (None, theme.nonactive_ui_text_color())
+                };
+                let mut container = Container::new(text(label, color))
+                    .with_horizontal_padding(4.)
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)));
+                if let Some(background) = background {
+                    container = container.with_background(background);
+                }
+                container.finish()
+            })
+            .on_click(move |ctx, _, _| {
+                ctx.dispatch_typed_action(WorkspaceAction::ActivateTmuxWindow {
+                    origin,
+                    window_id,
+                });
+            })
+            .with_cursor(Cursor::PointingHand)
+            .finish();
+            row.add_child(
+                Container::new(item)
+                    .with_margin_right(STRIP_ENTRY_GAP)
+                    .finish(),
+            );
+        }
+        if strip.hidden_after {
+            row.add_child(text(ELLIPSIS.to_string(), theme.nonactive_ui_text_color()));
+        }
+
+        Some(
+            Container::new(Clipped::new(row.finish()).finish())
+                .with_horizontal_padding(STRIP_HORIZONTAL_PADDING)
+                .with_vertical_padding(2.)
+                .with_background(theme.surface_2())
+                .with_border(Border::top(1.).with_border_fill(theme.outline()))
+                .finish(),
+        )
     }
 
     fn on_tmux_attached(&mut self, origin: TmuxOriginId, ctx: &mut ViewContext<Self>) {
