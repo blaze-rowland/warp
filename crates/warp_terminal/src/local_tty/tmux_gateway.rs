@@ -684,7 +684,10 @@ impl Gateway {
             | TmuxRequest::Detach => {}
         }
         let State::Session(session) = &mut self.state else {
-            log::debug!("tmux: dropping a {} request with no session running", request.name());
+            log::debug!(
+                "tmux: dropping a {} request with no session running",
+                request.name()
+            );
             return;
         };
         let client = &mut session.client;

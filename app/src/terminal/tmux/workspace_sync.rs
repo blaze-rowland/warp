@@ -635,7 +635,8 @@ impl TmuxSessions {
     ) -> Option<u64> {
         let tag = self.send_command(origin, line, None, ctx)?;
         if let Some(on_reply) = on_reply {
-            self.pending.insert((origin, tag), PendingReply::App(on_reply));
+            self.pending
+                .insert((origin, tag), PendingReply::App(on_reply));
         }
         Some(tag)
     }

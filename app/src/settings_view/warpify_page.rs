@@ -912,8 +912,8 @@ impl SettingsWidget for TmuxPluginWidget {
         app: &AppContext,
     ) -> Box<dyn Element> {
         let tmux_settings = TmuxSettings::as_ref(app);
-        let interactive = TmuxToggle::ControlMode.value(tmux_settings)
-            && *tmux_settings.integrate_panes.value();
+        let interactive =
+            TmuxToggle::ControlMode.value(tmux_settings) && *tmux_settings.integrate_panes.value();
         let row = render_body_item::<WarpifyPageAction>(
             "tmux plugin".to_owned(),
             None,

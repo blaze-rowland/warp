@@ -22,11 +22,11 @@ fn each_tmux_setting_row_is_its_own_search_result() {
     assert_eq!(matching("tmux").len(), widgets.len());
     assert_eq!(matching("").len(), widgets.len());
 
+    assert_eq!(matching("plugin"), [TmuxPluginWidget::static_widget_id()]);
     assert_eq!(
-        matching("plugin"),
+        matching("resurrect"),
         [TmuxPluginWidget::static_widget_id()]
     );
-    assert_eq!(matching("resurrect"), [TmuxPluginWidget::static_widget_id()]);
     assert_eq!(
         matching("auto convert"),
         [tmux_toggle_widget_id(TmuxToggle::AutoConvert)]

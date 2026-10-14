@@ -746,7 +746,10 @@ fn focus_sync_selects_only_what_tmux_does_not_already_have_active() {
     );
     assert_eq!(
         focus_sync_commands(&model, WindowId(2), Some(PaneId(2))),
-        vec!["select-window -t @2".to_owned(), "select-pane -t %2".to_owned()]
+        vec![
+            "select-window -t @2".to_owned(),
+            "select-pane -t %2".to_owned()
+        ]
     );
     assert_eq!(
         focus_sync_commands(&model, WindowId(2), None),

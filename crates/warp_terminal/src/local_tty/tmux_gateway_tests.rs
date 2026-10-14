@@ -618,13 +618,20 @@ fn a_queue_whose_reader_is_gone_is_reopened_with_a_resync() {
     let queues = opened_queues(&events);
     assert_eq!(queues.len(), 2);
     // The view showing %1 is dropped (zoomed out, or moved to another tab).
-    drop(queues.into_iter().find(|queue| queue.pane_id() == PaneId(1)));
+    drop(
+        queues
+            .into_iter()
+            .find(|queue| queue.pane_id() == PaneId(1)),
+    );
 
     let mut writes = VecDeque::new();
     gateway.route(b"%output %1 hidden\n", &mut writes);
     let reopened = opened_queues(&events);
     assert_eq!(
-        reopened.iter().map(PaneQueueReceiver::pane_id).collect::<Vec<_>>(),
+        reopened
+            .iter()
+            .map(PaneQueueReceiver::pane_id)
+            .collect::<Vec<_>>(),
         [PaneId(1)],
         "the pane's next output opens a new queue"
     );

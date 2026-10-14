@@ -133,7 +133,10 @@ fn the_probe_is_one_safe_tmux_line_each_and_runs_in_the_background() {
         .and_then(|rest| rest.strip_suffix('\''))
         .expect("a background run-shell, so ps never holds up tmux's command queue");
     assert!(!script.contains('#') && !script.contains('\''), "{script}");
-    assert!(script.contains("\"7;"), "the record starts with the token: {script}");
+    assert!(
+        script.contains("\"7;"),
+        "the record starts with the token: {script}"
+    );
     for command in std::iter::once(&start).chain(&probe_read_commands()) {
         assert!(!command.contains('\n'), "{command}");
     }
@@ -165,7 +168,10 @@ fn only_one_probe_runs_and_a_lost_one_is_given_up() {
         .start(now + PROBE_TIMEOUT + Duration::from_millis(1))
         .expect("a lost probe is given up");
     assert_ne!(first, second);
-    assert!(!state.finish(first), "a late reply to the lost probe is ignored");
+    assert!(
+        !state.finish(first),
+        "a late reply to the lost probe is ignored"
+    );
     assert!(state.finish(second));
     assert!(state.start(now + PROBE_TIMEOUT * 2).is_some());
 }

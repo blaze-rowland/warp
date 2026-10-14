@@ -240,7 +240,9 @@ impl TmuxIntegration {
                 .is_some_and(|(held, _)| *held == hold)
                 && let Some((_, connect)) = state.held_queues.remove(&pane_id)
             {
-                log::info!("tmux: no hook token yet on {origin:?}; parsing pane {pane_id} without it");
+                log::info!(
+                    "tmux: no hook token yet on {origin:?}; parsing pane {pane_id} without it"
+                );
                 connect(ctx);
             }
         });
@@ -826,7 +828,10 @@ type Reply = Box<dyn FnOnce(&CommandReply, &mut AppContext)>;
 /// Sends one command through the session registry, which routes its reply.
 fn send(origin: TmuxOriginId, line: String, on_reply: Option<Reply>, ctx: &mut AppContext) {
     TmuxSessions::handle(ctx).update(ctx, |sessions, ctx| {
-        if sessions.send_command_app(origin, line, on_reply, ctx).is_none() {
+        if sessions
+            .send_command_app(origin, line, on_reply, ctx)
+            .is_none()
+        {
             log::debug!("tmux: integration command dropped; origin {origin:?} is gone");
         }
     });

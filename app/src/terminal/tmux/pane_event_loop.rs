@@ -196,7 +196,11 @@ impl TmuxPaneEventLoop {
             Message::Shutdown | Message::ChildExited => self.release(),
             // Session-level requests go through the origin PTY's own event loop.
             Message::Tmux(request) => {
-                log::warn!("tmux: pane {} ignoring a {} request", self.pane_id, request.name());
+                log::warn!(
+                    "tmux: pane {} ignoring a {} request",
+                    self.pane_id,
+                    request.name()
+                );
             }
         }
     }

@@ -12,11 +12,11 @@ use warpui::r#async::Timer;
 use warpui::{Entity, ModelContext, SingletonEntity, WindowId as UiWindowId};
 
 use super::{
-    CONFIRM_DELAY, GLOBAL_PATH_QUERY, HiddenPopupChange, HiddenPopupWatch, PopupSpec,
-    PopupWindow, ProbeState, bound_popup_command, close_popup_command, hidden_popup_text,
-    hidden_popups, parse_clients, parse_global_path, parse_pane_pids, parse_probe,
-    parse_window_id, path_with_wrapper, popup_window_options_command, popup_windows,
-    probe_read_commands, probe_start_command, set_global_path_command, wrapper_dir,
+    CONFIRM_DELAY, GLOBAL_PATH_QUERY, HiddenPopupChange, HiddenPopupWatch, PopupSpec, PopupWindow,
+    ProbeState, bound_popup_command, close_popup_command, hidden_popup_text, hidden_popups,
+    parse_clients, parse_global_path, parse_pane_pids, parse_probe, parse_window_id,
+    path_with_wrapper, popup_window_options_command, popup_windows, probe_read_commands,
+    probe_start_command, set_global_path_command, wrapper_dir,
 };
 use crate::terminal::tmux::TmuxOriginId;
 use crate::terminal::tmux::gateway::TmuxGateways;
@@ -193,7 +193,12 @@ impl TmuxPopups {
 
     /// Probes again after `delay`, unless a follow-up is already scheduled. While no Warp window
     /// is active the probe waits for the next tick.
-    fn schedule_probe(&mut self, origin: TmuxOriginId, delay: Duration, ctx: &mut ModelContext<Self>) {
+    fn schedule_probe(
+        &mut self,
+        origin: TmuxOriginId,
+        delay: Duration,
+        ctx: &mut ModelContext<Self>,
+    ) {
         let Some(state) = self.origins.get_mut(&origin) else {
             return;
         };
@@ -276,11 +281,8 @@ impl TmuxPopups {
         };
         match parse_probe(record, token) {
             Some(children) => {
-                let found = hidden_popups(
-                    &children,
-                    &parse_pane_pids(panes),
-                    &parse_clients(clients),
-                );
+                let found =
+                    hidden_popups(&children, &parse_pane_pids(panes), &parse_clients(clients));
                 self.on_probed(origin, token, found, ctx);
             }
             None if attempts > 1 => self.read_probe(origin, token, attempts - 1, ctx),

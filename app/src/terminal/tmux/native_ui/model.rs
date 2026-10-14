@@ -561,7 +561,10 @@ pub(crate) fn send(
     ctx: &mut AppContext,
 ) {
     TmuxSessions::handle(ctx).update(ctx, |sessions, ctx| {
-        if sessions.send_command_app(origin, line, on_reply, ctx).is_none() {
+        if sessions
+            .send_command_app(origin, line, on_reply, ctx)
+            .is_none()
+        {
             log::debug!("tmux: native UI command dropped; origin {origin:?} is gone");
         }
     });
