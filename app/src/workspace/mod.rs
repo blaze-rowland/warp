@@ -613,7 +613,8 @@ pub fn init(app: &mut AppContext) {
         EditableBinding::new(
             "workspace:activate_last_tab",
             "Switch to last tab",
-            WorkspaceAction::ActivateLastTab,
+            // Number 9: the last tab, or tmux window 9 while a tmux tab is focused.
+            WorkspaceAction::ActivateTabByNumber(9),
         )
         .with_context_predicate(id!("Workspace"))
         .with_group(bindings::BindingGroup::Navigation.as_str())

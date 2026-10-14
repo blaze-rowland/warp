@@ -702,6 +702,7 @@ impl TmuxWindowSizer {
             | ClientEvent::SessionRenamed { .. }
             | ClientEvent::WindowAdded { .. }
             | ClientEvent::WindowRenamed { .. }
+            | ClientEvent::WindowIndexChanged { .. }
             | ClientEvent::ActiveWindowChanged { .. }
             | ClientEvent::ActivePaneChanged { .. }
             | ClientEvent::PaneSnapshot(_)

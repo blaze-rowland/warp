@@ -78,19 +78,6 @@ pub(crate) const TAB_ACTIVATE_BINDING_NAMES: [&str; 8] = [
 ];
 pub(crate) const TAB_ACTIVATE_LAST_BINDING_NAME: &str = "workspace:activate_last_tab";
 
-pub(crate) fn tab_activate_binding_name(
-    tab_index: usize,
-    tab_count: usize,
-) -> Option<&'static str> {
-    if tab_index >= tab_count {
-        return None;
-    }
-    if let Some(binding_name) = TAB_ACTIVATE_BINDING_NAMES.get(tab_index).copied() {
-        return Some(binding_name);
-    }
-    (tab_index == tab_count - 1).then_some(TAB_ACTIVATE_LAST_BINDING_NAME)
-}
-
 /// Modifier kinds relevant to revealing tab shortcut hints. The Super kind is
 /// the Cmd key on macOS and the Windows/Super key elsewhere; a `Keystroke`'s
 /// `cmd` and `meta` flags both correspond to it.
@@ -1193,12 +1180,6 @@ impl<'a> TabComponent<'a> {
             .as_ref(ctx)
             .is_terminal_pane_being_shared(ctx);
         let should_show_indicators = *TabSettings::as_ref(ctx).show_indicators.value();
-        let shortcut_hint_label = if reveals_tab_shortcut_hints(ctx) {
-            tab_activate_binding_name(tab_index, tab_bar.tab_count)
-                .and_then(|binding_name| keybinding_name_to_display_string(binding_name, ctx))
-        } else {
-            None
-        };
         let are_inputs_synced = SyncedInputState::as_ref(ctx)
             .should_sync_this_pane_group(tab.pane_group.id(), tab.pane_group.window_id(ctx));
 
@@ -1276,8 +1257,21 @@ impl<'a> TabComponent<'a> {
             sole_grouped_member: false,
             locator,
             is_in_multi_tab_selection: false,
-            shortcut_hint_label,
+            shortcut_hint_label: None,
         }
+    }
+
+    /// Shows `binding_name`'s keystroke on the tab while the tab shortcut modifier is held. The
+    /// workspace picks the binding (see `Workspace::tab_shortcut_binding_name`) because cmd+N
+    /// skips the hidden tmux origin tab and follows tmux window indices in a tmux tab.
+    pub fn with_shortcut_hint(
+        mut self,
+        binding_name: Option<&'static str>,
+        ctx: &AppContext,
+    ) -> Self {
+        self.shortcut_hint_label = binding_name
+            .and_then(|binding_name| keybinding_name_to_display_string(binding_name, ctx));
+        self
     }
 
     /// Marks this tab as being rendered inside the floating chip used by the

@@ -226,6 +226,17 @@ impl SessionModel {
         }
     }
 
+    /// Returns true when the window is known and its index changed.
+    pub fn set_window_index(&mut self, id: WindowId, index: u32) -> bool {
+        match self.windows.get_mut(&id) {
+            Some(window) if window.index != Some(index) => {
+                window.index = Some(index);
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn set_active_window(&mut self, id: WindowId) {
         self.active_window = Some(id);
     }

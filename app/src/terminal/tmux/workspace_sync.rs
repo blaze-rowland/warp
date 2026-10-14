@@ -783,6 +783,7 @@ impl TmuxSessions {
             ClientEvent::WindowAdded { .. }
             | ClientEvent::WindowClosed { .. }
             | ClientEvent::WindowRenamed { .. }
+            | ClientEvent::WindowIndexChanged { .. }
             | ClientEvent::LayoutChanged { .. } => {
                 ctx.emit(TmuxSessionEvent::WindowsChanged { origin });
             }

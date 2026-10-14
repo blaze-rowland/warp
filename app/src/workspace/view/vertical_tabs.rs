@@ -57,7 +57,7 @@ use crate::pane_group::{
 use crate::safe_triangle::SafeTriangle;
 use crate::tab::{
     SelectedTabColor, TAB_INDICATOR_SYNCED_COLOR, TabData, reveals_tab_shortcut_hints,
-    tab_activate_binding_name, tab_position_id,
+    tab_position_id,
 };
 use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
 use crate::terminal::session_settings::SessionSettings;
@@ -2274,7 +2274,7 @@ fn render_tab_group_internal(
                     None,
                     tab.pinned,
                     group_state.is_hovered(),
-                    tab_activate_binding_name(tab_index, workspace.tabs.len()),
+                    workspace.tab_shortcut_binding_name(tab_index, app),
                     app,
                 ) else {
                     return Empty::new().finish();
@@ -2334,7 +2334,7 @@ fn render_tab_group_internal(
                     is_pane_being_renamed.then_some(workspace.pane_rename_editor.clone()),
                     tab.pinned,
                     group_state.is_hovered(),
-                    tab_activate_binding_name(tab_index, workspace.tabs.len()),
+                    workspace.tab_shortcut_binding_name(tab_index, app),
                     app,
                 ) else {
                     continue;

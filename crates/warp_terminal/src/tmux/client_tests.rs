@@ -9,6 +9,7 @@ const FIRST_NUMBER: u64 = 286;
 
 const VERSION_QUERY: &str = "display-message -p '#{version}\t#{client_name}'\n";
 const FLAGS: &str = "refresh-client -f pause-after=5,wait-exit\n";
+const SUBSCRIBE: &str = "refresh-client -B 'warp-window-index:@*:#{window_index}'\n";
 const PREFIX: &str = "show -gv prefix\n";
 const PREFIX2: &str = "show -gv prefix2\n";
 
@@ -164,6 +165,7 @@ impl Harness {
         let handshake = self.out();
         assert_eq!(handshake[0], FLAGS);
         self.reply(&[]);
+        self.reply(&[]); // the window-index subscription
         let body = layout_body(panes.iter().chain(alt_panes).copied().collect());
         self.reply(&[&window_line(1, &body, "main")]);
         let pane_lines: Vec<String> = panes
@@ -228,6 +230,7 @@ fn handshake_on_3_7_queries_version_then_lists_prefixes_and_keys() {
         h.out(),
         vec![
             FLAGS.to_owned(),
+            SUBSCRIBE.to_owned(),
             list_windows(),
             list_panes(),
             PREFIX.to_owned(),
@@ -239,6 +242,7 @@ fn handshake_on_3_7_queries_version_then_lists_prefixes_and_keys() {
     assert!(h.client.version().unwrap().supports_client_key_commands());
 
     h.reply(&[]);
+    h.reply(&[]); // the window-index subscription
     h.reply(&[&window_line(
         1,
         "80x24,0,0{40x24,0,0,1,39x24,41,0,2}",
@@ -302,6 +306,7 @@ fn handshake_on_3_2_uses_pause_after_and_skips_key_table_queries() {
     assert_eq!(handshake[0], FLAGS);
     assert!(handshake.iter().all(|line| !line.starts_with("list-keys")));
     h.reply(&[]);
+    h.reply(&[]); // the window-index subscription
     h.reply(&[&window_line(1, "80x24,0,0,1", "main")]);
     h.reply(&[&pane_line(1, 1, false)]);
     h.reply(&["C-a"]);
@@ -491,6 +496,7 @@ fn output_during_a_seed_is_applied_after_it_in_order_with_no_duplicate_at_the_se
     h.reply(&["3.7c\tclient-7"]);
     h.out();
     h.reply(&[]);
+    h.reply(&[]); // the window-index subscription
     h.reply(&[&window_line(1, "80x24,0,0,4", "main")]);
     // Output before the pane list is covered by the capture that follows it.
     h.feed("%output %4 L0\\015\\012\n");
@@ -596,6 +602,7 @@ fn alt_screen_panes_are_repainted_instead_of_seeded() {
     h.reply(&["3.7c\tclient-7"]);
     h.out();
     h.reply(&[]);
+    h.reply(&[]); // the window-index subscription
     h.reply(&[&window_line(
         1,
         "80x24,0,0{40x24,0,0,1,39x24,41,0,2}",
@@ -1394,4 +1401,213 @@ fn quoted_values_cannot_expand_in_a_shell() {
         .output()
         .expect("run sh");
     assert_eq!(String::from_utf8_lossy(&output.stdout), value);
+}
+
+#[test]
+fn window_index_subscription_updates_move_the_window_in_the_model() {
+    let mut h = Harness::attached("3.7c", &[1]);
+    // tmux reports every window once when the subscription starts; unchanged indices are quiet.
+    h.feed("%subscription-changed warp-window-index $0 @1 1 - : 1\n");
+    assert!(h.events().is_empty());
+
+    h.feed("%subscription-changed warp-window-index $0 @1 5 - : 5\n");
+    assert_eq!(
+        h.events(),
+        vec![ClientEvent::WindowIndexChanged {
+            window_id: WindowId(1),
+            index: 5
+        }]
+    );
+    assert_eq!(h.client.model().window(WindowId(1)).unwrap().index, Some(5));
+
+    // Other sessions, other subscriptions, unknown windows and bad values change nothing.
+    h.feed(
+        "%subscription-changed warp-window-index $9 @1 2 - : 2\n\
+         %subscription-changed other $0 @1 3 - : 3\n\
+         %subscription-changed warp-window-index $0 @77 4 - : 4\n\
+         %subscription-changed warp-window-index $0 @1 5 - : x\n",
+    );
+    assert!(h.events().is_empty());
+    assert_eq!(h.client.model().window(WindowId(1)).unwrap().index, Some(5));
+    assert!(h.out().is_empty());
+}
+
+/// tmux sends no window notification for `move-window -r` (renumber) and only an add/close
+/// pair for a move, so the index comes from the window-index subscription. Runs against an
+/// isolated server (`-L warp-idx-<pid> -f /dev/null`).
+#[test]
+fn live_moved_and_renumbered_windows_update_their_index() {
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+    use std::sync::mpsc;
+
+    use command::blocking::Command;
+    use instant::Instant;
+
+    let Some(version) = Command::new("tmux")
+        .arg("-V")
+        .output()
+        .ok()
+        .and_then(|out| TmuxVersion::parse(&String::from_utf8_lossy(&out.stdout)))
+    else {
+        eprintln!("skipping: tmux not found");
+        return;
+    };
+    if !version.meets_native_floor() {
+        eprintln!("skipping: tmux is older than 3.2");
+        return;
+    }
+
+    let socket = format!("warp-idx-{}", std::process::id());
+    struct KillServer {
+        socket: String,
+        path: Option<String>,
+    }
+    impl Drop for KillServer {
+        fn drop(&mut self) {
+            let _ = Command::new("tmux")
+                .args(["-L", &self.socket, "kill-server"])
+                .output();
+            if let Some(path) = &self.path {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+    let mut cleanup = KillServer {
+        socket: socket.clone(),
+        path: None,
+    };
+    let tmux = |args: &[&str]| {
+        let out = Command::new("tmux")
+            .args(["-L", &socket, "-f", "/dev/null"])
+            .args(args)
+            .output()
+            .expect("run tmux");
+        assert!(out.status.success(), "tmux {args:?} failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    // Windows 1, 2, 3, 4, 6, 7: the user's layout with a gap at 5.
+    tmux(&[
+        "new-session",
+        "-d",
+        "-s",
+        "t",
+        "-x",
+        "80",
+        "-y",
+        "24",
+        "sleep 60",
+    ]);
+    let path = tmux(&["display-message", "-p", "#{socket_path}"]);
+    cleanup.path = path.contains(&socket).then_some(path);
+    for index in ["1", "2", "3", "4", "6", "7"] {
+        tmux(&["new-window", "-d", "-t", &format!("t:{index}"), "sleep 60"]);
+    }
+    tmux(&["kill-window", "-t", "t:0"]);
+
+    let mut child = Command::new("tmux")
+        .args(["-L", &socket, "-f", "/dev/null", "-C", "attach", "-t", "t"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn tmux");
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match stdout.read(&mut buf) {
+                Ok(0) | Err(_) => {
+                    let _ = tx.send(None);
+                    return;
+                }
+                Ok(n) => {
+                    if tx.send(Some(buf[..n].to_vec())).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
+    fn indices(client: &ControlClient) -> Vec<u32> {
+        let mut indices: Vec<u32> = client.model().windows().filter_map(|w| w.index).collect();
+        indices.sort();
+        indices
+    }
+
+    enum Step {
+        Attaching,
+        Moving(WindowId),
+        Renumbering,
+        Done,
+    }
+    let start = Instant::now();
+    let mut client = ControlClient::new(ClientConfig::default());
+    client.receive_bytes(CONTROL_MODE_DCS, start.elapsed());
+    let mut step = Step::Attaching;
+    let mut index_events = 0;
+    while start.elapsed() < Duration::from_secs(15) && !matches!(step, Step::Done) {
+        for line in client.take_outgoing() {
+            stdin.write_all(line.as_bytes()).unwrap();
+        }
+        stdin.flush().unwrap();
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(Some(bytes)) => {
+                client.receive_bytes(&bytes, start.elapsed());
+            }
+            Ok(None) => panic!("tmux exited early"),
+            Err(_) => client.tick(start.elapsed()),
+        }
+        for event in client.take_events() {
+            match event {
+                ClientEvent::WindowIndexChanged { .. } => index_events += 1,
+                ClientEvent::Desync { reason } => panic!("desync: {reason}"),
+                ClientEvent::AttachFailed { error } => panic!("attach failed: {error:?}"),
+                _ => {}
+            }
+        }
+        let now = start.elapsed();
+        step = match step {
+            Step::Attaching if client.phase() == Phase::Attached => {
+                assert_eq!(indices(&client), vec![1, 2, 3, 4, 6, 7]);
+                let review = client
+                    .model()
+                    .windows()
+                    .find(|w| w.index == Some(6))
+                    .unwrap()
+                    .id;
+                client.send_command("move-window -s :6 -t :5", now).unwrap();
+                Step::Moving(review)
+            }
+            Step::Moving(review)
+                if client.model().window(review).and_then(|w| w.index) == Some(5)
+                    && indices(&client) == vec![1, 2, 3, 4, 5, 7] =>
+            {
+                index_events = 0;
+                client.send_command("move-window -r", now).unwrap();
+                Step::Renumbering
+            }
+            Step::Renumbering if indices(&client) == vec![0, 1, 2, 3, 4, 5] => {
+                assert!(index_events > 0, "renumbering arrived without index events");
+                Step::Done
+            }
+            step => step,
+        };
+    }
+    let reached = match step {
+        Step::Attaching => "attaching",
+        Step::Moving(_) => "moving",
+        Step::Renumbering => "renumbering",
+        Step::Done => "done",
+    };
+    client.detach();
+    for line in client.take_outgoing() {
+        let _ = stdin.write_all(line.as_bytes());
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(reached, "done", "indices: {:?}", indices(&client));
 }

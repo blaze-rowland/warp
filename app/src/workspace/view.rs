@@ -5399,6 +5399,48 @@ impl Workspace {
         self.tabs.iter().map(|tab| tab.hidden_for_tmux).collect()
     }
 
+    /// Every tab as cmd+1–9 see it: hidden or not, and the tmux window it shows.
+    pub(crate) fn shortcut_tabs(
+        &self,
+        ctx: &AppContext,
+    ) -> Vec<crate::terminal::tmux::hidden_tabs::ShortcutTab> {
+        use crate::terminal::tmux::hidden_tabs::{ShortcutTab, TmuxWindowSlot};
+        self.tabs
+            .iter()
+            .map(|tab| ShortcutTab {
+                hidden: tab.hidden_for_tmux,
+                tmux: tab
+                    .pane_group
+                    .as_ref(ctx)
+                    .tmux_tab()
+                    .map(|tmux_tab| TmuxWindowSlot {
+                        origin: tmux_tab.origin,
+                        index: tmux_window_index(tmux_tab.origin, tmux_tab.window_id, ctx),
+                    }),
+            })
+            .collect()
+    }
+
+    /// The keybinding tab `tab_index`'s shortcut hint shows (the one that selects it), or
+    /// `None` while hints are not revealed.
+    pub(crate) fn tab_shortcut_binding_name(
+        &self,
+        tab_index: usize,
+        ctx: &AppContext,
+    ) -> Option<&'static str> {
+        if !crate::tab::reveals_tab_shortcut_hints(ctx) {
+            return None;
+        }
+        crate::terminal::tmux::hidden_tabs::shortcut_labels(
+            &self.shortcut_tabs(ctx),
+            self.active_tab_index,
+        )
+        .get(tab_index)
+        .copied()
+        .flatten()
+        .map(|shortcut| shortcut.binding_name())
+    }
+
     /// `index`, or the closest visible tab when `index` is a hidden tmux origin tab.
     pub(crate) fn visible_tab_index(&self, index: usize) -> usize {
         crate::terminal::tmux::hidden_tabs::nearest_visible(&self.hidden_tab_flags(), index)
@@ -20353,6 +20395,7 @@ impl Workspace {
             is_drag_target,
             ctx,
         )
+        .with_shortcut_hint(self.tab_shortcut_binding_name(tab_index, ctx), ctx)
         .with_multi_tab_selection(self.is_tab_in_multi_tab_selection(tab_index))
         .build()
         .finish()
@@ -20466,6 +20509,7 @@ impl Workspace {
                     is_drag_target,
                     ctx,
                 )
+                .with_shortcut_hint(self.tab_shortcut_binding_name(idx, ctx), ctx)
                 .with_effective_color(effective_color)
                 .for_grouped_member(is_sole_member)
                 .with_multi_tab_selection(self.is_tab_in_multi_tab_selection(idx))
@@ -24332,11 +24376,18 @@ impl TypedActionView for Workspace {
         match action {
             ActivateTab(index) => self.activate_tab(*index, ctx),
             ActivateTabByNumber(num) => {
-                // cmd+N counts visible tabs only, so a hidden tmux origin tab is skipped.
-                if let Some(index) = crate::terminal::tmux::hidden_tabs::visible_to_raw(
-                    &self.hidden_tab_flags(),
-                    num.saturating_sub(1),
-                ) {
+                // cmd+N skips a hidden tmux origin tab, and follows tmux window indices while a
+                // tmux tab is focused (see `hidden_tabs::shortcut_target`).
+                if let Some(index) = crate::terminal::tmux::hidden_tabs::TabShortcut::from_number(
+                    *num,
+                )
+                .and_then(|shortcut| {
+                    crate::terminal::tmux::hidden_tabs::shortcut_target(
+                        &self.shortcut_tabs(ctx),
+                        self.active_tab_index,
+                        shortcut,
+                    )
+                }) {
                     self.activate_tab(index, ctx);
                 }
             }
@@ -29822,6 +29873,26 @@ impl Workspace {
             }
         }
     }
+}
+
+/// tmux's `#{window_index}` for `window_id`, as the engine last reported it.
+fn tmux_window_index(
+    origin: crate::terminal::tmux::TmuxOriginId,
+    window_id: warp_terminal::tmux::WindowId,
+    ctx: &AppContext,
+) -> Option<u32> {
+    #[cfg(feature = "local_tty")]
+    {
+        use crate::terminal::tmux::gateway::TmuxGateways;
+        if ctx.has_singleton_model::<TmuxGateways>() {
+            return TmuxGateways::as_ref(ctx)
+                .model(origin)?
+                .window(window_id)?
+                .index;
+        }
+    }
+    let _ = (origin, window_id, ctx);
+    None
 }
 
 fn should_reserve_traffic_light_space_in_tab_bar(side: TrafficLightSide) -> bool {

@@ -28,6 +28,8 @@ use super::version::TmuxVersion;
 /// `list-keys -F` format (tmux 3.4+) matching [`KeyBinding`].
 pub const LIST_KEYS_FORMAT: &str = "#{key_table}\t#{key_repeat}\t#{key_string}\t#{key_command}";
 
+/// The `refresh-client -B` subscription that reports each window's `#{window_index}`.
+const WINDOW_INDEX_SUBSCRIPTION: &str = "warp-window-index";
 const VERSION_QUERY: &str = "display-message -p '#{version}\t#{client_name}'";
 
 /// `%begin` flag tmux sets on replies to commands this client sent.
@@ -190,6 +192,11 @@ pub enum ClientEvent {
         window_id: WindowId,
         name: String,
     },
+    /// The window's `#{window_index}` changed (`move-window`, `swap-window`, renumbering).
+    WindowIndexChanged {
+        window_id: WindowId,
+        index: u32,
+    },
     LayoutChanged {
         window_id: WindowId,
         layout: WindowLayout,
@@ -275,6 +282,7 @@ enum ListKind {
 enum Purpose {
     Version,
     ClientFlags,
+    Subscribe,
     ListWindows(ListKind),
     ListPanes(ListKind),
     Prefix,
@@ -553,6 +561,22 @@ impl ControlClient {
                 if self.model.session().is_some_and(|s| s.id == session_id) {
                     self.model.set_active_window(window_id);
                     self.emit_attached(ClientEvent::ActiveWindowChanged { window_id });
+                }
+            }
+            ControlEvent::SubscriptionChanged {
+                name,
+                session_id,
+                window_id: Some(window_id),
+                value,
+                ..
+            } if name == WINDOW_INDEX_SUBSCRIPTION => {
+                let in_session =
+                    session_id.is_none_or(|id| self.model.session().is_some_and(|s| s.id == id));
+                if let Ok(index) = value.trim().parse()
+                    && in_session
+                    && self.model.set_window_index(window_id, index)
+                {
+                    self.emit_attached(ClientEvent::WindowIndexChanged { window_id, index });
                 }
             }
             ControlEvent::Message { message } => {
@@ -876,6 +900,14 @@ impl ControlClient {
     fn dispatch(&mut self, purpose: Purpose, reply: CommandReply, now: Duration) {
         match purpose {
             Purpose::Version => self.on_version(reply, now),
+            Purpose::Subscribe => {
+                if reply.error {
+                    log::warn!(
+                        "tmux: window-index subscription refused: {}",
+                        reply_text(&reply)
+                    );
+                }
+            }
             Purpose::ClientFlags => {
                 self.wait_exit = !reply.error;
                 self.handshake_step_done();
@@ -957,6 +989,13 @@ impl ControlClient {
         self.write(
             format!("refresh-client -f pause-after={pause_after},wait-exit"),
             Purpose::ClientFlags,
+            now,
+        );
+        // tmux sends no notification when a window's index changes (`move-window -r`,
+        // `swap-window`; a move only adds and closes the window), so watch the index itself.
+        self.write(
+            format!("refresh-client -B '{WINDOW_INDEX_SUBSCRIPTION}:@*:#{{window_index}}'"),
+            Purpose::Subscribe,
             now,
         );
         self.send_lists(ListKind::Handshake, now);

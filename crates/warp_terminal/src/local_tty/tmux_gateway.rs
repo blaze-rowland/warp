@@ -996,6 +996,7 @@ fn changes_model(event: &ClientEvent) -> bool {
             | ClientEvent::WindowAdded { .. }
             | ClientEvent::WindowClosed { .. }
             | ClientEvent::WindowRenamed { .. }
+            | ClientEvent::WindowIndexChanged { .. }
             | ClientEvent::LayoutChanged { .. }
             | ClientEvent::ActiveWindowChanged { .. }
             | ClientEvent::ActivePaneChanged { .. }

@@ -264,3 +264,14 @@ fn replacing_panes_sets_state_and_active_panes() {
     );
     assert_eq!(model.panes().count(), 2);
 }
+
+#[test]
+fn a_window_index_change_moves_only_a_known_window() {
+    let mut model = SessionModel::default();
+    model.replace_windows(vec![window_row(4, 6, true, "80x24,0,0,1", "review")]);
+    assert!(!model.set_window_index(WindowId(4), 6));
+    assert!(model.set_window_index(WindowId(4), 5));
+    assert_eq!(model.window(WindowId(4)).unwrap().index, Some(5));
+    assert!(!model.set_window_index(WindowId(9), 1));
+    assert!(model.window(WindowId(9)).is_none());
+}
