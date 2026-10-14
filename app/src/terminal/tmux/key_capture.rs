@@ -216,13 +216,17 @@ fn route_key(pane_group: &PaneGroup, routed: &RoutedKey, ctx: &mut ViewContext<P
     let Some(target) = pane_group.tmux_key_target(ctx) else {
         return;
     };
-    let used: HashSet<Keystroke> = target
-        .view_ids
-        .iter()
-        .flat_map(|view_id| ctx.key_bindings_for_view(target.window_id, *view_id))
-        .filter_map(|binding| trigger_to_keystroke(binding.trigger))
-        .collect();
-    router.update(ctx, |router, ctx| {
-        router.check_shadow_notice(origin, |stroke| used.contains(stroke), ctx);
+    // Reading key bindings walks the focused view's ancestors, which include this pane group,
+    // so it cannot run while this action holds the pane group. The router runs it afterwards.
+    router.update(ctx, |_, ctx| {
+        let _ = ctx.spawn(async {}, move |router, _, ctx| {
+            let used: HashSet<Keystroke> = target
+                .view_ids
+                .iter()
+                .flat_map(|view_id| ctx.key_bindings_for_view(target.window_id, *view_id))
+                .filter_map(|binding| trigger_to_keystroke(binding.trigger))
+                .collect();
+            router.check_shadow_notice(origin, |stroke| used.contains(stroke), ctx);
+        });
     });
 }
