@@ -29,7 +29,7 @@ use crate::terminal::tmux::TmuxOriginId;
 use crate::terminal::tmux::gateway::{TmuxGatewayEvent, TmuxGateways};
 use crate::terminal::tmux::key_tables::HOOK_MARKER;
 use crate::terminal::tmux::keys::{TmuxKeyRouter, TmuxKeyRouterEvent};
-use crate::terminal::tmux::workspace_sync::{ReplyCallback, TmuxSessions};
+use crate::terminal::tmux::workspace_sync::TmuxSessions;
 use crate::view_components::DismissibleToast;
 use crate::workspace::{ToastStack, WorkspaceAction};
 
@@ -561,14 +561,7 @@ pub(crate) fn send(
     ctx: &mut AppContext,
 ) {
     TmuxSessions::handle(ctx).update(ctx, |sessions, ctx| {
-        let on_reply = on_reply.map(|on_reply| {
-            Box::new(
-                move |reply: &CommandReply,
-                      _: &mut TmuxSessions,
-                      ctx: &mut ModelContext<TmuxSessions>| on_reply(reply, ctx),
-            ) as ReplyCallback
-        });
-        if sessions.send_command(origin, line, on_reply, ctx).is_none() {
+        if sessions.send_command_app(origin, line, on_reply, ctx).is_none() {
             log::debug!("tmux: native UI command dropped; origin {origin:?} is gone");
         }
     });

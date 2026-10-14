@@ -489,6 +489,9 @@ pub enum TmuxSessionEvent {
     Notice { origin: TmuxOriginId, line: String },
     /// A Reattach that waited for the old control client to end can run now.
     ReattachReady { origin: TmuxOriginId },
+    /// Replies for commands sent with [`TmuxSessions::send_command_app`] are waiting for
+    /// [`TmuxReplyRunner`], which runs them once the registry's update has finished.
+    RepliesReady,
 }
 
 /// Called with a tagged command's reply. It runs inside the registry's update, so it gets the
@@ -496,10 +499,23 @@ pub enum TmuxSessionEvent {
 pub type ReplyCallback =
     Box<dyn FnOnce(&CommandReply, &mut TmuxSessions, &mut ModelContext<TmuxSessions>)>;
 
+/// Called with a tagged command's reply outside the registry's update, so it may update any model,
+/// the registry included (for example to send a follow-up through another model's helper).
+pub type AppReplyCallback = Box<dyn FnOnce(&CommandReply, &mut AppContext)>;
+
+enum PendingReply {
+    /// Runs inside the registry's update with the registry in hand.
+    Registry(ReplyCallback),
+    /// Runs after the registry's update, from [`TmuxReplyRunner`].
+    App(AppReplyCallback),
+}
+
 /// Every tmux session in this Warp instance. See the module docs.
 pub struct TmuxSessions {
     sessions: HashMap<TmuxOriginId, SessionInfo>,
-    pending: HashMap<(TmuxOriginId, u64), ReplyCallback>,
+    pending: HashMap<(TmuxOriginId, u64), PendingReply>,
+    /// App replies whose commands completed, waiting for [`TmuxReplyRunner`].
+    ready_replies: Vec<(CommandReply, AppReplyCallback)>,
     next_tag: u64,
     /// Disconnected sessions whose Reattach waits for the old control client to end.
     reattach_after_end: HashSet<TmuxOriginId>,
@@ -519,6 +535,7 @@ impl TmuxSessions {
         Self {
             sessions: HashMap::new(),
             pending: HashMap::new(),
+            ready_replies: Vec::new(),
             next_tag: 1,
             reattach_after_end: HashSet::new(),
         }
@@ -600,9 +617,32 @@ impl TmuxSessions {
             return None;
         }
         if let Some(on_reply) = on_reply {
-            self.pending.insert((origin, tag), on_reply);
+            self.pending
+                .insert((origin, tag), PendingReply::Registry(on_reply));
         }
         Some(tag)
+    }
+
+    /// Like [`Self::send_command`], but `on_reply` runs after the registry's update instead of
+    /// inside it. Models outside the registry use this: their reply handlers often send follow-up
+    /// commands through the registry, which would be a circular update if they ran inside it.
+    pub fn send_command_app(
+        &mut self,
+        origin: TmuxOriginId,
+        line: String,
+        on_reply: Option<AppReplyCallback>,
+        ctx: &mut ModelContext<Self>,
+    ) -> Option<u64> {
+        let tag = self.send_command(origin, line, None, ctx)?;
+        if let Some(on_reply) = on_reply {
+            self.pending.insert((origin, tag), PendingReply::App(on_reply));
+        }
+        Some(tag)
+    }
+
+    /// Takes the app replies that are ready to run.
+    fn take_ready_replies(&mut self) -> Vec<(CommandReply, AppReplyCallback)> {
+        std::mem::take(&mut self.ready_replies)
     }
 
     /// Records the host a session runs on and checks whether another origin already shows the
@@ -685,8 +725,13 @@ impl TmuxSessions {
                 self.on_client_event(*origin, event, ctx);
             }
             TmuxGatewayEvent::CommandCompleted { origin, tag, reply } => {
-                if let Some(callback) = self.pending.remove(&(*origin, *tag)) {
-                    callback(reply, self, ctx);
+                match self.pending.remove(&(*origin, *tag)) {
+                    Some(PendingReply::Registry(callback)) => callback(reply, self, ctx),
+                    Some(PendingReply::App(callback)) => {
+                        self.ready_replies.push((reply.clone(), callback));
+                        ctx.emit(TmuxSessionEvent::RepliesReady);
+                    }
+                    None => {}
                 }
             }
             TmuxGatewayEvent::Ended { origin } => self.on_ended(*origin, ctx),
@@ -823,3 +868,27 @@ impl TmuxSessions {
 #[cfg(test)]
 #[path = "workspace_sync_tests.rs"]
 mod tests;
+
+/// Runs replies for [`TmuxSessions::send_command_app`] once the registry's update has finished, so
+/// a reply handler can send follow-up commands through the registry without a circular update.
+pub struct TmuxReplyRunner;
+
+impl Entity for TmuxReplyRunner {
+    type Event = ();
+}
+
+impl SingletonEntity for TmuxReplyRunner {}
+
+impl TmuxReplyRunner {
+    pub fn new(ctx: &mut ModelContext<Self>) -> Self {
+        ctx.subscribe_to_model(&TmuxSessions::handle(ctx), |_, sessions, event, ctx| {
+            if matches!(event, TmuxSessionEvent::RepliesReady) {
+                let ready = sessions.update(ctx, |sessions, _| sessions.take_ready_replies());
+                for (reply, callback) in ready {
+                    callback(&reply, ctx);
+                }
+            }
+        });
+        Self
+    }
+}

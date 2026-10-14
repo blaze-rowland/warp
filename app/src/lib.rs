@@ -1534,6 +1534,8 @@ pub(crate) fn initialize_app(
     #[cfg(feature = "local_tty")]
     ctx.add_singleton_model(crate::terminal::tmux::workspace_sync::TmuxSessions::new);
     #[cfg(feature = "local_tty")]
+    ctx.add_singleton_model(crate::terminal::tmux::workspace_sync::TmuxReplyRunner::new);
+    #[cfg(feature = "local_tty")]
     ctx.add_singleton_model(crate::terminal::tmux::integration::TmuxIntegration::new);
     #[cfg(feature = "local_tty")]
     ctx.add_singleton_model(crate::terminal::tmux::keys::TmuxKeyRouter::new);

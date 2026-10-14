@@ -266,7 +266,8 @@ impl TmuxIntegration {
             | TmuxSessionEvent::StatusChanged { .. }
             | TmuxSessionEvent::Focus { .. }
             | TmuxSessionEvent::Notice { .. }
-            | TmuxSessionEvent::ReattachReady { .. } => {}
+            | TmuxSessionEvent::ReattachReady { .. }
+            | TmuxSessionEvent::RepliesReady => {}
         }
     }
 
@@ -825,14 +826,7 @@ type Reply = Box<dyn FnOnce(&CommandReply, &mut AppContext)>;
 /// Sends one command through the session registry, which routes its reply.
 fn send(origin: TmuxOriginId, line: String, on_reply: Option<Reply>, ctx: &mut AppContext) {
     TmuxSessions::handle(ctx).update(ctx, |sessions, ctx| {
-        let on_reply = on_reply.map(|on_reply| {
-            Box::new(
-                move |reply: &CommandReply,
-                      _: &mut TmuxSessions,
-                      ctx: &mut ModelContext<TmuxSessions>| on_reply(reply, ctx),
-            ) as crate::terminal::tmux::workspace_sync::ReplyCallback
-        });
-        if sessions.send_command(origin, line, on_reply, ctx).is_none() {
+        if sessions.send_command_app(origin, line, on_reply, ctx).is_none() {
             log::debug!("tmux: integration command dropped; origin {origin:?} is gone");
         }
     });

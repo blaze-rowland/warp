@@ -103,6 +103,7 @@ impl Workspace {
                 self.write_tmux_origin_line(*origin, line, ctx)
             }
             TmuxSessionEvent::ReattachReady { origin } => self.tmux_reattach(*origin, ctx),
+            TmuxSessionEvent::RepliesReady => {}
         }
     }
 

@@ -95,6 +95,7 @@ fn integration(app: &mut App) -> (ModelHandle<TmuxGateways>, ModelHandle<TmuxInt
     initialize_settings_for_tests(app);
     let gateways = app.add_singleton_model(TmuxGateways::new);
     app.add_singleton_model(TmuxSessions::new);
+    app.add_singleton_model(crate::terminal::tmux::workspace_sync::TmuxReplyRunner::new);
     let integration = app.add_singleton_model(TmuxIntegration::new);
     (gateways, integration)
 }
@@ -321,4 +322,32 @@ fn autosave_steps() {
         autosave_step(Some(&reply(&[CONTINUUM_ON])), &reply(&[ONLY_WARP])),
         AutosaveStep::Save(_)
     ));
+}
+
+#[test]
+fn a_reply_handler_can_send_a_follow_up_command() {
+    // Reply handlers that send through the registry used to run inside its update and panic
+    // with a circular model update (the launcher install on attach does exactly this).
+    let _flag = FeatureFlag::TmuxControlMode.override_enabled(true);
+    App::test((), |mut app| async move {
+        let (gateways, _integration) = integration(&mut app);
+        let (origin, _link, rx) = session(&mut app, &gateways);
+        commands(&rx);
+        app.update(|ctx| {
+            send(
+                origin,
+                "display-message -p first".to_owned(),
+                Some(Box::new(move |_, ctx| {
+                    send(origin, "display-message -p second".to_owned(), None, ctx);
+                })),
+                ctx,
+            );
+        });
+        let sent = commands(&rx);
+        let (tag, line) = sent.last().cloned().expect("the first command was sent");
+        assert_eq!(line, "display-message -p first");
+        answer(&mut app, &gateways, origin, tag, reply(&["ok"]));
+        let follow_up: Vec<String> = commands(&rx).into_iter().map(|(_, line)| line).collect();
+        assert_eq!(follow_up, vec!["display-message -p second".to_owned()]);
+    });
 }

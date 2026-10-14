@@ -174,7 +174,8 @@ impl TmuxPopups {
             | TmuxSessionEvent::StatusChanged { .. }
             | TmuxSessionEvent::Focus { .. }
             | TmuxSessionEvent::Notice { .. }
-            | TmuxSessionEvent::ReattachReady { .. } => {}
+            | TmuxSessionEvent::ReattachReady { .. }
+            | TmuxSessionEvent::RepliesReady => {}
         }
     }
 
