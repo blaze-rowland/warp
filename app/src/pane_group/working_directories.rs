@@ -1,15 +1,19 @@
 use std::collections::HashMap;
 #[cfg(feature = "local_fs")]
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 #[cfg(feature = "local_fs")]
 use std::path::Path;
-#[cfg(feature = "local_fs")]
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 #[cfg(feature = "local_fs")]
 use indexmap::IndexSet;
 #[cfg(feature = "local_fs")]
+use notify_debouncer_full::notify::{RecursiveMode, WatchFilter};
+#[cfg(feature = "local_fs")]
 use remote_server::manager::RemoteServerManager;
+#[cfg(feature = "local_fs")]
+use repo_metadata::discovery::{RepoDiscovery, discover_repos};
 #[cfg(feature = "local_fs")]
 use repo_metadata::repositories::DetectedRepositories;
 use warp_core::SessionId;
@@ -17,9 +21,15 @@ use warp_core::SessionId;
 use warp_errors::report_error;
 #[cfg(feature = "local_fs")]
 use warp_util::remote_path::RemotePath;
+#[cfg(all(feature = "local_fs", test))]
+use warpui::r#async::FutureId;
+#[cfg(feature = "local_fs")]
+use warpui::r#async::SpawnedFutureHandle;
 #[cfg(feature = "local_fs")]
 use warpui::{AppContext, SingletonEntity as _};
 use warpui::{Entity, EntityId, ModelContext, ModelHandle, ViewHandle};
+#[cfg(feature = "local_fs")]
+use watcher::{BulkFilesystemWatcher, BulkFilesystemWatcherEvent};
 
 use crate::code::buffer_location::LocalOrRemotePath;
 #[cfg(feature = "local_fs")]
@@ -29,7 +39,16 @@ use crate::code_review::comments::{
     AttachedReviewComment, PendingImportedReviewComment, ReviewCommentBatch,
 };
 use crate::code_review::diff_state::{DiffMode, DiffStateModel};
+#[cfg(feature = "local_fs")]
+use crate::features::FeatureFlag;
 use crate::workspace::view::global_search::view::GlobalSearchView;
+
+#[cfg(all(feature = "local_fs", not(test)))]
+const DISCOVERY_WATCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
+/// Caps the parent-folder watches held per discovery so a truncated scan cannot register
+/// thousands of watches; the shallowest folders are kept.
+#[cfg(feature = "local_fs")]
+const MAX_DISCOVERY_WATCHES: usize = 256;
 
 /// Type-safe wrapper around the map of `LocalOrRemotePath` → `DiffStateModel`.
 ///
@@ -220,6 +239,97 @@ impl PaneGroupRepositoryRoots {
     }
 }
 
+/// Where a repo found beneath a non-repo working directory came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiscoveredRepoInfo {
+    /// The canonical working directory the repo was discovered under.
+    pub parent: PathBuf,
+    /// Directory name of the main repository when the repo is a linked worktree.
+    pub main_repo_name: Option<String>,
+    /// Last-change time read during the scan.
+    pub recency: Option<SystemTime>,
+}
+
+/// Progress of repo discovery for a pane group.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RepoDiscoveryState {
+    /// Whether any discovery scan for the pane group has not finished yet.
+    pub scanning: bool,
+    /// Whether any scan stopped at its size bound, so the list may be incomplete.
+    pub truncated: bool,
+}
+
+/// Discovery state for one non-repo working directory.
+#[cfg(feature = "local_fs")]
+struct DiscoveryEntry {
+    /// The terminal whose cwd this is; discovered repos map to it.
+    terminal_id: EntityId,
+    result: Option<RepoDiscovery>,
+    scan: Option<SpawnedFutureHandle>,
+    rescan_requested: bool,
+}
+
+#[cfg(feature = "local_fs")]
+impl DiscoveryEntry {
+    fn watched_dirs(&self) -> Vec<PathBuf> {
+        self.result
+            .as_ref()
+            .map(discovery_watch_dirs)
+            .unwrap_or_default()
+    }
+}
+
+/// Repo discovery for one pane group, keyed by canonical cwd.
+#[cfg(feature = "local_fs")]
+#[derive(Default)]
+struct PaneGroupDiscovery {
+    entries: BTreeMap<PathBuf, DiscoveryEntry>,
+    /// Repo roots and their terminals from the latest refresh, before discovered roots join them.
+    cwd_repo_roots: Vec<LocalOrRemotePath>,
+    cwd_root_to_terminal: HashMap<LocalOrRemotePath, EntityId>,
+    /// Roots that only discovery produced in this pane group.
+    discovered_roots: HashSet<PathBuf>,
+}
+
+#[cfg(feature = "local_fs")]
+impl PaneGroupDiscovery {
+    fn state(&self) -> RepoDiscoveryState {
+        RepoDiscoveryState {
+            scanning: self
+                .entries
+                .values()
+                .any(|entry| entry.scan.is_some() || entry.result.is_none()),
+            truncated: self
+                .entries
+                .values()
+                .any(|entry| entry.result.as_ref().is_some_and(|result| result.truncated)),
+        }
+    }
+
+    /// Appends discovered roots that no cwd produced, mapping each to the terminal whose cwd
+    /// discovered it.
+    fn chain_discovered_roots(
+        &mut self,
+        repo_roots: &mut Vec<LocalOrRemotePath>,
+        root_to_terminal: &mut HashMap<LocalOrRemotePath, EntityId>,
+    ) {
+        self.discovered_roots.clear();
+        let cwd_roots: HashSet<LocalOrRemotePath> = repo_roots.iter().cloned().collect();
+        for entry in self.entries.values() {
+            for repo in entry.result.iter().flat_map(|result| &result.repos) {
+                let key = LocalOrRemotePath::Local(repo.root.clone());
+                if cwd_roots.contains(&key) {
+                    continue;
+                }
+                if self.discovered_roots.insert(repo.root.clone()) {
+                    repo_roots.push(key.clone());
+                }
+                root_to_terminal.entry(key).or_insert(entry.terminal_id);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkingDirectory {
     pub path: LocalOrRemotePath,
@@ -300,6 +410,14 @@ pub struct WorkingDirectoriesModel {
     selected_review_repo: HashMap<EntityId, LocalOrRemotePath>,
     global_search_views: HashMap<EntityId, ViewHandle<GlobalSearchView>>,
     file_tree_views: HashMap<EntityId, ViewHandle<FileTreeView>>,
+    /// Per-pane-group discovery of repos beneath non-repo working directories.
+    repo_discovery: HashMap<EntityId, PaneGroupDiscovery>,
+    /// Non-recursive watches on the folders discovery walked, created on first use.
+    discovery_watcher: Option<ModelHandle<BulkFilesystemWatcher>>,
+    /// Number of discovery entries holding a watch on each folder.
+    discovery_watch_counts: HashMap<PathBuf, usize>,
+    #[cfg(test)]
+    discovery_scan_futures: Vec<FutureId>,
 }
 
 #[derive(Default)]
@@ -395,7 +513,11 @@ impl WorkingDirectoriesModel {
         let diff_state_model = match &key {
             LocalOrRemotePath::Local(path) => {
                 let path = path.clone();
-                ctx.add_model(|ctx| DiffStateModel::new_local(path, ctx))
+                if self.is_discovered_only_repo(&path) {
+                    ctx.add_model(|ctx| DiffStateModel::new_local_for_discovered_repo(path, ctx))
+                } else {
+                    ctx.add_model(|ctx| DiffStateModel::new_local(path, ctx))
+                }
             }
             LocalOrRemotePath::Remote(remote_path) => {
                 let mgr_handle = RemoteServerManager::handle(ctx);
@@ -564,6 +686,11 @@ impl WorkingDirectoriesModel {
     }
 
     fn handle_empty_pane_group(&mut self, pane_group_id: EntityId, ctx: &mut ModelContext<Self>) {
+        if let Some(discovery) = self.repo_discovery.remove(&pane_group_id) {
+            for entry in discovery.entries.into_values() {
+                self.release_discovery_entry(entry, ctx);
+            }
+        }
         let did_remove_dirs = self.pane_groups.remove(&pane_group_id).is_some();
         let did_remove_terminals = self.directory_to_terminal.remove(&pane_group_id).is_some();
         let orphaned_repos = self.repository_roots.remove_pane_group(pane_group_id);
@@ -819,12 +946,44 @@ impl WorkingDirectoriesModel {
         });
         let _ = seen; // consumed by retain closure above
 
+        let discovery_enabled = FeatureFlag::MultiRepoCodeReview.is_enabled();
+        let old_discovery_state = self.discovery_state(pane_group_id);
+        if discovery_enabled {
+            let mut discovery_cwds: HashMap<PathBuf, EntityId> = HashMap::new();
+            for (terminal_id, cwd) in &local_terminal_cwds {
+                let Some(cwd) = normalize_cwd(cwd) else {
+                    continue;
+                };
+                if DetectedRepositories::as_ref(ctx)
+                    .get_root_for_canonical_path(&LocalOrRemotePath::Local(cwd.clone()))
+                    .is_some()
+                {
+                    continue;
+                }
+                let mapped = discovery_cwds.entry(cwd).or_insert(*terminal_id);
+                if focused_terminal_id == Some(*terminal_id) {
+                    *mapped = *terminal_id;
+                }
+            }
+            self.update_discovery_entries(pane_group_id, discovery_cwds, ctx);
+
+            let discovery = self.repo_discovery.entry(pane_group_id).or_default();
+            discovery.cwd_repo_roots = new_repo_roots_wrapped.clone();
+            discovery.cwd_root_to_terminal = new_root_to_terminal.clone();
+            discovery
+                .chain_discovered_roots(&mut new_repo_roots_wrapped, &mut new_root_to_terminal);
+        }
+
         let orphaned_repos = self
             .repository_roots
             .set_paths(pane_group_id, new_repo_roots_wrapped);
 
         self.directory_to_terminal
             .insert(pane_group_id, new_root_to_terminal);
+
+        if discovery_enabled {
+            self.reset_discovery_defaults_for_cwd_repos(pane_group_id, ctx);
+        }
 
         let new_directories: Vec<WorkingDirectory> = self
             .pane_groups
@@ -849,6 +1008,8 @@ impl WorkingDirectoriesModel {
 
         if old_repos != new_deduplicated_repos {
             self.drop_unused_diff_state_models(orphaned_repos, ctx);
+            self.emit_repositories_changed(pane_group_id, ctx);
+        } else if old_discovery_state != self.discovery_state(pane_group_id) {
             self.emit_repositories_changed(pane_group_id, ctx);
         }
 
@@ -885,6 +1046,325 @@ impl WorkingDirectoriesModel {
     ) {
         if self.repository_roots.insert(pane_group_id, repo_key) {
             self.emit_repositories_changed(pane_group_id, ctx);
+        }
+    }
+
+    /// Metadata for `root` when it was discovered beneath one of the pane group's non-repo
+    /// working directories and no working directory sits inside it.
+    pub fn discovered_repo_info(
+        &self,
+        pane_group_id: EntityId,
+        root: &Path,
+    ) -> Option<DiscoveredRepoInfo> {
+        let discovery = self.repo_discovery.get(&pane_group_id)?;
+        if !discovery.discovered_roots.contains(root) {
+            return None;
+        }
+        discovery.entries.iter().find_map(|(parent, entry)| {
+            let repo = entry
+                .result
+                .as_ref()?
+                .repos
+                .iter()
+                .find(|repo| repo.root == root)?;
+            Some(DiscoveredRepoInfo {
+                parent: parent.clone(),
+                main_repo_name: repo.main_repo_name.clone(),
+                recency: repo.recency,
+            })
+        })
+    }
+
+    pub fn discovery_state(&self, pane_group_id: EntityId) -> RepoDiscoveryState {
+        self.repo_discovery
+            .get(&pane_group_id)
+            .map(PaneGroupDiscovery::state)
+            .unwrap_or_default()
+    }
+
+    /// Rescans every non-repo working directory in the pane group, e.g. when the code review
+    /// panel opens.
+    pub fn rescan_discovered_repos(
+        &mut self,
+        pane_group_id: EntityId,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let cwds: Vec<PathBuf> = self
+            .repo_discovery
+            .get(&pane_group_id)
+            .map(|discovery| discovery.entries.keys().cloned().collect())
+            .unwrap_or_default();
+        for cwd in cwds {
+            self.request_discovery_scan(pane_group_id, cwd, ctx);
+        }
+    }
+
+    fn is_discovered_only_repo(&self, root: &Path) -> bool {
+        let key = LocalOrRemotePath::Local(root.to_path_buf());
+        self.repo_discovery
+            .values()
+            .any(|discovery| discovery.discovered_roots.contains(root))
+            && !self
+                .repo_discovery
+                .values()
+                .any(|discovery| discovery.cwd_repo_roots.contains(&key))
+    }
+
+    /// Drops discovery for working directories that left the pane group and starts a scan for
+    /// each new one.
+    fn update_discovery_entries(
+        &mut self,
+        pane_group_id: EntityId,
+        cwds: HashMap<PathBuf, EntityId>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let discovery = self.repo_discovery.entry(pane_group_id).or_default();
+        let stale: Vec<PathBuf> = discovery
+            .entries
+            .keys()
+            .filter(|cwd| !cwds.contains_key(*cwd))
+            .cloned()
+            .collect();
+        let stale_entries: Vec<DiscoveryEntry> = stale
+            .iter()
+            .filter_map(|cwd| discovery.entries.remove(cwd))
+            .collect();
+        let mut new_cwds = Vec::new();
+        for (cwd, terminal_id) in cwds {
+            match discovery.entries.get_mut(&cwd) {
+                Some(entry) => entry.terminal_id = terminal_id,
+                None => {
+                    discovery.entries.insert(
+                        cwd.clone(),
+                        DiscoveryEntry {
+                            terminal_id,
+                            result: None,
+                            scan: None,
+                            rescan_requested: false,
+                        },
+                    );
+                    new_cwds.push(cwd);
+                }
+            }
+        }
+
+        for entry in stale_entries {
+            self.release_discovery_entry(entry, ctx);
+        }
+        for cwd in new_cwds {
+            self.request_discovery_scan(pane_group_id, cwd, ctx);
+        }
+    }
+
+    /// Starts a scan of `cwd`, or queues one behind a scan already in flight.
+    fn request_discovery_scan(
+        &mut self,
+        pane_group_id: EntityId,
+        cwd: PathBuf,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let Some(entry) = self
+            .repo_discovery
+            .get_mut(&pane_group_id)
+            .and_then(|discovery| discovery.entries.get_mut(&cwd))
+        else {
+            return;
+        };
+        if entry.scan.is_some() {
+            entry.rescan_requested = true;
+            return;
+        }
+
+        let scan_cwd = cwd.clone();
+        let handle = ctx.spawn(
+            async move { discover_repos_outside_repo(&scan_cwd) },
+            move |me, result, ctx| me.on_discovery_scan_finished(pane_group_id, cwd, result, ctx),
+        );
+        #[cfg(test)]
+        self.discovery_scan_futures.push(handle.future_id());
+        entry.scan = Some(handle);
+    }
+
+    fn on_discovery_scan_finished(
+        &mut self,
+        pane_group_id: EntityId,
+        cwd: PathBuf,
+        result: RepoDiscovery,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let old_state = self.discovery_state(pane_group_id);
+        let Some(entry) = self
+            .repo_discovery
+            .get_mut(&pane_group_id)
+            .and_then(|discovery| discovery.entries.get_mut(&cwd))
+        else {
+            return;
+        };
+        entry.scan = None;
+        let old_watches = entry.watched_dirs();
+        entry.result = Some(result);
+        let new_watches = entry.watched_dirs();
+        let rescan = std::mem::take(&mut entry.rescan_requested);
+
+        self.watch_discovery_dirs(new_watches, ctx);
+        self.unwatch_discovery_dirs(old_watches, ctx);
+        if rescan {
+            self.request_discovery_scan(pane_group_id, cwd, ctx);
+        }
+        self.apply_discovered_roots(pane_group_id, old_state, ctx);
+    }
+
+    /// Rebuilds the pane group's repo roots from its latest cwd-derived roots plus the current
+    /// discovery results.
+    fn apply_discovered_roots(
+        &mut self,
+        pane_group_id: EntityId,
+        old_state: RepoDiscoveryState,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let Some(discovery) = self.repo_discovery.get_mut(&pane_group_id) else {
+            return;
+        };
+        let mut repo_roots = discovery.cwd_repo_roots.clone();
+        let mut root_to_terminal = discovery.cwd_root_to_terminal.clone();
+        discovery.chain_discovered_roots(&mut repo_roots, &mut root_to_terminal);
+
+        let old_repos: Vec<LocalOrRemotePath> = self
+            .least_recent_repositories_for_pane_group(pane_group_id)
+            .map(|repos| repos.iter().cloned().collect())
+            .unwrap_or_default();
+        let orphaned_repos = self.repository_roots.set_paths(pane_group_id, repo_roots);
+        self.directory_to_terminal
+            .insert(pane_group_id, root_to_terminal);
+        let repos_changed = self
+            .least_recent_repositories_for_pane_group(pane_group_id)
+            .is_none_or(|repos| !repos.iter().eq(old_repos.iter()));
+
+        if repos_changed {
+            self.drop_unused_diff_state_models(orphaned_repos, ctx);
+        }
+        if repos_changed || old_state != self.discovery_state(pane_group_id) {
+            self.emit_repositories_changed(pane_group_id, ctx);
+        }
+    }
+
+    /// A discovered repo that a working directory now sits in gets today's `Head` default back,
+    /// unless the user already picked a mode.
+    fn reset_discovery_defaults_for_cwd_repos(
+        &mut self,
+        pane_group_id: EntityId,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let Some(discovery) = self.repo_discovery.get(&pane_group_id) else {
+            return;
+        };
+        let models: Vec<ModelHandle<DiffStateModel>> = discovery
+            .cwd_repo_roots
+            .iter()
+            .filter_map(|root| self.diff_state_models.get(root).cloned())
+            .collect();
+        for model in models {
+            if model.as_ref(ctx).has_discovery_default_mode(ctx) {
+                model.update(ctx, |model, ctx| model.reset_discovery_default_mode(ctx));
+            }
+        }
+    }
+
+    fn release_discovery_entry(&mut self, entry: DiscoveryEntry, ctx: &mut ModelContext<Self>) {
+        if let Some(scan) = &entry.scan {
+            scan.abort();
+        }
+        self.unwatch_discovery_dirs(entry.watched_dirs(), ctx);
+    }
+
+    fn watch_discovery_dirs(&mut self, dirs: Vec<PathBuf>, ctx: &mut ModelContext<Self>) {
+        let watcher = self.discovery_watcher(ctx);
+        for dir in dirs {
+            let count = self.discovery_watch_counts.entry(dir.clone()).or_default();
+            *count += 1;
+            if *count == 1 {
+                watcher.update(ctx, |watcher, _| {
+                    std::mem::drop(watcher.register_path(
+                        &dir,
+                        WatchFilter::accept_all(),
+                        RecursiveMode::NonRecursive,
+                    ));
+                });
+            }
+        }
+    }
+
+    fn unwatch_discovery_dirs(&mut self, dirs: Vec<PathBuf>, ctx: &mut ModelContext<Self>) {
+        for dir in dirs {
+            let Some(count) = self.discovery_watch_counts.get_mut(&dir) else {
+                continue;
+            };
+            *count -= 1;
+            if *count == 0 {
+                self.discovery_watch_counts.remove(&dir);
+                if let Some(watcher) = &self.discovery_watcher {
+                    watcher.update(ctx, |watcher, _| {
+                        std::mem::drop(watcher.unregister_path(&dir));
+                    });
+                }
+            }
+        }
+    }
+
+    fn discovery_watcher(
+        &mut self,
+        ctx: &mut ModelContext<Self>,
+    ) -> ModelHandle<BulkFilesystemWatcher> {
+        if let Some(watcher) = &self.discovery_watcher {
+            return watcher.clone();
+        }
+        #[cfg(not(test))]
+        let watcher =
+            ctx.add_model(|ctx| BulkFilesystemWatcher::new(DISCOVERY_WATCH_DEBOUNCE, ctx));
+        #[cfg(test)]
+        let watcher = ctx.add_model(|_| BulkFilesystemWatcher::new_for_test());
+        ctx.subscribe_to_model(&watcher, |me, _, event, ctx| {
+            me.handle_discovery_watch_event(event, ctx);
+        });
+        self.discovery_watcher = Some(watcher.clone());
+        watcher
+    }
+
+    /// Rescans the discoveries that walked through a folder where a directory or `.git` entry
+    /// appeared or disappeared.
+    fn handle_discovery_watch_event(
+        &mut self,
+        event: &BulkFilesystemWatcherEvent,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let appeared = event
+            .added
+            .iter()
+            .chain(event.moved.keys())
+            .filter(|path| path.is_dir() || is_dot_git(path));
+        let disappeared = event.deleted.iter().chain(event.moved.values());
+        let changed: Vec<&PathBuf> = appeared.chain(disappeared).collect();
+        if changed.is_empty() {
+            return;
+        }
+
+        let mut to_rescan = Vec::new();
+        for (pane_group_id, discovery) in &self.repo_discovery {
+            for (cwd, entry) in &discovery.entries {
+                let Some(result) = &entry.result else {
+                    continue;
+                };
+                let affected = changed.iter().any(|path| {
+                    path.parent()
+                        .is_some_and(|parent| result.visited_dirs.iter().any(|dir| dir == parent))
+                });
+                if affected {
+                    to_rescan.push((*pane_group_id, cwd.clone()));
+                }
+            }
+        }
+        for (pane_group_id, cwd) in to_rescan {
+            self.request_discovery_scan(pane_group_id, cwd, ctx);
         }
     }
 
@@ -1100,6 +1580,25 @@ impl WorkingDirectoriesModel {
 
     pub fn remove_pane_group(&mut self, _pane_group_id: EntityId, _ctx: &mut ModelContext<Self>) {}
 
+    pub fn discovered_repo_info(
+        &self,
+        _pane_group_id: EntityId,
+        _root: &std::path::Path,
+    ) -> Option<DiscoveredRepoInfo> {
+        None
+    }
+
+    pub fn discovery_state(&self, _pane_group_id: EntityId) -> RepoDiscoveryState {
+        RepoDiscoveryState::default()
+    }
+
+    pub fn rescan_discovered_repos(
+        &mut self,
+        _pane_group_id: EntityId,
+        _ctx: &mut ModelContext<Self>,
+    ) {
+    }
+
     pub(crate) fn insert_code_review_comments(
         &mut self,
         _pane_group_id: EntityId,
@@ -1121,6 +1620,36 @@ impl WorkingDirectoriesModel {
 
 impl Entity for WorkingDirectoriesModel {
     type Event = WorkingDirectoriesEvent;
+}
+
+/// Runs [`discover_repos`] unless `cwd` is inside a git repo that repo detection has not reported
+/// yet. Like repo detection, a repo at `$HOME` or above does not count.
+#[cfg(feature = "local_fs")]
+fn discover_repos_outside_repo(cwd: &Path) -> RepoDiscovery {
+    let home = dirs::home_dir();
+    for dir in cwd.ancestors() {
+        if home.as_deref() == Some(dir) {
+            break;
+        }
+        if dir.join(".git").exists() {
+            return RepoDiscovery::default();
+        }
+    }
+    discover_repos(cwd)
+}
+
+/// The folders a discovery watches: the walked non-repo folders, shallowest first, capped.
+#[cfg(feature = "local_fs")]
+fn discovery_watch_dirs(result: &RepoDiscovery) -> Vec<PathBuf> {
+    let mut dirs = result.visited_dirs.clone();
+    dirs.sort_by_key(|dir| dir.components().count());
+    dirs.truncate(MAX_DISCOVERY_WATCHES);
+    dirs
+}
+
+#[cfg(feature = "local_fs")]
+fn is_dot_git(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name == ".git")
 }
 
 /// Normalize a CWD path string to a canonical PathBuf

@@ -2,15 +2,21 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use repo_metadata::repositories::DetectedRepositories;
+use repo_metadata::repositories::{
+    DetectedRepositories, DetectedRepositoriesEvent, RepoDetectionSource,
+};
 use repo_metadata::watcher::DirectoryWatcher;
-use warpui::{App, EntityId};
+use warp_core::features::FeatureFlag;
+use warpui::{App, Entity, EntityId, ModelHandle};
+use watcher::BulkFilesystemWatcherEvent;
 
-use super::PaneGroupRepositoryRoots;
+use super::{PaneGroupRepositoryRoots, WorkingDirectoriesEvent};
 use crate::code::buffer_location::LocalOrRemotePath;
+use crate::code_review::diff_state::DiffMode;
 use crate::pane_group::WorkingDirectoriesModel;
+use crate::test_util::assert_eventually;
 
 fn local(path: &std::path::Path) -> LocalOrRemotePath {
     LocalOrRemotePath::Local(path.to_path_buf())
@@ -588,5 +594,611 @@ fn clear_selected_review_repo_removes_only_the_targeted_pane_group_entry() {
                 Some(local(&repo_b)),
             );
         });
+    });
+}
+
+// ── Repo discovery beneath non-repo working directories ──────────
+
+const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+fn write(path: &Path, contents: &str) {
+    fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
+    fs::write(path, contents).expect("write file");
+}
+
+fn make_repo(dir: &Path) {
+    let git_dir = dir.join(".git");
+    write(&git_dir.join("HEAD"), "ref: refs/heads/main\n");
+    write(&git_dir.join("refs/heads/main"), &format!("{SHA}\n"));
+}
+
+fn make_worktree(main: &Path, worktree: &Path, name: &str) {
+    let admin = main.join(".git/worktrees").join(name);
+    write(&admin.join("HEAD"), &format!("ref: refs/heads/{name}\n"));
+    write(&admin.join("commondir"), "../..\n");
+    write(
+        &admin.join("gitdir"),
+        &format!("{}\n", worktree.join(".git").display()),
+    );
+    write(
+        &main.join(".git/refs/heads").join(name),
+        &format!("{SHA}\n"),
+    );
+    write(
+        &worktree.join(".git"),
+        &format!("gitdir: {}\n", admin.display()),
+    );
+}
+
+/// A canonical parent folder holding repos `a` and `b`.
+struct ParentFixture {
+    _temp_dir: tempfile::TempDir,
+    parent: PathBuf,
+    repo_a: PathBuf,
+    repo_b: PathBuf,
+}
+
+fn parent_with_two_repos() -> ParentFixture {
+    let temp_dir = tempfile::TempDir::new().expect("temp dir");
+    let parent = dunce::canonicalize(temp_dir.path()).expect("canonical parent");
+    let repo_a = parent.join("a");
+    let repo_b = parent.join("b");
+    make_repo(&repo_a);
+    make_repo(&repo_b);
+    ParentFixture {
+        _temp_dir: temp_dir,
+        parent,
+        repo_a,
+        repo_b,
+    }
+}
+
+fn setup_discovery(
+    app: &mut App,
+) -> (
+    ModelHandle<DetectedRepositories>,
+    ModelHandle<WorkingDirectoriesModel>,
+) {
+    let detected_repos = app.add_singleton_model(|_| DetectedRepositories::default());
+    app.add_singleton_model(DirectoryWatcher::new_for_testing);
+    let working_directories = app.add_model(|_| WorkingDirectoriesModel::new());
+    (detected_repos, working_directories)
+}
+
+fn seed_detected_repo(
+    app: &mut App,
+    detected_repos: &ModelHandle<DetectedRepositories>,
+    root: &Path,
+) {
+    detected_repos.update(app, |repos, _| {
+        repos.insert_test_repo_root(
+            warp_util::standardized_path::StandardizedPath::from_local_canonicalized(root)
+                .expect("canonicalized path"),
+        );
+    });
+}
+
+fn refresh(
+    app: &mut App,
+    working_directories: &ModelHandle<WorkingDirectoriesModel>,
+    pane_group_id: EntityId,
+    cwds: &[(EntityId, &Path)],
+) {
+    let terminal_cwds = cwds
+        .iter()
+        .map(|(terminal_id, cwd)| (*terminal_id, local(cwd)))
+        .collect();
+    let focused = cwds.first().map(|(terminal_id, _)| *terminal_id);
+    working_directories.update(app, |model, ctx| {
+        model.refresh_working_directories_for_pane_group(
+            pane_group_id,
+            terminal_cwds,
+            vec![],
+            focused,
+            ctx,
+        );
+    });
+}
+
+/// Waits for every discovery scan started so far, including rescans they queue.
+async fn await_discovery_scans(
+    app: &mut App,
+    working_directories: &ModelHandle<WorkingDirectoriesModel>,
+) {
+    loop {
+        let futures = working_directories.update(app, |model, _| {
+            std::mem::take(&mut model.discovery_scan_futures)
+        });
+        if futures.is_empty() {
+            return;
+        }
+        for future_id in futures {
+            working_directories
+                .update(app, |_, ctx| ctx.await_spawned_future(future_id))
+                .await;
+        }
+    }
+}
+
+fn repos(
+    app: &App,
+    working_directories: &ModelHandle<WorkingDirectoriesModel>,
+    pane_group_id: EntityId,
+) -> HashSet<LocalOrRemotePath> {
+    working_directories.read(app, |model, _| {
+        model
+            .most_recent_repositories_for_pane_group(pane_group_id)
+            .map(|repos| repos.collect())
+            .unwrap_or_default()
+    })
+}
+
+fn scans_started(app: &App, working_directories: &ModelHandle<WorkingDirectoriesModel>) -> usize {
+    working_directories.read(app, |model, _| model.discovery_scan_futures.len())
+}
+
+#[derive(Default)]
+struct EventRecorder {
+    repositories: Vec<Vec<LocalOrRemotePath>>,
+    directories: Vec<Vec<LocalOrRemotePath>>,
+    detection_sources: Vec<RepoDetectionSource>,
+}
+
+impl Entity for EventRecorder {
+    type Event = ();
+}
+
+fn record_events(
+    app: &mut App,
+    working_directories: &ModelHandle<WorkingDirectoriesModel>,
+    detected_repos: &ModelHandle<DetectedRepositories>,
+) -> ModelHandle<EventRecorder> {
+    app.add_model(|ctx| {
+        ctx.subscribe_to_model(
+            working_directories,
+            |me: &mut EventRecorder, _, event, _| match event {
+                WorkingDirectoriesEvent::RepositoriesChanged { repositories, .. } => {
+                    me.repositories.push(repositories.clone());
+                }
+                WorkingDirectoriesEvent::DirectoriesChanged { directories, .. } => {
+                    me.directories
+                        .push(directories.iter().map(|dir| dir.path.clone()).collect());
+                }
+                WorkingDirectoriesEvent::FocusedRepoChanged { .. } => {}
+            },
+        );
+        ctx.subscribe_to_model(detected_repos, |me: &mut EventRecorder, _, event, _| {
+            let DetectedRepositoriesEvent::DetectedGitRepo { source, .. } = event;
+            me.detection_sources.push(*source);
+        });
+        EventRecorder::default()
+    })
+}
+
+fn diff_mode(
+    app: &mut App,
+    working_directories: &ModelHandle<WorkingDirectoriesModel>,
+    root: &Path,
+) -> DiffMode {
+    let model = working_directories.update(app, |model, ctx| {
+        model
+            .get_or_create_diff_state_model(local(root), None, ctx)
+            .expect("local diff state model")
+    });
+    model.read(app, |model, ctx| model.diff_mode(ctx))
+}
+
+#[test]
+fn discovery_lists_repos_beneath_parent_without_changing_directories() {
+    let _flag = FeatureFlag::MultiRepoCodeReview.override_enabled(true);
+    App::test((), |mut app| async move {
+        let (detected_repos, working_directories) = setup_discovery(&mut app);
+        let recorder = record_events(&mut app, &working_directories, &detected_repos);
+        let fixture = parent_with_two_repos();
+        let pane_group_id = EntityId::new();
+        let terminal = EntityId::new();
+
+        refresh(
+            &mut app,
+            &working_directories,
+            pane_group_id,
+            &[(terminal, &fixture.parent)],
+        );
+        await_discovery_scans(&mut app, &working_directories).await;
+
+        let expected = HashSet::from_iter([local(&fixture.repo_a), local(&fixture.repo_b)]);
+        assert_eq!(repos(&app, &working_directories, pane_group_id), expected);
+        recorder.read(&app, |recorder, _| {
+            let last = recorder
+                .repositories
+                .last()
+                .expect("RepositoriesChanged emitted");
+            assert_eq!(last.iter().cloned().collect::<HashSet<_>>(), expected);
+            assert_eq!(recorder.directories, vec![vec![local(&fixture.parent)]]);
+        });
+        working_directories.read(&app, |model, _| {
+            for root in [&fixture.repo_a, &fixture.repo_b] {
+                assert_eq!(
+                    model.get_terminal_id_for_root_path(pane_group_id, &local(root)),
+                    Some(terminal)
+                );
+                let info = model
+                    .discovered_repo_info(pane_group_id, root)
+                    .expect("discovered repo info");
+                assert_eq!(info.parent, fixture.parent);
+            }
+            assert!(!model.discovery_state(pane_group_id).scanning);
+            assert!(model.discovery_watch_counts.contains_key(&fixture.parent));
+        });
+    });
+}
+
+#[test]
+fn discovery_does_not_scan_cwd_inside_a_repo() {
+    let _flag = FeatureFlag::MultiRepoCodeReview.override_enabled(true);
+    App::test((), |mut app| async move {
+        let (detected_repos, working_directories) = setup_discovery(&mut app);
+        let fixture = parent_with_two_repos();
+        seed_detected_repo(&mut app, &detected_repos, &fixture.repo_a);
+        let pane_group_id = EntityId::new();
+
+        refresh(
+            &mut app,
+            &working_directories,
+            pane_group_id,
+            &[(EntityId::new(), &fixture.repo_a)],
+        );
+        await_discovery_scans(&mut app, &working_directories).await;
+
+        assert_eq!(
+            repos(&app, &working_directories, pane_group_id),
+            HashSet::from_iter([local(&fixture.repo_a)])
+        );
+        working_directories.read(&app, |model, _| {
+            assert!(model.repo_discovery[&pane_group_id].entries.is_empty());
+            assert!(model.discovery_watch_counts.is_empty());
+        });
+    });
+}
+
+#[test]
+fn discovery_unions_parent_and_repo_panes_without_duplicates() {
+    let _flag = FeatureFlag::MultiRepoCodeReview.override_enabled(true);
+    App::test((), |mut app| async move {
+        let (detected_repos, working_directories) = setup_discovery(&mut app);
+        let fixture = parent_with_two_repos();
+        seed_detected_repo(&mut app, &detected_repos, &fixture.repo_a);
+        let pane_group_id = EntityId::new();
+        let parent_terminal = EntityId::new();
+        let repo_terminal = EntityId::new();
+
+        refresh(
+            &mut app,
+            &working_directories,
+            pane_group_id,
+            &[
+                (parent_terminal, &fixture.parent),
+                (repo_terminal, &fixture.repo_a),
+            ],
+        );
+        await_discovery_scans(&mut app, &working_directories).await;
+
+        let repo_list: Vec<LocalOrRemotePath> = working_directories.read(&app, |model, _| {
+            model
+                .most_recent_repositories_for_pane_group(pane_group_id)
+                .expect("pane group repos")
+                .collect()
+        });
+        assert_eq!(repo_list.len(), 2);
+        assert_eq!(
+            repo_list.into_iter().collect::<HashSet<_>>(),
+            HashSet::from_iter([local(&fixture.repo_a), local(&fixture.repo_b)])
+        );
+        working_directories.read(&app, |model, _| {
+            assert_eq!(
+                model.get_terminal_id_for_root_path(pane_group_id, &local(&fixture.repo_a)),
+                Some(repo_terminal)
+            );
+            assert!(
+                model
+                    .discovered_repo_info(pane_group_id, &fixture.repo_a)
+                    .is_none()
+            );
+            assert!(
+                model
+                    .discovered_repo_info(pane_group_id, &fixture.repo_b)
+                    .is_some()
+            );
+        });
+    });
+}
+
+#[test]
+fn discovery_is_cleared_when_cwd_moves_to_home() {
+    let _flag = FeatureFlag::MultiRepoCodeReview.override_enabled(true);
+    App::test((), |mut app| async move {
+        let (_detected_repos, working_directories) = setup_discovery(&mut app);
+        let fixture = parent_with_two_repos();
+        let home = dirs::home_dir().expect("home dir");
+        let pane_group_id = EntityId::new();
+        let terminal = EntityId::new();
+
+        refresh(
+            &mut app,
+            &working_directories,
+            pane_group_id,
+            &[(terminal, &fixture.parent)],
+        );
+        await_discovery_scans(&mut app, &working_directories).await;
+        assert_eq!(repos(&app, &working_directories, pane_group_id).len(), 2);
+
+        refresh(
+            &mut app,
+            &working_directories,
+            pane_group_id,
+            &[(terminal, &home)],
+        );
+        await_discovery_scans(&mut app, &working_directories).await;
+
+        assert!(repos(&app, &working_directories, pane_group_id).is_empty());
+        working_directories.read(&app, |model, _| {
+            assert!(model.discovery_watch_counts.is_empty());
+            assert!(
+                model
+                    .discovered_repo_info(pane_group_id, &fixture.repo_a)
+                    .is_none()
+            );
+        });
+    });
+}
+
+#[test]
+fn discovery_rescans_when_worktree_is_created_or_removed() {
+    let _flag = FeatureFlag::MultiRepoCodeReview.override_enabled(true);
+    App::test((), |mut app| async move {
+        let (_detected_repos, working_directories) = setup_discovery(&mut app);
+        let fixture = parent_with_two_repos();
+        let worktrees = fixture.parent.join(".claude/worktrees");
+        fs::create_dir_all(&worktrees).expect("create worktrees dir");
+        let pane_group_id = EntityId::new();
+
+        refresh(
+            &mut app,
+            &working_directories,
+            pane_group_id,
+            &[(EntityId::new(), &fixture.parent)],
+        );
+        await_discovery_scans(&mut app, &working_directories).await;
+        working_directories.read(&app, |model, _| {
+            assert!(model.discovery_watch_counts.contains_key(&worktrees));
+        });
+
+        let worktree = worktrees.join("a-feature");
+        make_worktree(&fixture.repo_a, &worktree, "a-feature");
+        working_directories.update(&mut app, |model, ctx| {
+            model.handle_discovery_watch_event(
+                &BulkFilesystemWatcherEvent {
+                    added: HashSet::from_iter([worktree.clone()]),
+                    ..Default::default()
+                },
+                ctx,
+            );
+        });
+        await_discovery_scans(&mut app, &working_directories).await;
+
+        assert!(repos(&app, &working_directories, pane_group_id).contains(&local(&worktree)));
+        working_directories.read(&app, |model, _| {
+            let info = model
+                .discovered_repo_info(pane_group_id, &worktree)
+                .expect("worktree info");
+            assert_eq!(info.main_repo_name.as_deref(), Some("a"));
+        });
+
+        fs::remove_dir_all(&worktree).expect("remove worktree");
+        working_directories.update(&mut app, |model, ctx| {
+            model.handle_discovery_watch_event(
+                &BulkFilesystemWatcherEvent {
+                    deleted: HashSet::from_iter([worktree.clone()]),
+                    ..Default::default()
+                },
+                ctx,
+            );
+        });
+        await_discovery_scans(&mut app, &working_directories).await;
+
+        assert!(!repos(&app, &working_directories, pane_group_id).contains(&local(&worktree)));
+    });
+}
+
+#[test]
+fn discovery_ignores_file_changes_in_parent() {
+    let _flag = FeatureFlag::MultiRepoCodeReview.override_enabled(true);
+    App::test((), |mut app| async move {
+        let (_detected_repos, working_directories) = setup_discovery(&mut app);
+        let fixture = parent_with_two_repos();
+        let pane_group_id = EntityId::new();
+
+        refresh(
+            &mut app,
+            &working_directories,
+            pane_group_id,
+            &[(EntityId::new(), &fixture.parent)],
+        );
+        await_discovery_scans(&mut app, &working_directories).await;
+
+        let notes = fixture.parent.join("notes.md");
+        write(&notes, "notes");
+        working_directories.update(&mut app, |model, ctx| {
+            model.handle_discovery_watch_event(
+                &BulkFilesystemWatcherEvent {
+                    added: HashSet::from_iter([notes.clone()]),
+                    modified: HashSet::from_iter([notes.clone()]),
+                    ..Default::default()
+                },
+                ctx,
+            );
+        });
+
+        assert_eq!(scans_started(&app, &working_directories), 0);
+    });
+}
+
+#[test]
+fn discovered_diff_model_defaults_to_main_branch_and_skips_indexing_source() {
+    let _flag = FeatureFlag::MultiRepoCodeReview.override_enabled(true);
+    App::test((), |mut app| async move {
+        let (detected_repos, working_directories) = setup_discovery(&mut app);
+        let recorder = record_events(&mut app, &working_directories, &detected_repos);
+        let fixture = parent_with_two_repos();
+        let cwd_repo_dir = tempfile::TempDir::new().expect("temp dir");
+        let cwd_repo = dunce::canonicalize(cwd_repo_dir.path()).expect("canonical repo");
+        seed_detected_repo(&mut app, &detected_repos, &cwd_repo);
+        let pane_group_id = EntityId::new();
+
+        refresh(
+            &mut app,
+            &working_directories,
+            pane_group_id,
+            &[
+                (EntityId::new(), &fixture.parent),
+                (EntityId::new(), &cwd_repo),
+            ],
+        );
+        await_discovery_scans(&mut app, &working_directories).await;
+
+        assert_eq!(
+            diff_mode(&mut app, &working_directories, &fixture.repo_a),
+            DiffMode::MainBranch
+        );
+        assert_eq!(
+            diff_mode(&mut app, &working_directories, &cwd_repo),
+            DiffMode::Head
+        );
+
+        assert_eventually!(
+            recorder.read(&app, |recorder, _| !recorder.detection_sources.is_empty()),
+            "discovered repo detection never completed"
+        );
+        recorder.read(&app, |recorder, _| {
+            assert_eq!(
+                recorder.detection_sources,
+                vec![RepoDetectionSource::DiscoveredRepoReview]
+            );
+        });
+    });
+}
+
+#[test]
+fn discovery_is_off_without_feature_flag() {
+    let _flag = FeatureFlag::MultiRepoCodeReview.override_enabled(false);
+    App::test((), |mut app| async move {
+        let (_detected_repos, working_directories) = setup_discovery(&mut app);
+        let fixture = parent_with_two_repos();
+        let pane_group_id = EntityId::new();
+
+        refresh(
+            &mut app,
+            &working_directories,
+            pane_group_id,
+            &[(EntityId::new(), &fixture.parent)],
+        );
+        await_discovery_scans(&mut app, &working_directories).await;
+
+        assert!(repos(&app, &working_directories, pane_group_id).is_empty());
+        assert_eq!(scans_started(&app, &working_directories), 0);
+    });
+}
+
+#[test]
+fn unchanged_parent_cwd_scans_once() {
+    let _flag = FeatureFlag::MultiRepoCodeReview.override_enabled(true);
+    App::test((), |mut app| async move {
+        let (_detected_repos, working_directories) = setup_discovery(&mut app);
+        let fixture = parent_with_two_repos();
+        let pane_group_id = EntityId::new();
+        let terminal = EntityId::new();
+
+        refresh(
+            &mut app,
+            &working_directories,
+            pane_group_id,
+            &[(terminal, &fixture.parent)],
+        );
+        refresh(
+            &mut app,
+            &working_directories,
+            pane_group_id,
+            &[(terminal, &fixture.parent)],
+        );
+        assert_eq!(scans_started(&app, &working_directories), 1);
+
+        await_discovery_scans(&mut app, &working_directories).await;
+        refresh(
+            &mut app,
+            &working_directories,
+            pane_group_id,
+            &[(terminal, &fixture.parent)],
+        );
+        assert_eq!(scans_started(&app, &working_directories), 0);
+    });
+}
+
+#[test]
+fn discovered_default_resets_to_head_when_a_pane_enters_the_repo() {
+    let _flag = FeatureFlag::MultiRepoCodeReview.override_enabled(true);
+    App::test((), |mut app| async move {
+        let (detected_repos, working_directories) = setup_discovery(&mut app);
+        let fixture = parent_with_two_repos();
+        let pane_group_id = EntityId::new();
+        let parent_terminal = EntityId::new();
+        let other_terminal = EntityId::new();
+
+        refresh(
+            &mut app,
+            &working_directories,
+            pane_group_id,
+            &[(parent_terminal, &fixture.parent)],
+        );
+        await_discovery_scans(&mut app, &working_directories).await;
+        assert_eq!(
+            diff_mode(&mut app, &working_directories, &fixture.repo_a),
+            DiffMode::MainBranch
+        );
+        assert_eq!(
+            diff_mode(&mut app, &working_directories, &fixture.repo_b),
+            DiffMode::MainBranch
+        );
+
+        let user_mode = DiffMode::OtherBranch("dev".to_owned());
+        let model_b = working_directories.update(&mut app, |model, ctx| {
+            model
+                .get_or_create_diff_state_model(local(&fixture.repo_b), None, ctx)
+                .expect("model b")
+        });
+        model_b.update(&mut app, |model, ctx| {
+            model.set_diff_mode(user_mode.clone(), false, false, None, ctx);
+        });
+
+        seed_detected_repo(&mut app, &detected_repos, &fixture.repo_a);
+        seed_detected_repo(&mut app, &detected_repos, &fixture.repo_b);
+        refresh(
+            &mut app,
+            &working_directories,
+            pane_group_id,
+            &[
+                (parent_terminal, &fixture.parent),
+                (other_terminal, &fixture.repo_a),
+                (EntityId::new(), &fixture.repo_b),
+            ],
+        );
+
+        assert_eq!(
+            diff_mode(&mut app, &working_directories, &fixture.repo_a),
+            DiffMode::Head
+        );
+        assert_eq!(
+            diff_mode(&mut app, &working_directories, &fixture.repo_b),
+            user_mode
+        );
     });
 }

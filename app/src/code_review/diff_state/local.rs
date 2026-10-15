@@ -202,6 +202,9 @@ pub struct LocalDiffStateModel {
     state: InternalDiffState,
     backend_origin: BackendOrigin,
     mode: DiffMode,
+    /// Whether `mode` is still the main-branch default given to a discovered repo, untouched by
+    /// the user.
+    discovery_default_mode: bool,
     metadata: Option<DiffMetadata>,
     computing_diffs_abort_handle: Option<SpawnedFutureHandle>,
     computing_metadata_abort_handle: Option<SpawnedFutureHandle>,
@@ -231,6 +234,36 @@ impl LocalDiffStateModel {
     pub fn new(
         repo_path: Option<String>,
         backend_origin: BackendOrigin,
+        ctx: &mut ModelContext<Self>,
+    ) -> Self {
+        Self::new_with_detection_source(
+            repo_path,
+            backend_origin,
+            RepoDetectionSource::CodeReviewInitialization,
+            ctx,
+        )
+    }
+
+    /// Creates a model for a repo found by scanning beneath a non-repo working directory. It
+    /// defaults to the main-branch diff and stays off the indexing path.
+    #[cfg(feature = "local_fs")]
+    pub fn new_for_discovered_repo(repo_path: String, ctx: &mut ModelContext<Self>) -> Self {
+        let mut model = Self::new_with_detection_source(
+            Some(repo_path),
+            BackendOrigin::ClientLocal,
+            RepoDetectionSource::DiscoveredRepoReview,
+            ctx,
+        );
+        model.mode = DiffMode::MainBranch;
+        model.discovery_default_mode = true;
+        model
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn new_with_detection_source(
+        repo_path: Option<String>,
+        backend_origin: BackendOrigin,
+        detection_source: RepoDetectionSource,
         ctx: &mut ModelContext<Self>,
     ) -> Self {
         // Set up file invalidation queue and subscribe to results
@@ -285,6 +318,7 @@ impl LocalDiffStateModel {
             },
             subscriber_id: None,
             mode: DiffMode::default(),
+            discovery_default_mode: false,
             backend_origin,
             metadata: None,
             computing_diffs_abort_handle: None,
@@ -297,11 +331,7 @@ impl LocalDiffStateModel {
 
         if let Some(repo_path) = &repo_path {
             let fut = DetectedRepositories::handle(ctx).update(ctx, |model, ctx| {
-                model.detect_possible_local_git_repo(
-                    repo_path,
-                    RepoDetectionSource::CodeReviewInitialization,
-                    ctx,
-                )
+                model.detect_possible_local_git_repo(repo_path, detection_source, ctx)
             });
 
             ctx.spawn(fut, move |me, repo_path, ctx| {
@@ -336,6 +366,7 @@ impl LocalDiffStateModel {
             state: InternalDiffState::default(),
             backend_origin,
             mode: DiffMode::default(),
+            discovery_default_mode: false,
             metadata: None,
             computing_diffs_abort_handle: None,
             computing_metadata_abort_handle: None,
@@ -518,7 +549,26 @@ impl LocalDiffStateModel {
     ) {
         if self.mode != mode {
             self.mode = mode;
+            self.discovery_default_mode = false;
             self.load_diffs_for_current_repo(should_fetch_base, track_load_duration, ctx);
+        }
+    }
+
+    pub fn has_discovery_default_mode(&self) -> bool {
+        self.discovery_default_mode
+    }
+
+    /// Returns a discovered repo's untouched main-branch default to `Head`, the default for a
+    /// repo a terminal sits in.
+    pub fn reset_discovery_default_mode(&mut self, ctx: &mut ModelContext<Self>) {
+        if !self.discovery_default_mode {
+            return;
+        }
+        self.discovery_default_mode = false;
+        if self.mode != DiffMode::Head {
+            self.mode = DiffMode::Head;
+            self.load_diffs_for_current_repo(false, false, ctx);
+            ctx.emit(DiffStateModelEvent::DiffModeReset);
         }
     }
 
@@ -3012,6 +3062,7 @@ impl LocalDiffStateModel {
             subscriber_id: None,
             backend_origin: BackendOrigin::ClientLocal,
             mode: DiffMode::default(),
+            discovery_default_mode: false,
             metadata: None,
             computing_diffs_abort_handle: None,
             computing_metadata_abort_handle: None,

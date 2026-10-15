@@ -401,7 +401,10 @@ impl LocalRepoMetadataModel {
                 model.watcher = Some(watcher);
 
                 ctx.subscribe_to_model(&DetectedRepositories::handle(ctx), |me, _, event, ctx| {
-                    let DetectedRepositoriesEvent::DetectedGitRepo { repository, .. } = event;
+                    let DetectedRepositoriesEvent::DetectedGitRepo { repository, source } = event;
+                    if !source.triggers_indexing() {
+                        return;
+                    }
                     let repo_path = repository.as_ref(ctx).root_dir().clone();
                     if let Err(e) = me.index_directory(repository.clone(), ctx) {
                         log::warn!(

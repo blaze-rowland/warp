@@ -146,6 +146,12 @@ fn repository_discovery_is_surface_aware() {
         RepoDetectionSource::CloudEnvironmentPrep,
         SettingsMode::Tui
     ));
+    for mode in [SettingsMode::Gui, SettingsMode::Tui] {
+        assert!(!should_watch_repository(
+            RepoDetectionSource::DiscoveredRepoReview,
+            mode
+        ));
+    }
 }
 
 #[test]

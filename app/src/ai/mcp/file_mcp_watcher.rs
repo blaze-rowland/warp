@@ -700,13 +700,15 @@ fn should_watch_repository(
                 true
             }
             RepoDetectionSource::ProjectRulesIndexing
-            | RepoDetectionSource::CodeReviewInitialization => false,
+            | RepoDetectionSource::CodeReviewInitialization
+            | RepoDetectionSource::DiscoveredRepoReview => false,
         },
         settings::SettingsMode::Tui => match source {
             RepoDetectionSource::TerminalNavigation => true,
             RepoDetectionSource::ProjectRulesIndexing
             | RepoDetectionSource::CodeReviewInitialization
-            | RepoDetectionSource::CloudEnvironmentPrep => false,
+            | RepoDetectionSource::CloudEnvironmentPrep
+            | RepoDetectionSource::DiscoveredRepoReview => false,
         },
     }
 }

@@ -214,7 +214,9 @@ pub use pane::{
 pub use tmux_tab::TmuxTab;
 pub use tree::{Direction, PaneData, PaneFlex, PaneNode, SplitDirection};
 use warp_errors::report_error;
-pub use working_directories::{WorkingDirectoriesEvent, WorkingDirectoriesModel};
+pub use working_directories::{
+    DiscoveredRepoInfo, RepoDiscoveryState, WorkingDirectoriesEvent, WorkingDirectoriesModel,
+};
 
 use self::pane::{DetachType, PaneViewEvent};
 pub use crate::code_review::CodeReviewPanelArg;

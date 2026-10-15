@@ -84,11 +84,10 @@ impl RepoOutlines {
             ))
         {
             ctx.subscribe_to_model(&DetectedRepositories::handle(ctx), |me, _, event, ctx| {
-                let DetectedRepositoriesEvent::DetectedGitRepo {
-                    repository,
-                    source: _,
-                } = event;
-                me.index_repo(repository.clone(), ctx);
+                let DetectedRepositoriesEvent::DetectedGitRepo { repository, source } = event;
+                if source.triggers_indexing() {
+                    me.index_repo(repository.clone(), ctx);
+                }
             });
         }
 

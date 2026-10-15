@@ -321,7 +321,10 @@ impl PersistedWorkspace {
             feature = "integration_tests"
         )) {
             ctx.subscribe_to_model(&DetectedRepositories::handle(ctx), |me, _, event, ctx| {
-                let DetectedRepositoriesEvent::DetectedGitRepo { repository, .. } = event;
+                let DetectedRepositoriesEvent::DetectedGitRepo { repository, source } = event;
+                if !source.triggers_indexing() {
+                    return;
+                }
                 let repo_path = repository.as_ref(ctx).root_dir().to_local_path_lossy();
 
                 me.index_repo(repo_path, ctx);

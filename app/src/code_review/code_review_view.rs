@@ -2349,6 +2349,9 @@ impl CodeReviewView {
                 }
                 ctx.notify();
             }
+            DiffStateModelEvent::DiffModeReset => {
+                self.update_diff_selector_selection(ctx);
+            }
             DiffStateModelEvent::ConnectionLost => {
                 // Don't clear loaded state — keep stale diffs visible
                 // so the user can still see what they were looking at.

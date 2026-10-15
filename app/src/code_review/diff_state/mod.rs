@@ -413,6 +413,8 @@ pub enum DiffStateModelEvent {
     /// same way for both backends: the local model computes them off-thread and
     /// emits this; the remote model emits it on the daemon's RPC response.
     BranchCommittedFilesReceived(Vec<FileChangeEntry>),
+    /// A discovered repo's default diff mode was reset to `Head` without user input.
+    DiffModeReset,
 }
 
 /// Result of a remote git operation, emitted via
@@ -454,6 +456,17 @@ impl DiffStateModel {
         let repo_path = Some(path.display().to_string());
         let local = ctx
             .add_model(|ctx| LocalDiffStateModel::new(repo_path, BackendOrigin::ClientLocal, ctx));
+        ctx.subscribe_to_model(&local, |me, _, event, ctx| me.forward_event(event, ctx));
+        Self::Local(local)
+    }
+
+    /// Creates a local-backed model for a repo found by scanning beneath a non-repo working
+    /// directory.
+    #[cfg(feature = "local_fs")]
+    pub fn new_local_for_discovered_repo(path: PathBuf, ctx: &mut ModelContext<Self>) -> Self {
+        let repo_path = path.display().to_string();
+        let local =
+            ctx.add_model(|ctx| LocalDiffStateModel::new_for_discovered_repo(repo_path, ctx));
         ctx.subscribe_to_model(&local, |me, _, event, ctx| me.forward_event(event, ctx));
         Self::Local(local)
     }
@@ -504,6 +517,9 @@ impl DiffStateModel {
             }
             DiffStateModelEvent::ConnectionLost => {
                 ctx.emit(DiffStateModelEvent::ConnectionLost);
+            }
+            DiffStateModelEvent::DiffModeReset => {
+                ctx.emit(DiffStateModelEvent::DiffModeReset);
             }
             DiffStateModelEvent::BranchesReceived(branches) => {
                 ctx.emit(DiffStateModelEvent::BranchesReceived(branches.clone()));
@@ -846,6 +862,22 @@ impl DiffStateModel {
             Self::Remote(model) => model.update(ctx, |model, ctx| {
                 model.fetch_committed_branch_files(ctx);
             }),
+        }
+    }
+
+    pub(crate) fn has_discovery_default_mode(&self, ctx: &AppContext) -> bool {
+        match self {
+            Self::Local(local) => local.as_ref(ctx).has_discovery_default_mode(),
+            Self::Remote(_) => false,
+        }
+    }
+
+    pub(crate) fn reset_discovery_default_mode(&self, ctx: &mut ModelContext<Self>) {
+        match self {
+            Self::Local(local) => {
+                local.update(ctx, |local, ctx| local.reset_discovery_default_mode(ctx));
+            }
+            Self::Remote(_) => {}
         }
     }
 

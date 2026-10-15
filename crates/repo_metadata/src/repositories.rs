@@ -26,6 +26,23 @@ pub enum RepoDetectionSource {
     CodeReviewInitialization,
     /// Repo was cloned or discovered during cloud agent environment preparation.
     CloudEnvironmentPrep,
+    /// Repo was found by scanning beneath a non-repo working directory and opened for code review.
+    /// Indexing subscribers skip this source.
+    DiscoveredRepoReview,
+}
+
+impl RepoDetectionSource {
+    /// Whether codebase, outline and file-tree indexers should index a repo detected from this
+    /// source.
+    pub fn triggers_indexing(self) -> bool {
+        match self {
+            Self::TerminalNavigation
+            | Self::ProjectRulesIndexing
+            | Self::CodeReviewInitialization
+            | Self::CloudEnvironmentPrep => true,
+            Self::DiscoveredRepoReview => false,
+        }
+    }
 }
 
 pub enum DetectedRepositoriesEvent {
