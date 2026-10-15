@@ -246,6 +246,8 @@ pub struct DiscoveredRepoInfo {
     pub parent: PathBuf,
     /// Directory name of the main repository when the repo is a linked worktree.
     pub main_repo_name: Option<String>,
+    /// Per-worktree git dir when it lives outside the working tree, as for a linked worktree.
+    pub external_git_dir: Option<PathBuf>,
     /// Last-change time read during the scan.
     pub recency: Option<SystemTime>,
 }
@@ -1070,6 +1072,7 @@ impl WorkingDirectoriesModel {
             Some(DiscoveredRepoInfo {
                 parent: parent.clone(),
                 main_repo_name: repo.main_repo_name.clone(),
+                external_git_dir: repo.external_git_dir.clone(),
                 recency: repo.recency,
             })
         })

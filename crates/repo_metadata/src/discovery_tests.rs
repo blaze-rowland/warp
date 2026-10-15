@@ -68,8 +68,13 @@ fn discovery_finds_main_repos_and_linked_worktree() {
     );
     let wt = result.repos.iter().find(|r| r.root == worktree).unwrap();
     assert_eq!(wt.main_repo_name.as_deref(), Some("first"));
+    assert_eq!(
+        wt.external_git_dir.as_deref(),
+        Some(first.join(".git/worktrees/A").as_path())
+    );
     let main = result.repos.iter().find(|r| r.root == first).unwrap();
     assert_eq!(main.main_repo_name, None);
+    assert_eq!(main.external_git_dir, None);
     assert!(result.repos.iter().all(|repo| repo.recency.is_some()));
     assert!(!result.truncated);
 }

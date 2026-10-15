@@ -28,6 +28,9 @@ pub struct DiscoveredRepo {
     pub root: PathBuf,
     /// Directory name of the main repository when this is a linked worktree.
     pub main_repo_name: Option<String>,
+    /// Canonical per-worktree git dir when it lives outside the working tree, as for a linked
+    /// worktree; `None` when the git dir is `root/.git`.
+    pub external_git_dir: Option<PathBuf>,
     /// Newest mtime among the git index, `logs/HEAD` and the top-level working-tree entries.
     pub recency: Option<SystemTime>,
 }
@@ -136,6 +139,7 @@ fn classify_dir(dir: &Path) -> DirKind {
         return DirKind::Repo(DiscoveredRepo {
             root: dir.to_owned(),
             main_repo_name: None,
+            external_git_dir: None,
             recency: recency(dir, &dot_git),
         });
     }
@@ -156,6 +160,7 @@ fn classify_dir(dir: &Path) -> DirKind {
         root: dir.to_owned(),
         main_repo_name: common_dir.as_deref().and_then(main_repo_name),
         recency: recency(dir, &git_dir),
+        external_git_dir: Some(dunce::canonicalize(&git_dir).unwrap_or(git_dir)),
     })
 }
 

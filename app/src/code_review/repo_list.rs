@@ -4,6 +4,8 @@ use std::cmp::Reverse;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use repo_metadata::TargetFile;
+
 use crate::pane_group::RepoDiscoveryState;
 use crate::settings::RepoListPrefs;
 
@@ -156,6 +158,89 @@ pub fn repo_list_state(ordered: &OrderedRepos, discovery: RepoDiscoveryState) ->
 /// `cwd` must be canonical, since `discovery_parent` is.
 pub fn cwd_can_review_repo(cwd: &Path, repo_root: &Path, discovery_parent: Option<&Path>) -> bool {
     cwd.starts_with(repo_root) || discovery_parent == Some(cwd)
+}
+
+/// The "Changes in <repo>" chip: at most one pending repo, the most recent to change.
+#[derive(Debug, Default)]
+pub struct ChangesChip {
+    pending: Option<PendingChip>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingChip {
+    pub repo: PathBuf,
+    pub changed_at: SystemTime,
+}
+
+/// The panel state a repo change is judged against.
+pub struct ChipScope<'a> {
+    pub viewed: Option<&'a Path>,
+    pub hidden: &'a [PathBuf],
+}
+
+impl ChangesChip {
+    pub fn pending(&self) -> Option<&PendingChip> {
+        self.pending.as_ref()
+    }
+
+    /// Raises the chip for `repo`, replacing any older one, when `changed` holds a file worth
+    /// reviewing: inside the repo, outside any `.git` dir and not gitignored. Changes to the
+    /// viewed or a hidden repo never raise it. Returns whether the chip now names `repo`.
+    pub fn on_repo_changed<'a>(
+        &mut self,
+        repo: &Path,
+        changed: impl IntoIterator<Item = &'a TargetFile>,
+        scope: &ChipScope,
+        changed_at: SystemTime,
+    ) -> bool {
+        if scope.viewed == Some(repo) || scope.hidden.iter().any(|hidden| hidden == repo) {
+            return false;
+        }
+        let has_reviewable_change = changed.into_iter().any(|file| {
+            !file.is_ignored
+                && file
+                    .path
+                    .strip_prefix(repo)
+                    .is_ok_and(|relative| !relative.components().any(|c| c.as_os_str() == ".git"))
+        });
+        if has_reviewable_change {
+            self.pending = Some(PendingChip {
+                repo: repo.to_path_buf(),
+                changed_at,
+            });
+        }
+        has_reviewable_change
+    }
+
+    /// Clears the chip when it names `repo`, e.g. because the user is now viewing it.
+    pub fn clear_for(&mut self, repo: &Path) {
+        if self.pending.as_ref().is_some_and(|chip| chip.repo == repo) {
+            self.pending = None;
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.pending = None;
+    }
+}
+
+pub fn changes_chip_text(label: &str) -> String {
+    format!("Changes in {label}")
+}
+
+/// Shortens `text` to at most `max_chars` characters by replacing its middle with an ellipsis,
+/// keeping both the repo name and the worktree folder of a long label recognizable.
+pub fn truncate_middle(text: &str, max_chars: usize) -> String {
+    let len = text.chars().count();
+    if len <= max_chars {
+        return text.to_owned();
+    }
+    let kept = max_chars.saturating_sub(1);
+    let tail = kept / 2;
+    let head = kept - tail;
+    let start: String = text.chars().take(head).collect();
+    let end: String = text.chars().skip(len - tail).collect();
+    format!("{start}…{end}")
 }
 
 #[cfg(test)]

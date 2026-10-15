@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use dunce::canonicalize;
 use itertools::Itertools;
@@ -35,9 +36,13 @@ use crate::code_review::code_review_view::{
     CodeReviewViewEvent, ReviewActionTargetProvider, render_file_navigation_button,
 };
 use crate::code_review::diff_state::DiffStateModel;
+use crate::code_review::repo_change_watcher::{
+    RepoChangeWatcher, RepoChangeWatcherEvent, WatchedRepo,
+};
 use crate::code_review::repo_list::{
-    RepoListEntry, RepoListState, cwd_can_review_repo, keep_frozen_order, merge_prefs, order_repos,
-    repo_label, repo_list_state, selection_after_change,
+    ChangesChip, ChipScope, RepoListEntry, RepoListState, changes_chip_text, cwd_can_review_repo,
+    keep_frozen_order, merge_prefs, order_repos, repo_label, repo_list_state,
+    selection_after_change, truncate_middle,
 };
 use crate::code_review::telemetry_event::CodeReviewContextDestination;
 use crate::drive::panel::{MAX_SIDEBAR_WIDTH_RATIO, MIN_SIDEBAR_WIDTH};
@@ -60,7 +65,9 @@ use crate::util::bindings::{CustomAction, keybinding_name_to_display_string};
 #[cfg(feature = "local_fs")]
 use crate::util::openable_file_type::FileTarget;
 use crate::util::path::{display_name_with_host, display_path_with_host};
-use crate::view_components::action_button::{ActionButton, PaneHeaderTheme};
+use crate::view_components::action_button::{
+    ActionButton, ButtonSize, PaneHeaderTheme, SecondaryTheme,
+};
 #[cfg(feature = "local_fs")]
 use crate::view_components::action_button::{NakedTheme, TooltipAlignment};
 use crate::view_components::{Dropdown, DropdownAction, DropdownEvent, DropdownItem};
@@ -190,17 +197,18 @@ impl ReviewActionTargetProvider for RightPanelReviewActionTargetProvider {
 struct CodeReviewState {
     dropdown: ViewHandle<Dropdown<RightPanelAction>>,
     available_repos: Vec<LocalOrRemotePath>,
-    /// The repository path of the focused terminal
-    focused_repo_path: Option<LocalOrRemotePath>,
     /// The repository path of the repository selected in the dropdown
     selected_repo_path: Option<LocalOrRemotePath>,
-    /// Avoid showing the jump-to-repo button if the focused repo has not changed
-    did_focused_repo_change: bool,
     /// Set when the tab's repos include ones discovered beneath a non-repo working directory.
     discovered_list: Option<DiscoveredRepoList>,
     /// Visible repo order captured when the dropdown opened; `Some` while it is open.
     frozen_order: Option<Vec<PathBuf>>,
     hidden_group_expanded: bool,
+    changes_chip: ChangesChip,
+    /// Last change seen by the chip watchers, newer than the scan-time recency.
+    change_recency: HashMap<PathBuf, SystemTime>,
+    /// Set when `change_recency` moved since the dropdown was last ordered.
+    recency_changed: bool,
 }
 
 /// The repo dropdown's contents for a tab with discovered repos, in display order.
@@ -229,6 +237,7 @@ struct RepoRow {
 
 const REPO_DROPDOWN_MENU_WIDTH: f32 = 320.;
 const ALL_REPOS_HIDDEN_LABEL: &str = "All repos hidden";
+const CHANGES_CHIP_MAX_LABEL_CHARS: usize = 32;
 
 #[cfg(feature = "local_fs")]
 struct CodeReviewSessionEnv {
@@ -290,11 +299,12 @@ impl CodeReviewState {
             dropdown,
             available_repos: vec![],
             selected_repo_path: None,
-            focused_repo_path: None,
-            did_focused_repo_change: false,
             discovered_list: None,
             frozen_order: None,
             hidden_group_expanded: false,
+            changes_chip: ChangesChip::default(),
+            change_recency: HashMap::new(),
+            recency_changed: false,
         }
     }
 
@@ -365,16 +375,6 @@ impl CodeReviewState {
         self.set_selected_repo_internal(repo_path, true, ctx);
     }
 
-    pub fn set_focused_repo(
-        &mut self,
-        repo_path: Option<LocalOrRemotePath>,
-        ctx: &mut ViewContext<RightPanelView>,
-    ) {
-        self.did_focused_repo_change = true;
-        self.focused_repo_path = repo_path;
-        ctx.notify();
-    }
-
     /// Internal method to set the selected repo with control over whether to update the dropdown.
     /// When `update_dropdown` is false, we skip updating the dropdown (useful when the change
     /// is coming from the dropdown itself to avoid circular updates).
@@ -392,7 +392,6 @@ impl CodeReviewState {
             return;
         }
 
-        self.did_focused_repo_change = false;
         self.selected_repo_path = Some(repo_path.clone());
 
         // Only update the dropdown if requested (not when selection came from dropdown itself)
@@ -599,6 +598,9 @@ pub enum RightPanelAction {
         repo: PathBuf,
     },
     ToggleHiddenRepos,
+    JumpToRepo {
+        repo_path: LocalOrRemotePath,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -632,6 +634,8 @@ pub struct RightPanelView {
     working_directories_model: ModelHandle<WorkingDirectoriesModel>,
     maximize_button: ViewHandle<ActionButton>,
     code_review_state: Option<CodeReviewState>,
+    repo_change_watcher: ModelHandle<RepoChangeWatcher>,
+    changes_chip_button: ViewHandle<ActionButton>,
     #[cfg(feature = "local_fs")]
     code_review_session_env: Option<CodeReviewSessionEnv>,
     is_agent_management_view_open: bool,
@@ -700,6 +704,16 @@ impl RightPanelView {
             }
         });
 
+        let repo_change_watcher = ctx.add_model(RepoChangeWatcher::new);
+        ctx.subscribe_to_model(&repo_change_watcher, |me, _, event, ctx| {
+            me.handle_repo_change(event, ctx);
+        });
+        let changes_chip_button = ctx.add_typed_action_view(|_| {
+            ActionButton::new("", SecondaryTheme)
+                .with_size(ButtonSize::Small)
+                .with_tooltip_positioning_provider(Arc::new(MenuPositioning::BelowInputBox))
+        });
+
         let maximize_button = ctx.add_typed_action_view(|_| {
             ActionButton::new("", PaneHeaderTheme)
                 .with_icon(Icon::Maximize)
@@ -728,6 +742,8 @@ impl RightPanelView {
             working_directories_model,
             maximize_button,
             code_review_state,
+            repo_change_watcher,
+            changes_chip_button,
             #[cfg(feature = "local_fs")]
             code_review_session_env: None,
             is_agent_management_view_open: false,
@@ -799,24 +815,13 @@ impl RightPanelView {
                 }
                 self.apply_available_repos(repositories.clone(), ctx);
             }
-            WorkingDirectoriesEvent::FocusedRepoChanged {
-                pane_group_id,
-                repository_terminal_map: _,
-                focused_repo,
-            } => {
+            WorkingDirectoriesEvent::FocusedRepoChanged { pane_group_id, .. } => {
                 let Some(active_pane_group) = &self.active_pane_group else {
                     return;
                 };
                 if active_pane_group.id() != *pane_group_id {
                     return;
                 }
-
-                // When the focused terminal changes repos (via CD or pane focus),
-                // update the dropdown to match the focused terminal's repo
-                if let Some(state) = self.code_review_state.as_mut() {
-                    state.set_focused_repo(focused_repo.clone(), ctx);
-                }
-
                 self.recompute_terminal_availability(ctx);
                 ctx.notify();
             }
@@ -845,6 +850,7 @@ impl RightPanelView {
             .and_then(|s| s.selected_repo_path.clone());
 
         if let Some(state) = self.code_review_state.as_mut() {
+            state.recency_changed = false;
             state.set_available_repos(repos, discovered_list, ctx);
         }
 
@@ -865,6 +871,7 @@ impl RightPanelView {
         }
 
         self.recompute_terminal_availability(ctx);
+        self.sync_changes_chip(ctx);
         ctx.notify();
     }
 
@@ -881,6 +888,14 @@ impl RightPanelView {
     }
 
     fn handle_repo_dropdown_event(&mut self, event: &DropdownEvent, ctx: &mut ViewContext<Self>) {
+        if matches!(event, DropdownEvent::ToggleExpanded)
+            && self
+                .code_review_state
+                .as_ref()
+                .is_some_and(|state| state.recency_changed)
+        {
+            self.refresh_repo_list(ctx);
+        }
         let Some(state) = self.code_review_state.as_mut() else {
             return;
         };
@@ -938,12 +953,16 @@ impl RightPanelView {
         let prefs = merge_prefs(&per_parent, &discovered);
 
         // Repos a pane sits inside have no cheap recency, so they sort after discovered repos.
+        let change_recency = self.code_review_state.as_ref().map(|s| &s.change_recency);
         let entries: Vec<RepoListEntry> = repos
             .iter()
             .filter_map(LocalOrRemotePath::to_local_path)
             .map(|path| RepoListEntry {
                 path: path.to_path_buf(),
-                recency: infos.get(path).and_then(|info| info.recency),
+                recency: infos
+                    .get(path)
+                    .and_then(|info| info.recency)
+                    .max(change_recency.and_then(|recency| recency.get(path).copied())),
             })
             .collect();
         let mut ordered = order_repos(&entries, &prefs);
@@ -1012,10 +1031,111 @@ impl RightPanelView {
             return;
         };
         if state.discovered_list.is_none() || state.selected_repo_path.is_some() {
+            self.sync_changes_chip(ctx);
             return;
         }
         state.selected_repo_path = saved;
         self.refresh_repo_list(ctx);
+    }
+
+    /// Points the chip watchers at the listed, non-hidden discovered repos other than the viewed
+    /// one while the panel is open, and drops a chip for a repo that is no longer watched.
+    fn sync_changes_chip(&mut self, ctx: &mut ViewContext<Self>) {
+        let watched = self.chip_watch_targets(ctx);
+        if let Some(state) = self.code_review_state.as_mut()
+            && let Some(pending) = state.changes_chip.pending()
+            && !watched.iter().any(|repo| repo.root == pending.repo)
+        {
+            state.changes_chip.clear();
+            ctx.notify();
+        }
+        self.repo_change_watcher.update(ctx, |watcher, ctx| {
+            watcher.set_watched_repos(watched, ctx);
+        });
+    }
+
+    fn chip_watch_targets(&self, ctx: &AppContext) -> Vec<WatchedRepo> {
+        if !FeatureFlag::MultiRepoCodeReview.is_enabled() {
+            return Vec::new();
+        }
+        let (Some(pane_group), Some(state)) = (&self.active_pane_group, &self.code_review_state)
+        else {
+            return Vec::new();
+        };
+        let Some(list) = state
+            .discovered_list
+            .as_ref()
+            .filter(|_| pane_group.as_ref(ctx).right_panel_open)
+        else {
+            return Vec::new();
+        };
+        let model = self.working_directories_model.as_ref(ctx);
+        list.rows
+            .iter()
+            .filter(|row| state.selected_repo_path.as_ref() != Some(&row.path))
+            .filter_map(|row| {
+                let root = row.path.to_local_path()?;
+                let info = model.discovered_repo_info(pane_group.id(), root)?;
+                Some(WatchedRepo {
+                    root: root.to_path_buf(),
+                    external_git_dir: info.external_git_dir,
+                })
+            })
+            .collect()
+    }
+
+    fn handle_repo_change(&mut self, event: &RepoChangeWatcherEvent, ctx: &mut ViewContext<Self>) {
+        let RepoChangeWatcherEvent::FilesChanged { repo, files } = event;
+        let Some(state) = self.code_review_state.as_mut() else {
+            return;
+        };
+        let Some(list) = &state.discovered_list else {
+            return;
+        };
+        let hidden: Vec<PathBuf> = list
+            .hidden_rows
+            .iter()
+            .filter_map(|row| row.path.to_local_path().map(Path::to_path_buf))
+            .collect();
+        let label = list
+            .rows
+            .iter()
+            .find(|row| row.path.to_local_path() == Some(repo.as_path()))
+            .map(|row| row.label.clone())
+            .unwrap_or_else(|| repo_label(repo, None));
+        let viewed = state
+            .selected_repo_path
+            .as_ref()
+            .and_then(LocalOrRemotePath::to_local_path)
+            .map(Path::to_path_buf);
+        let scope = ChipScope {
+            viewed: viewed.as_deref(),
+            hidden: &hidden,
+        };
+        let now = SystemTime::now();
+        if !state.changes_chip.on_repo_changed(repo, files, &scope, now) {
+            return;
+        }
+        state.change_recency.insert(repo.clone(), now);
+        state.recency_changed = true;
+
+        let repo_path = LocalOrRemotePath::Local(repo.clone());
+        self.changes_chip_button.update(ctx, |button, ctx| {
+            button.set_label(
+                changes_chip_text(&truncate_middle(&label, CHANGES_CHIP_MAX_LABEL_CHARS)),
+                ctx,
+            );
+            button.set_tooltip(Some(changes_chip_text(&label)), ctx);
+            button.set_on_click(
+                move |ctx| {
+                    ctx.dispatch_typed_action(RightPanelAction::JumpToRepo {
+                        repo_path: repo_path.clone(),
+                    })
+                },
+                ctx,
+            );
+        });
+        ctx.notify();
     }
 
     pub fn set_active_pane_group(
@@ -1062,6 +1182,7 @@ impl RightPanelView {
             // the first repo, instead of preserving the previous tab's repo.
             state.selected_repo_path = saved_selection;
             state.frozen_order = None;
+            state.changes_chip.clear();
             let discovered_list = self.discovered_repo_list(&active_repositories, None, ctx);
             if let Some(state) = self.code_review_state.as_mut() {
                 state.set_available_repos(active_repositories, discovered_list, ctx);
@@ -1079,6 +1200,7 @@ impl RightPanelView {
 
         let is_maximized = self.is_maximized(ctx);
         self.set_maximized(is_maximized, ctx);
+        self.sync_changes_chip(ctx);
 
         ctx.notify();
     }
@@ -1124,6 +1246,7 @@ impl RightPanelView {
             });
             self.recompute_terminal_availability(ctx);
         };
+        self.sync_changes_chip(ctx);
         ctx.notify();
     }
 
@@ -1167,6 +1290,7 @@ impl RightPanelView {
         if let Some(code_review_state) = &mut self.code_review_state {
             code_review_state.selected_repo_path = None;
         }
+        self.sync_changes_chip(ctx);
         ctx.notify();
     }
 
@@ -1189,6 +1313,15 @@ impl RightPanelView {
             )
             .with_margin_right(4.)
             .finish(),
+        )
+    }
+
+    fn render_changes_chip(&self) -> Option<Box<dyn Element>> {
+        self.code_review_state.as_ref()?.changes_chip.pending()?;
+        Some(
+            Container::new(ChildView::new(&self.changes_chip_button).finish())
+                .with_margin_right(4.)
+                .finish(),
         )
     }
 
@@ -1445,6 +1578,9 @@ impl RightPanelView {
         }
 
         let mut right_section = Vec::new();
+        if let Some(changes_chip) = self.render_changes_chip() {
+            right_section.push(changes_chip);
+        }
         if let Some(repo_dropdown) = self.render_repo_dropdown() {
             right_section.push(repo_dropdown);
         }
@@ -1534,6 +1670,9 @@ impl RightPanelView {
         left_section.add_child(title);
 
         let mut right_section = Vec::new();
+        if let Some(changes_chip) = self.render_changes_chip() {
+            right_section.push(changes_chip);
+        }
         if let Some(repo_dropdown) = self.render_repo_dropdown() {
             right_section.push(repo_dropdown);
         }
@@ -2328,6 +2467,9 @@ impl TypedActionView for RightPanelView {
                         should_update_dropdown,
                         ctx,
                     );
+                    if let Some(repo) = repo_path.to_local_path() {
+                        state.changes_chip.clear_for(repo);
+                    }
                     self.ensure_code_review_view_exists(repo_path, ctx);
 
                     // Persist the user's manual selection so it can be restored when
@@ -2343,6 +2485,7 @@ impl TypedActionView for RightPanelView {
                         });
                     }
 
+                    self.sync_changes_chip(ctx);
                     ctx.notify();
                 }
             }
@@ -2369,6 +2512,15 @@ impl TypedActionView for RightPanelView {
                 CodeSettings::handle(ctx).update(ctx, |settings, ctx| {
                     settings.unhide_repo(parent, repo, ctx);
                 });
+            }
+            RightPanelAction::JumpToRepo { repo_path } => {
+                self.handle_action(
+                    &RightPanelAction::SelectRepo {
+                        repo_path: repo_path.clone(),
+                        from_dropdown: false,
+                    },
+                    ctx,
+                );
             }
             RightPanelAction::ToggleHiddenRepos => {
                 if let Some(state) = self.code_review_state.as_mut() {

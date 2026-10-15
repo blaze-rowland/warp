@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use repo_metadata::TargetFile;
+
 use super::*;
 use crate::settings::{RepoListPrefs, canonical_repo_list_key};
 
@@ -313,4 +315,165 @@ fn review_cwd_parent_folder_is_rejected_for_repo_not_discovered_there() {
         root,
         Some(Path::new("/w/elsewhere"))
     ));
+}
+
+fn at(secs: u64) -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+}
+
+fn tracked(path: &str) -> TargetFile {
+    TargetFile::new(PathBuf::from(path), false)
+}
+
+fn change(
+    chip: &mut ChangesChip,
+    repo: &str,
+    changed: &[&str],
+    scope: &ChipScope,
+    secs: u64,
+) -> bool {
+    let files: Vec<TargetFile> = changed.iter().map(|path| tracked(path)).collect();
+    chip.on_repo_changed(Path::new(repo), &files, scope, at(secs))
+}
+
+#[test]
+fn change_in_another_repo_raises_chip() {
+    let mut chip = ChangesChip::default();
+    let scope = ChipScope {
+        viewed: Some(Path::new("/w/Backend_Legacy-MON-1091")),
+        hidden: &[],
+    };
+
+    assert!(change(
+        &mut chip,
+        "/w/Desktop",
+        &["/w/Desktop/src/main.rs"],
+        &scope,
+        1
+    ));
+
+    assert_eq!(
+        chip.pending(),
+        Some(&PendingChip {
+            repo: PathBuf::from("/w/Desktop"),
+            changed_at: at(1),
+        })
+    );
+    assert_eq!(changes_chip_text("Desktop"), "Changes in Desktop");
+}
+
+#[test]
+fn change_only_under_git_dir_raises_no_chip() {
+    let mut chip = ChangesChip::default();
+    let scope = ChipScope {
+        viewed: Some(Path::new("/w/A")),
+        hidden: &[],
+    };
+
+    assert!(!change(
+        &mut chip,
+        "/w/B",
+        &["/w/B/.git/index", "/w/B/.git/refs/heads/main"],
+        &scope,
+        1
+    ));
+    assert_eq!(chip.pending(), None);
+}
+
+#[test]
+fn gitignored_change_raises_no_chip() {
+    let mut chip = ChangesChip::default();
+    let scope = ChipScope {
+        viewed: Some(Path::new("/w/A")),
+        hidden: &[],
+    };
+
+    let ignored = TargetFile::new(PathBuf::from("/w/B/target/debug/app"), true);
+    let raised = chip.on_repo_changed(Path::new("/w/B"), [&ignored], &scope, at(1));
+
+    assert!(!raised);
+    assert_eq!(chip.pending(), None);
+}
+
+#[test]
+fn newer_change_replaces_chip() {
+    let mut chip = ChangesChip::default();
+    let scope = ChipScope {
+        viewed: Some(Path::new("/w/A")),
+        hidden: &[],
+    };
+
+    change(&mut chip, "/w/B", &["/w/B/a.rs"], &scope, 1);
+    change(&mut chip, "/w/C", &["/w/C/b.rs"], &scope, 2);
+
+    assert_eq!(
+        chip.pending().map(|c| c.repo.as_path()),
+        Some(Path::new("/w/C"))
+    );
+}
+
+#[test]
+fn hidden_repo_change_raises_no_chip() {
+    let mut chip = ChangesChip::default();
+    let hidden = [PathBuf::from("/w/Desktop-MT3-5509")];
+    let scope = ChipScope {
+        viewed: Some(Path::new("/w/A")),
+        hidden: &hidden,
+    };
+
+    assert!(!change(
+        &mut chip,
+        "/w/Desktop-MT3-5509",
+        &["/w/Desktop-MT3-5509/src/lib.rs"],
+        &scope,
+        1
+    ));
+    assert_eq!(chip.pending(), None);
+}
+
+#[test]
+fn viewed_repo_change_raises_no_chip_and_keeps_pending() {
+    let mut chip = ChangesChip::default();
+    let scope = ChipScope {
+        viewed: Some(Path::new("/w/A")),
+        hidden: &[],
+    };
+    change(&mut chip, "/w/B", &["/w/B/a.rs"], &scope, 1);
+
+    assert!(!change(&mut chip, "/w/A", &["/w/A/a.rs"], &scope, 2));
+    assert_eq!(
+        chip.pending().map(|c| c.repo.as_path()),
+        Some(Path::new("/w/B"))
+    );
+}
+
+#[test]
+fn viewing_repo_clears_its_chip_only() {
+    let mut chip = ChangesChip::default();
+    let scope = ChipScope {
+        viewed: Some(Path::new("/w/A")),
+        hidden: &[],
+    };
+    change(&mut chip, "/w/B", &["/w/B/a.rs"], &scope, 1);
+
+    chip.clear_for(Path::new("/w/C"));
+    assert!(chip.pending().is_some());
+
+    chip.clear_for(Path::new("/w/B"));
+    assert_eq!(chip.pending(), None);
+}
+
+#[test]
+fn truncate_middle_keeps_both_ends() {
+    assert_eq!(truncate_middle("Desktop", 10), "Desktop");
+    assert_eq!(
+        truncate_middle("Backend_Legacy · MON-1091", 13),
+        "Backen…N-1091"
+    );
+    assert_eq!(
+        truncate_middle("Backend_Legacy · MON-1091", 13)
+            .chars()
+            .count(),
+        13
+    );
 }
