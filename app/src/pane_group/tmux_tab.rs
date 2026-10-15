@@ -396,11 +396,12 @@ impl PaneGroup {
         };
         #[cfg(feature = "local_tty")]
         {
-            use crate::appearance::Appearance;
             use warpui::elements::{
                 Align, Border, Container, CornerRadius, Flex, ParentElement, Percentage, Radius,
                 Shrinkable, Text,
             };
+
+            use crate::appearance::Appearance;
             if let Some(popup) = &tab.popup {
                 let appearance = Appearance::as_ref(app);
                 let theme = appearance.theme();

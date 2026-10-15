@@ -4,7 +4,6 @@ use std::time::Duration;
 
 use command::blocking::Command;
 use instant::Instant;
-
 use warp_terminal::tmux::{CommandReply, PaneId};
 
 use super::*;

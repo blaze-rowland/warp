@@ -12,8 +12,7 @@ use super::{
     TmuxSettings, TmuxToggle,
 };
 use crate::settings::schema_generation::settings_schema_json;
-use crate::settings_view::SettingsAction;
-use crate::settings_view::warpify_page;
+use crate::settings_view::{SettingsAction, warpify_page};
 use crate::test_util::settings::initialize_settings_for_tests;
 
 /// Schema entries for the tmux settings, found by their TOML location.

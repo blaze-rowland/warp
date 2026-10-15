@@ -10012,7 +10012,8 @@ impl Workspace {
                     ctx
                 );
                 self.setup_code_review_panel(panel_update_params.review_pane_context, ctx);
-                self.right_panel_view.update(ctx, |view, ctx| view.on_panel_opened(ctx));
+                self.right_panel_view
+                    .update(ctx, |view, ctx| view.on_panel_opened(ctx));
             }
         } else {
             self.focus_active_tab(ctx);
