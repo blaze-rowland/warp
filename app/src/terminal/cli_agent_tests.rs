@@ -11,8 +11,8 @@ use warp_util::path::EscapeChar;
 use warpui::App;
 
 use super::{
-    CLIAgent, ReviewGitTarget, UBER_TEAM_UID, build_diff_hunk_prompt, build_review_prompt,
-    build_selection_line_range_prompt, build_selection_substring_prompt,
+    CLIAgent, ReviewGitTarget, UBER_TEAM_UID, build_diff_context_prompt, build_diff_hunk_prompt,
+    build_review_prompt, build_selection_line_range_prompt, build_selection_substring_prompt,
 };
 use crate::ai::agent::{AgentReviewCommentBatch, DiffSetHunk};
 use crate::code::buffer_location::LocalOrRemotePath;
@@ -249,19 +249,89 @@ fn test_build_diff_hunk_prompt_format() {
 }
 
 // ---------------------------------------------------------------------------
+// build_diff_context_prompt tests
+// ---------------------------------------------------------------------------
+
+fn diff_context_hunk(lines: std::ops::Range<usize>, added: u32, removed: u32) -> DiffSetHunk {
+    DiffSetHunk {
+        line_range: LineCount::range(lines),
+        diff_content: String::new(),
+        lines_added: added,
+        lines_removed: removed,
+    }
+}
+
+fn diff_context_files() -> HashMap<String, Vec<DiffSetHunk>> {
+    HashMap::from([
+        (
+            "src/b.rs".to_string(),
+            vec![
+                diff_context_hunk(9..12, 2, 1),
+                diff_context_hunk(19..20, 0, 4),
+            ],
+        ),
+        ("src/a.rs".to_string(), vec![diff_context_hunk(0..3, 3, 0)]),
+    ])
+}
+
+#[test]
+fn test_build_diff_context_prompt_format() {
+    assert_eq!(
+        build_diff_context_prompt(&diff_context_files(), &ReviewGitTarget::WorkingDirectory),
+        "src/a.rs L1-L3 (+3 -0)\nsrc/b.rs L10-L12 (+2 -1)\nsrc/b.rs L20-L20 (+0 -4)",
+    );
+}
+
+#[test]
+fn test_build_diff_context_prompt_outside_repo_is_absolute() {
+    let target = ReviewGitTarget::Repo {
+        root: PathBuf::from("/w/eventric/mobile"),
+        base_branch: Some("main".to_string()),
+    };
+    assert_eq!(
+        build_diff_context_prompt(&diff_context_files(), &target),
+        "/w/eventric/mobile/src/a.rs L1-L3 (+3 -0)\n\
+         /w/eventric/mobile/src/b.rs L10-L12 (+2 -1)\n\
+         /w/eventric/mobile/src/b.rs L20-L20 (+0 -4)",
+    );
+}
+
+// ---------------------------------------------------------------------------
 // build_selection_line_range_prompt tests
 // ---------------------------------------------------------------------------
 
 #[test]
 fn test_build_selection_line_range_prompt_format() {
-    let result = build_selection_line_range_prompt("src/foo.rs", 5, 10);
+    let result =
+        build_selection_line_range_prompt("src/foo.rs", 5, 10, &ReviewGitTarget::WorkingDirectory);
     assert_eq!(result, "src/foo.rs L5-L10");
 }
 
 #[test]
 fn test_build_selection_substring_prompt_format() {
-    let result = build_selection_substring_prompt("src/foo.rs", 5, "let x = 42;");
+    let result = build_selection_substring_prompt(
+        "src/foo.rs",
+        5,
+        "let x = 42;",
+        &ReviewGitTarget::WorkingDirectory,
+    );
     assert_eq!(result, "src/foo.rs L5: let x = 42;");
+}
+
+#[test]
+fn test_build_selection_prompts_outside_repo_are_absolute() {
+    let target = ReviewGitTarget::Repo {
+        root: PathBuf::from("/w/eventric/mobile"),
+        base_branch: None,
+    };
+    assert_eq!(
+        build_selection_line_range_prompt("src/foo.rs", 5, 10, &target),
+        "/w/eventric/mobile/src/foo.rs L5-L10",
+    );
+    assert_eq!(
+        build_selection_substring_prompt("src/foo.rs", 5, "let x = 42;", &target),
+        "/w/eventric/mobile/src/foo.rs L5: let x = 42;",
+    );
 }
 
 #[test]

@@ -5768,12 +5768,18 @@ impl CodeReviewView {
     ) {
         if let Some(terminal_view) = self.attach_target_terminal(ctx) {
             // If a CLI agent is active, send appropriate content to the PTY.
+            let git_target = self.review_git_target(&terminal_view, ctx);
             let prompt = if start_line == end_line {
                 // Single-line: send the literal text with file/line context.
-                build_selection_substring_prompt(&file_path, start_line, &selected_text)
+                build_selection_substring_prompt(
+                    &file_path,
+                    start_line,
+                    &selected_text,
+                    &git_target,
+                )
             } else {
                 // Multi-line: send a line-range reference with format note.
-                build_selection_line_range_prompt(&file_path, start_line, end_line)
+                build_selection_line_range_prompt(&file_path, start_line, end_line, &git_target)
             };
             if let Some(routing) = terminal_view.update(ctx, |tv, ctx| {
                 tv.try_send_text_to_cli_agent_or_rich_input(prompt, ctx)
@@ -5881,8 +5887,13 @@ impl CodeReviewView {
                     };
                     let file_diffs =
                         convert_file_diffs_to_diffset_hunks(files_to_process.into_iter());
+                    let git_target = self.review_git_target(&terminal_view, ctx);
                     let routing = terminal_view.update(ctx, |tv, ctx| {
-                        tv.send_diff_context_to_cli_agent_or_rich_input(&file_diffs, ctx)
+                        tv.send_diff_context_to_cli_agent_or_rich_input(
+                            &file_diffs,
+                            &git_target,
+                            ctx,
+                        )
                     });
                     let destination = match routing {
                         Some(CliAgentRouting::RichInput) => CodeReviewContextDestination::RichInput,

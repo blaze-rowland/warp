@@ -569,6 +569,15 @@ impl ReviewGitTarget {
             base_branch,
         }
     }
+
+    /// Spells a repo-relative path so the agent's shell resolves it: as-is inside the repo,
+    /// joined onto the repo root outside it.
+    fn prompt_path<'a>(&self, file_path: &'a str) -> Cow<'a, str> {
+        match self {
+            Self::WorkingDirectory => Cow::Borrowed(file_path),
+            Self::Repo { root, .. } => Cow::Owned(root.join(file_path).display().to_string()),
+        }
+    }
 }
 
 /// The command that shows a repo's reviewed diff from outside the repo.
@@ -724,20 +733,25 @@ pub fn build_diff_hunk_prompt(
 ///
 /// # Location format
 /// Each line is `<path> L<start>-L<end> (+N -N)` where `start` and `end` are
-/// 1-indexed and both ends are **inclusive**.
-pub fn build_diff_context_prompt(file_diffs: &HashMap<String, Vec<DiffSetHunk>>) -> String {
+/// 1-indexed and both ends are **inclusive**. File keys are repo-relative; they are made
+/// absolute when the agent runs outside the repo.
+pub fn build_diff_context_prompt(
+    file_diffs: &HashMap<String, Vec<DiffSetHunk>>,
+    git_target: &ReviewGitTarget,
+) -> String {
     let mut text = String::new();
     let mut sorted_keys: Vec<&String> = file_diffs.keys().collect();
     sorted_keys.sort();
     for file_key in sorted_keys {
         let hunks = &file_diffs[file_key];
+        let path = git_target.prompt_path(file_key);
         for hunk in hunks {
             // hunk.line_range is [start, end) 0-indexed; convert to L<start>-L<end>
             // where both start and end are 1-indexed inclusive.
             let start = hunk.line_range.start.as_usize() + 1;
             let end = hunk.line_range.end.as_usize();
             text.push_str(&format!(
-                "{file_key} L{start}-L{end} (+{} -{})",
+                "{path} L{start}-L{end} (+{} -{})",
                 hunk.lines_added, hunk.lines_removed,
             ));
             text.push('\n');
@@ -752,9 +766,16 @@ pub fn build_diff_context_prompt(file_diffs: &HashMap<String, Vec<DiffSetHunk>>)
 /// Prefixes the literal text with its file path and line number for context.
 ///
 /// # Format
-/// `<path> L<line>: <text>` where `line` is 1-indexed.
-pub fn build_selection_substring_prompt(file_path: &str, line: usize, text: &str) -> String {
-    format!("{file_path} L{line}: {text}")
+/// `<path> L<line>: <text>` where `line` is 1-indexed. `file_path` is made absolute when the
+/// agent runs outside the repo.
+pub fn build_selection_substring_prompt(
+    file_path: &str,
+    line: usize,
+    text: &str,
+    git_target: &ReviewGitTarget,
+) -> String {
+    let path = git_target.prompt_path(file_path);
+    format!("{path} L{line}: {text}")
 }
 
 /// Builds a prompt for a multi-line selection suitable for writing to a CLI agent's PTY.
@@ -762,12 +783,15 @@ pub fn build_selection_substring_prompt(file_path: &str, line: usize, text: &str
 ///
 /// # Location format
 /// `<path> L<start>-L<end>` where line numbers are 1-indexed and both ends are inclusive.
+/// `file_path` is made absolute when the agent runs outside the repo.
 pub fn build_selection_line_range_prompt(
     file_path: &str,
     start_line: usize,
     end_line: usize,
+    git_target: &ReviewGitTarget,
 ) -> String {
-    format!("{file_path} L{start_line}-L{end_line}")
+    let path = git_target.prompt_path(file_path);
+    format!("{path} L{start_line}-L{end_line}")
 }
 
 #[cfg(test)]

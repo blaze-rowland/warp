@@ -64,7 +64,7 @@ use crate::server::telemetry::CodeContextDestination;
 use crate::settings::CodeSettings;
 use crate::tab::TAB_BAR_BORDER_HEIGHT;
 use crate::terminal::cli_agent::{
-    build_selection_line_range_prompt, build_selection_substring_prompt,
+    ReviewGitTarget, build_selection_line_range_prompt, build_selection_substring_prompt,
 };
 use crate::terminal::view::CliAgentRouting;
 use crate::ui_components::blended_colors;
@@ -1092,10 +1092,20 @@ impl CodeView {
         if let Some(terminal_view) = get_context_target_terminal_view(window_id, ctx) {
             let prompt = if start_line == end_line {
                 // Single-line: send the literal text with file/line context.
-                build_selection_substring_prompt(&file_path, start_line, &selected_text)
+                build_selection_substring_prompt(
+                    &file_path,
+                    start_line,
+                    &selected_text,
+                    &ReviewGitTarget::WorkingDirectory,
+                )
             } else {
                 // Multi-line: send a line-range reference with format note.
-                build_selection_line_range_prompt(&file_path, start_line, end_line)
+                build_selection_line_range_prompt(
+                    &file_path,
+                    start_line,
+                    end_line,
+                    &ReviewGitTarget::WorkingDirectory,
+                )
             };
             if let Some(routing) = terminal_view.update(ctx, |tv, ctx| {
                 tv.try_send_text_to_cli_agent_or_rich_input(prompt, ctx)

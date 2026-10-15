@@ -24742,9 +24742,10 @@ impl TerminalView {
     pub fn send_diff_context_to_cli_agent_or_rich_input(
         &mut self,
         file_diffs: &std::collections::HashMap<String, Vec<crate::ai::agent::DiffSetHunk>>,
+        git_target: &cli_agent::ReviewGitTarget,
         ctx: &mut ViewContext<Self>,
     ) -> Option<CliAgentRouting> {
-        let text = cli_agent::build_diff_context_prompt(file_diffs);
+        let text = cli_agent::build_diff_context_prompt(file_diffs, git_target);
         self.try_send_text_to_cli_agent_or_rich_input(text, ctx)
     }
 
