@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ai::skills::SkillProvider;
@@ -10,7 +11,7 @@ use warp_util::path::EscapeChar;
 use warpui::App;
 
 use super::{
-    CLIAgent, UBER_TEAM_UID, build_diff_hunk_prompt, build_review_prompt,
+    CLIAgent, ReviewGitTarget, UBER_TEAM_UID, build_diff_hunk_prompt, build_review_prompt,
     build_selection_line_range_prompt, build_selection_substring_prompt,
 };
 use crate::ai::agent::{AgentReviewCommentBatch, DiffSetHunk};
@@ -19,6 +20,7 @@ use crate::code::editor::line::EditorLineLocation;
 use crate::code_review::comments::{
     AttachedReviewComment, AttachedReviewCommentTarget, CommentOrigin, LineDiffContent,
 };
+use crate::code_review::diff_state::DiffMode;
 use crate::server::ids::ServerId;
 use crate::server::server_api::team::MockTeamClient;
 use crate::server::server_api::workspace::MockWorkspaceClient;
@@ -86,7 +88,7 @@ fn test_build_review_prompt_current_line_is_1_indexed() {
         },
         false,
     );
-    let prompt = build_review_prompt(&batch(vec![comment]));
+    let prompt = build_review_prompt(&batch(vec![comment]), &ReviewGitTarget::WorkingDirectory);
     assert!(
         prompt.contains("/repo/src/main.rs L1"),
         "expected 1-indexed L1, got: {prompt}",
@@ -109,7 +111,7 @@ fn test_build_review_prompt_removed_line_is_1_indexed() {
         },
         false,
     );
-    let prompt = build_review_prompt(&batch(vec![comment]));
+    let prompt = build_review_prompt(&batch(vec![comment]), &ReviewGitTarget::WorkingDirectory);
     assert!(
         prompt.contains("(deleted, was L10"),
         "expected 1-indexed L10, got: {prompt}",
@@ -129,7 +131,7 @@ fn test_build_review_prompt_collapsed_range_is_1_indexed_start() {
         },
         false,
     );
-    let prompt = build_review_prompt(&batch(vec![comment]));
+    let prompt = build_review_prompt(&batch(vec![comment]), &ReviewGitTarget::WorkingDirectory);
     // line_range is [4, 10) 0-indexed -> L5-L10 (1-indexed, both ends inclusive)
     assert!(prompt.contains("L5-L10"), "expected L5-L10, got: {prompt}",);
 }
@@ -143,7 +145,7 @@ fn test_build_review_prompt_file_level_comment() {
         },
         false,
     );
-    let prompt = build_review_prompt(&batch(vec![comment]));
+    let prompt = build_review_prompt(&batch(vec![comment]), &ReviewGitTarget::WorkingDirectory);
     assert!(prompt.contains("/repo/src/utils.rs: needs refactoring"));
     // Not a deleted file (empty diff_set), so no "deleted file" text.
     assert!(!prompt.contains("deleted file"));
@@ -168,7 +170,7 @@ fn test_build_review_prompt_deleted_file_comment() {
             lines_removed: 5,
         }],
     );
-    let prompt = build_review_prompt(&review);
+    let prompt = build_review_prompt(&review, &ReviewGitTarget::WorkingDirectory);
     assert!(
         prompt.contains("(deleted file"),
         "expected deleted file annotation, got: {prompt}",
@@ -182,7 +184,7 @@ fn test_build_review_prompt_general_comment() {
         AttachedReviewCommentTarget::General,
         false,
     );
-    let prompt = build_review_prompt(&batch(vec![comment]));
+    let prompt = build_review_prompt(&batch(vec![comment]), &ReviewGitTarget::WorkingDirectory);
     assert!(prompt.contains("General: overall looks good"));
 }
 
@@ -190,7 +192,10 @@ fn test_build_review_prompt_general_comment() {
 fn test_build_review_prompt_skips_outdated_comments() {
     let active = make_comment("keep me", AttachedReviewCommentTarget::General, false);
     let outdated = make_comment("skip me", AttachedReviewCommentTarget::General, true);
-    let prompt = build_review_prompt(&batch(vec![active, outdated]));
+    let prompt = build_review_prompt(
+        &batch(vec![active, outdated]),
+        &ReviewGitTarget::WorkingDirectory,
+    );
     assert!(prompt.contains("keep me"));
     assert!(!prompt.contains("skip me"));
 }
@@ -210,7 +215,7 @@ fn test_build_review_prompt_multiple_comments() {
         false,
     );
     let c2 = make_comment("second", AttachedReviewCommentTarget::General, false);
-    let prompt = build_review_prompt(&batch(vec![c1, c2]));
+    let prompt = build_review_prompt(&batch(vec![c1, c2]), &ReviewGitTarget::WorkingDirectory);
     assert!(prompt.contains("/repo/a.rs L5: first"));
     assert!(prompt.contains("General: second"));
 }
@@ -218,7 +223,7 @@ fn test_build_review_prompt_multiple_comments() {
 #[test]
 fn test_build_review_prompt_exports_internal_markdown_without_punctuation_escapes() {
     let comment = make_comment("Fix this\\.", AttachedReviewCommentTarget::General, false);
-    let prompt = build_review_prompt(&batch(vec![comment]));
+    let prompt = build_review_prompt(&batch(vec![comment]), &ReviewGitTarget::WorkingDirectory);
     assert!(prompt.contains("General: Fix this."));
     assert!(!prompt.contains("Fix this\\."));
 }
@@ -229,7 +234,14 @@ fn test_build_review_prompt_exports_internal_markdown_without_punctuation_escape
 
 #[test]
 fn test_build_diff_hunk_prompt_format() {
-    let prompt = build_diff_hunk_prompt("/repo/src/main.rs", 10, 20, 3, 2);
+    let prompt = build_diff_hunk_prompt(
+        "/repo/src/main.rs",
+        10,
+        20,
+        3,
+        2,
+        &ReviewGitTarget::WorkingDirectory,
+    );
     assert_eq!(
         prompt,
         "/repo/src/main.rs L10-L20 (+3 -2) -- run `git diff` to see the full context.",
@@ -689,5 +701,154 @@ fn test_warp_tui_variant_properties() {
     assert_eq!(
         CLIAgent::from_serialized_name(&CLIAgent::WarpTui.to_serialized_name()),
         CLIAgent::WarpTui
+    );
+}
+
+/// A batch with every comment kind whose prompt text names a `git diff` hint.
+fn review_with_diff_hints(root: &str) -> AgentReviewCommentBatch {
+    let removed = make_comment(
+        "why gone",
+        AttachedReviewCommentTarget::Line {
+            absolute_file_path: local_path(&format!("{root}/old.rs")),
+            line: EditorLineLocation::Removed {
+                line_number: LineCount::from(1),
+                line_range: LineCount::from(1)..LineCount::from(2),
+                index: 0,
+            },
+            content: LineDiffContent::default(),
+        },
+        false,
+    );
+    let collapsed = make_comment(
+        "hunk",
+        AttachedReviewCommentTarget::Line {
+            absolute_file_path: local_path(&format!("{root}/lib.rs")),
+            line: EditorLineLocation::Collapsed {
+                line_range: LineCount::from(0)..LineCount::from(3),
+            },
+            content: LineDiffContent::default(),
+        },
+        false,
+    );
+    let deleted_file = make_comment(
+        "file gone",
+        AttachedReviewCommentTarget::File {
+            absolute_file_path: local_path(&format!("{root}/src/old.rs")),
+        },
+        false,
+    );
+    let mut review = batch(vec![removed, collapsed, deleted_file]);
+    review.diff_set.insert(
+        "src/old.rs".to_string(),
+        vec![DiffSetHunk {
+            line_range: LineCount::from(0)..LineCount::from(5),
+            diff_content: String::new(),
+            lines_added: 0,
+            lines_removed: 5,
+        }],
+    );
+    review
+}
+
+#[test]
+fn test_build_review_prompt_in_repo_text_is_characterized() {
+    let prompt = build_review_prompt(
+        &review_with_diff_hints("/repo"),
+        &ReviewGitTarget::WorkingDirectory,
+    );
+    assert_eq!(
+        prompt,
+        "Please address the following code review comments. \
+         Run `git diff` (or `git diff HEAD`) to see the full context of any changes, \
+         especially for deleted lines.\n\
+         \n- /repo/old.rs (deleted, was L2 — see `git diff`): why gone\
+         \n- /repo/lib.rs (collapsed hunk, L1-L3 — see `git diff`): hunk\
+         \n- /repo/src/old.rs (deleted file — see `git diff`): file gone",
+    );
+}
+
+#[test]
+fn test_build_review_prompt_outside_repo_names_repo_in_git_hints() {
+    let target = ReviewGitTarget::Repo {
+        root: PathBuf::from("/w/eventric/mobile"),
+        base_branch: Some("main".to_string()),
+    };
+    let prompt = build_review_prompt(&review_with_diff_hints("/w/eventric/mobile"), &target);
+    let diff = "git -C /w/eventric/mobile diff $(git -C /w/eventric/mobile merge-base HEAD main)";
+    assert_eq!(
+        prompt,
+        format!(
+            "Please address the following code review comments in the git repo at \
+             `/w/eventric/mobile`. Run `{diff}` to see the full context of any changes, \
+             especially for deleted lines.\n\
+             \n- /w/eventric/mobile/old.rs (deleted, was L2 — see `{diff}`): why gone\
+             \n- /w/eventric/mobile/lib.rs (collapsed hunk, L1-L3 — see `{diff}`): hunk\
+             \n- /w/eventric/mobile/src/old.rs (deleted file — see `{diff}`): file gone"
+        ),
+    );
+    assert!(!prompt.contains("`git diff`"));
+}
+
+#[test]
+fn test_build_review_prompt_outside_repo_head_mode_and_quoting() {
+    let target = ReviewGitTarget::Repo {
+        root: PathBuf::from("/w/my repos/mobile"),
+        base_branch: None,
+    };
+    let prompt = build_review_prompt(&review_with_diff_hints("/w/my repos/mobile"), &target);
+    assert!(
+        prompt.contains("Run `git -C '/w/my repos/mobile' diff HEAD`"),
+        "got: {prompt}",
+    );
+}
+
+#[test]
+fn test_review_git_target_for_terminal_inside_repo_uses_working_directory() {
+    let root = Path::new("/w/eventric/mobile");
+    for cwd in [Some(root), Some(Path::new("/w/eventric/mobile/src")), None] {
+        assert_eq!(
+            ReviewGitTarget::for_terminal(root, cwd, &DiffMode::MainBranch, Some("main")),
+            ReviewGitTarget::WorkingDirectory,
+        );
+    }
+}
+
+#[test]
+fn test_review_git_target_for_terminal_outside_repo_names_base() {
+    let root = Path::new("/w/eventric/mobile");
+    let cwd = Some(Path::new("/w/eventric"));
+    let repo = |base_branch: Option<&str>| ReviewGitTarget::Repo {
+        root: root.to_path_buf(),
+        base_branch: base_branch.map(str::to_owned),
+    };
+    assert_eq!(
+        ReviewGitTarget::for_terminal(root, cwd, &DiffMode::MainBranch, Some("master")),
+        repo(Some("master")),
+    );
+    assert_eq!(
+        ReviewGitTarget::for_terminal(root, cwd, &DiffMode::Head, Some("master")),
+        repo(None),
+    );
+    assert_eq!(
+        ReviewGitTarget::for_terminal(
+            root,
+            cwd,
+            &DiffMode::OtherBranch("dev".to_string()),
+            Some("master"),
+        ),
+        repo(Some("dev")),
+    );
+}
+
+#[test]
+fn test_build_diff_hunk_prompt_outside_repo_is_absolute() {
+    let target = ReviewGitTarget::Repo {
+        root: PathBuf::from("/w/eventric/mobile"),
+        base_branch: None,
+    };
+    assert_eq!(
+        build_diff_hunk_prompt("src/main.rs", 10, 20, 3, 2, &target),
+        "/w/eventric/mobile/src/main.rs L10-L20 (+3 -2) \
+         -- run `git -C /w/eventric/mobile diff HEAD` to see the full context.",
     );
 }

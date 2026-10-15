@@ -5,6 +5,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use ai::skills::SkillProvider;
 use enum_iterator::Sequence;
@@ -23,6 +24,7 @@ use crate::ai::agent::{AgentReviewCommentBatch, DiffSetHunk};
 use crate::ai::blocklist::CLAUDE_ORANGE;
 use crate::code::editor::line::EditorLineLocation;
 use crate::code_review::comments::AttachedReviewCommentTarget;
+use crate::code_review::diff_state::DiffMode;
 use crate::ui_components::icons::Icon;
 use crate::workspaces::user_workspaces::UserWorkspaces;
 
@@ -528,6 +530,59 @@ impl CLIAgent {
     }
 }
 
+/// Where a CLI agent's shell sits relative to the repo under review, which decides how
+/// review prompts spell their `git diff` hints.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReviewGitTarget {
+    /// The shell is inside the repo, so a bare `git diff` resolves to it.
+    WorkingDirectory,
+    /// The shell is outside the repo, e.g. in the folder the repo was discovered under.
+    Repo {
+        root: PathBuf,
+        /// Branch the review diffs against; `None` diffs against `HEAD`.
+        base_branch: Option<String>,
+    },
+}
+
+impl ReviewGitTarget {
+    /// `cwd` must be canonical. `main_branch_name` is only used in [`DiffMode::MainBranch`].
+    pub fn for_terminal(
+        repo_root: &Path,
+        cwd: Option<&Path>,
+        diff_mode: &DiffMode,
+        main_branch_name: Option<&str>,
+    ) -> Self {
+        let Some(cwd) = cwd else {
+            return Self::WorkingDirectory;
+        };
+        if cwd.starts_with(repo_root) {
+            return Self::WorkingDirectory;
+        }
+        let base_branch = match diff_mode {
+            DiffMode::Head => None,
+            // Without a known main branch, `HEAD` is the only base the agent can resolve.
+            DiffMode::MainBranch => main_branch_name.map(str::to_owned),
+            DiffMode::OtherBranch(branch) => Some(branch.clone()),
+        };
+        Self::Repo {
+            root: repo_root.to_path_buf(),
+            base_branch,
+        }
+    }
+}
+
+/// The command that shows a repo's reviewed diff from outside the repo.
+fn repo_diff_command(root: &Path, base_branch: Option<&str>) -> String {
+    let root = shell_words::quote(&root.to_string_lossy()).into_owned();
+    match base_branch {
+        Some(branch) => {
+            let branch = shell_words::quote(branch);
+            format!("git -C {root} diff $(git -C {root} merge-base HEAD {branch})")
+        }
+        None => format!("git -C {root} diff HEAD"),
+    }
+}
+
 /// Builds a prompt string from a batch of code review comments suitable for
 /// writing to a CLI agent's PTY.
 ///
@@ -536,12 +591,30 @@ impl CLIAgent {
 /// Line ranges are written `L<start>-L<end>` where both ends are **inclusive**.
 /// Instructs the agent to run `git diff` for deleted-line context rather than
 /// inlining the full diff.
-pub fn build_review_prompt(review: &AgentReviewCommentBatch) -> String {
-    let mut text = String::from(
-        "Please address the following code review comments. \
-         Run `git diff` (or `git diff HEAD`) to see the full context of any changes, \
-         especially for deleted lines.\n",
-    );
+pub fn build_review_prompt(
+    review: &AgentReviewCommentBatch,
+    git_target: &ReviewGitTarget,
+) -> String {
+    let (mut text, see_diff) = match git_target {
+        ReviewGitTarget::WorkingDirectory => (
+            String::from(
+                "Please address the following code review comments. \
+                 Run `git diff` (or `git diff HEAD`) to see the full context of any changes, \
+                 especially for deleted lines.\n",
+            ),
+            "git diff".to_string(),
+        ),
+        ReviewGitTarget::Repo { root, base_branch } => {
+            let diff_command = repo_diff_command(root, base_branch.as_deref());
+            let text = format!(
+                "Please address the following code review comments in the git repo at `{}`. \
+                 Run `{diff_command}` to see the full context of any changes, \
+                 especially for deleted lines.\n",
+                root.display(),
+            );
+            (text, diff_command)
+        }
+    };
 
     for comment in &review.comments {
         if comment.outdated {
@@ -562,14 +635,14 @@ pub fn build_review_prompt(review: &AgentReviewCommentBatch) -> String {
                     }
                     EditorLineLocation::Removed { line_number, .. } => {
                         let n = line_number.as_usize() + 1;
-                        format!("{path} (deleted, was L{n} — see `git diff`)")
+                        format!("{path} (deleted, was L{n} — see `{see_diff}`)")
                     }
                     EditorLineLocation::Collapsed { line_range } => {
                         // line_range is [start, end) 0-indexed; convert to L<start>-L<end>
                         // where both start and end are 1-indexed inclusive.
                         let start = line_range.start.as_usize() + 1;
                         let end = line_range.end.as_usize();
-                        format!("{path} (collapsed hunk, L{start}-L{end} — see `git diff`)")
+                        format!("{path} (collapsed hunk, L{start}-L{end} — see `{see_diff}`)")
                     }
                 }
             }
@@ -583,7 +656,7 @@ pub fn build_review_prompt(review: &AgentReviewCommentBatch) -> String {
                             .all(|h| h.lines_added == 0 && h.lines_removed > 0)
                 });
                 if is_deleted {
-                    format!("{path} (deleted file — see `git diff`)")
+                    format!("{path} (deleted file — see `{see_diff}`)")
                 } else {
                     path
                 }
@@ -619,18 +692,31 @@ fn export_review_comment_for_cli_prompt(comment: &str) -> String {
 ///
 /// # Location format
 /// `<path> L<start>-L<end>` where `start` and `end` are 1-indexed and both
-/// ends are **inclusive**.
+/// ends are **inclusive**. `file_path` is repo-relative; it is made absolute when
+/// the agent runs outside the repo.
 pub fn build_diff_hunk_prompt(
     file_path: &str,
     start_line: usize,
     end_line: usize,
     lines_added: u32,
     lines_removed: u32,
+    git_target: &ReviewGitTarget,
 ) -> String {
-    format!(
-        "{file_path} L{start_line}-L{end_line} (+{lines_added} -{lines_removed}) \
-         -- run `git diff` to see the full context."
-    )
+    match git_target {
+        ReviewGitTarget::WorkingDirectory => format!(
+            "{file_path} L{start_line}-L{end_line} (+{lines_added} -{lines_removed}) \
+             -- run `git diff` to see the full context."
+        ),
+        ReviewGitTarget::Repo { root, base_branch } => {
+            let path = root.join(file_path);
+            let diff_command = repo_diff_command(root, base_branch.as_deref());
+            format!(
+                "{} L{start_line}-L{end_line} (+{lines_added} -{lines_removed}) \
+                 -- run `{diff_command}` to see the full context.",
+                path.display(),
+            )
+        }
+    }
 }
 
 /// Builds a prompt string for a set of diff file context hunks suitable for

@@ -10719,8 +10719,12 @@ fn send_review_comments_to_warp_tui_writes_prompt_to_pty() {
             assert!(!view.is_cli_agent_rich_input_open(ctx));
 
             let review = single_general_review_comment("please fix the off-by-one");
-            view.send_review_to_cli_agent_or_rich_input(&review, ctx)
-                .expect("send should succeed");
+            view.send_review_to_cli_agent_or_rich_input(
+                &review,
+                &crate::terminal::cli_agent::ReviewGitTarget::WorkingDirectory,
+                ctx,
+            )
+            .expect("send should succeed");
         });
 
         // The review prompt is written to the PTY in a single write because

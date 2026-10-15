@@ -267,3 +267,50 @@ fn list_state_notes_truncated_walk() {
         RepoListState::Listed { truncated: true }
     );
 }
+
+#[test]
+fn review_cwd_inside_repo_is_accepted() {
+    let root = Path::new("/w/eventric/mobile");
+    assert!(cwd_can_review_repo(root, root, None));
+    assert!(cwd_can_review_repo(
+        Path::new("/w/eventric/mobile/src"),
+        root,
+        None
+    ));
+}
+
+#[test]
+fn review_cwd_equal_to_discovery_parent_is_accepted() {
+    assert!(cwd_can_review_repo(
+        Path::new("/w/eventric"),
+        Path::new("/w/eventric/mobile"),
+        Some(Path::new("/w/eventric")),
+    ));
+}
+
+#[test]
+fn review_cwd_in_unrelated_folder_is_rejected() {
+    assert!(!cwd_can_review_repo(
+        Path::new("/w/other"),
+        Path::new("/w/eventric/mobile"),
+        Some(Path::new("/w/eventric")),
+    ));
+    // A subfolder of the discovery parent is not the parent itself.
+    assert!(!cwd_can_review_repo(
+        Path::new("/w/eventric/web"),
+        Path::new("/w/eventric/mobile"),
+        Some(Path::new("/w/eventric")),
+    ));
+}
+
+#[test]
+fn review_cwd_parent_folder_is_rejected_for_repo_not_discovered_there() {
+    let cwd = Path::new("/w/eventric");
+    let root = Path::new("/w/eventric/mobile");
+    assert!(!cwd_can_review_repo(cwd, root, None));
+    assert!(!cwd_can_review_repo(
+        cwd,
+        root,
+        Some(Path::new("/w/elsewhere"))
+    ));
+}

@@ -123,7 +123,8 @@ use crate::server::telemetry::CodePanelsFileOpenEntrypoint;
 use crate::settings::{AISettings, CodeSettings};
 use crate::settings_view::SettingsSection;
 use crate::terminal::cli_agent::{
-    build_selection_line_range_prompt, build_selection_substring_prompt,
+    ReviewGitTarget, build_diff_hunk_prompt, build_selection_line_range_prompt,
+    build_selection_substring_prompt,
 };
 use crate::terminal::input::MenuPositioning;
 use crate::terminal::view::{CliAgentRouting, InitProjectModel, TerminalAction, TerminalView};
@@ -697,6 +698,34 @@ impl CodeReviewView {
 
     pub fn diff_state_model(&self) -> &ModelHandle<DiffStateModel> {
         &self.diff_state_model
+    }
+
+    /// How prompts sent to `terminal` should name this review's repo in git commands.
+    pub(crate) fn review_git_target(
+        &self,
+        terminal: &ViewHandle<TerminalView>,
+        ctx: &AppContext,
+    ) -> ReviewGitTarget {
+        if !FeatureFlag::MultiRepoCodeReview.is_enabled() {
+            return ReviewGitTarget::WorkingDirectory;
+        }
+        let Some(LocalOrRemotePath::Local(repo_root)) = self.repo_path() else {
+            return ReviewGitTarget::WorkingDirectory;
+        };
+        let cwd = terminal
+            .read(ctx, |terminal, ctx| {
+                terminal.active_session_path_if_local(ctx)
+            })
+            .map(|cwd| dunce::canonicalize(&cwd).unwrap_or(cwd));
+        let (diff_mode, main_branch_name) = self.diff_state_model.read(ctx, |model, ctx| {
+            (model.diff_mode(ctx), model.get_main_branch_name(ctx))
+        });
+        ReviewGitTarget::for_terminal(
+            repo_root,
+            cwd.as_deref(),
+            &diff_mode,
+            main_branch_name.as_deref(),
+        )
     }
 
     /// The session this review is being shown in, when available. Supplied
@@ -6052,15 +6081,16 @@ impl CodeReviewView {
                     // Use repo-relative path strings so the prompt avoids machine-specific paths.
                     let start_line = line_range.start.as_usize() + 1;
                     let end_line = line_range.end.as_usize();
+                    let prompt = build_diff_hunk_prompt(
+                        &file_path,
+                        start_line,
+                        end_line,
+                        lines_added,
+                        lines_removed,
+                        &self.review_git_target(&terminal_view, ctx),
+                    );
                     let routing = terminal_view.update(ctx, |tv, ctx| {
-                        tv.send_diff_hunk_to_cli_agent_or_rich_input(
-                            &file_path,
-                            start_line,
-                            end_line,
-                            lines_added,
-                            lines_removed,
-                            ctx,
-                        )
+                        tv.try_send_text_to_cli_agent_or_rich_input(prompt, ctx)
                     });
                     let destination = match routing {
                         Some(CliAgentRouting::RichInput) => CodeReviewContextDestination::RichInput,

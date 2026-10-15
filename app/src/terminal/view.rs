@@ -24728,9 +24728,10 @@ impl TerminalView {
     pub fn send_review_to_cli_agent_or_rich_input(
         &mut self,
         review: &AgentReviewCommentBatch,
+        git_target: &cli_agent::ReviewGitTarget,
         ctx: &mut ViewContext<Self>,
     ) -> anyhow::Result<()> {
-        let text = cli_agent::build_review_prompt(review);
+        let text = cli_agent::build_review_prompt(review, git_target);
         self.try_send_text_to_cli_agent_or_rich_input(text, ctx);
         Ok(())
     }
@@ -24744,27 +24745,6 @@ impl TerminalView {
         ctx: &mut ViewContext<Self>,
     ) -> Option<CliAgentRouting> {
         let text = cli_agent::build_diff_context_prompt(file_diffs);
-        self.try_send_text_to_cli_agent_or_rich_input(text, ctx)
-    }
-
-    /// Sends a diff hunk location to a running CLI agent, routing to the
-    /// rich input when open or the PTY when closed.
-    pub fn send_diff_hunk_to_cli_agent_or_rich_input(
-        &mut self,
-        file_path: &str,
-        start_line: usize,
-        end_line: usize,
-        lines_added: u32,
-        lines_removed: u32,
-        ctx: &mut ViewContext<Self>,
-    ) -> Option<CliAgentRouting> {
-        let text = cli_agent::build_diff_hunk_prompt(
-            file_path,
-            start_line,
-            end_line,
-            lines_added,
-            lines_removed,
-        );
         self.try_send_text_to_cli_agent_or_rich_input(text, ctx)
     }
 

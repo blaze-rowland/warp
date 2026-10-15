@@ -151,6 +151,13 @@ pub fn repo_list_state(ordered: &OrderedRepos, discovery: RepoDiscoveryState) ->
     }
 }
 
+/// Whether a terminal at `cwd` can receive review comments for the repo at `repo_root`:
+/// either it sits inside the repo, or it is the folder the repo was discovered under.
+/// `cwd` must be canonical, since `discovery_parent` is.
+pub fn cwd_can_review_repo(cwd: &Path, repo_root: &Path, discovery_parent: Option<&Path>) -> bool {
+    cwd.starts_with(repo_root) || discovery_parent == Some(cwd)
+}
+
 #[cfg(test)]
 #[path = "repo_list_tests.rs"]
 mod tests;

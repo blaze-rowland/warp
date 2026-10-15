@@ -36,8 +36,8 @@ use crate::code_review::code_review_view::{
 };
 use crate::code_review::diff_state::DiffStateModel;
 use crate::code_review::repo_list::{
-    RepoListEntry, RepoListState, keep_frozen_order, merge_prefs, order_repos, repo_label,
-    repo_list_state, selection_after_change,
+    RepoListEntry, RepoListState, cwd_can_review_repo, keep_frozen_order, merge_prefs, order_repos,
+    repo_label, repo_list_state, selection_after_change,
 };
 use crate::code_review::telemetry_event::CodeReviewContextDestination;
 use crate::drive::panel::{MAX_SIDEBAR_WIDTH_RATIO, MIN_SIDEBAR_WIDTH};
@@ -152,9 +152,12 @@ impl ReviewActionTargetProvider for RightPanelReviewActionTargetProvider {
                     // terminals still targets the focused conversation.
                     let focused = pane_group
                         .read(app, |pane_group, app| pane_group.focused_session_view(app))?;
+                    let discovery_parent =
+                        panel.review_discovery_parent(pane_group.id(), repo_path, app);
                     let status = RightPanelView::review_terminal_status(
                         &focused,
                         Some(repo_path),
+                        discovery_parent.as_deref(),
                         ai_enabled,
                         app,
                     );
@@ -1770,8 +1773,10 @@ impl RightPanelView {
         let active_cli_agent = terminal_view.read(ctx, |t, ctx| t.active_cli_agent(ctx));
 
         let (result, destination) = if active_cli_agent.is_some() {
+            let git_target =
+                code_review_view.read(ctx, |view, ctx| view.review_git_target(&terminal_view, ctx));
             let r = terminal_view.update(ctx, |terminal, ctx| {
-                terminal.send_review_to_cli_agent_or_rich_input(&comments, ctx)
+                terminal.send_review_to_cli_agent_or_rich_input(&comments, &git_target, ctx)
             });
             let dest = if terminal_view.read(ctx, |t, ctx| t.is_cli_agent_rich_input_open(ctx)) {
                 CodeReviewContextDestination::RichInput
@@ -1818,6 +1823,7 @@ impl RightPanelView {
     fn review_terminal_status(
         tv: &ViewHandle<TerminalView>,
         repo_path: Option<&LocalOrRemotePath>,
+        discovery_parent: Option<&Path>,
         ai_enabled: bool,
         ctx: &AppContext,
     ) -> ReviewTerminalStatus {
@@ -1835,10 +1841,11 @@ impl RightPanelView {
                     (LocalOrRemotePath::Local(repo_path), _) => {
                         match active_session_path.as_ref() {
                             Some(cwd)
-                                if canonicalize(cwd)
-                                    .as_deref()
-                                    .unwrap_or(cwd)
-                                    .starts_with(repo_path) => {}
+                                if cwd_can_review_repo(
+                                    canonicalize(cwd).as_deref().unwrap_or(cwd),
+                                    repo_path,
+                                    discovery_parent,
+                                ) => {}
                             Some(_) => unavailable_reasons
                                 .push(ReviewTerminalUnavailableReason::SessionOutsideSelectedRepo),
                             None => unavailable_reasons
@@ -1928,6 +1935,9 @@ impl RightPanelView {
             self.find_review_terminal(pane_group, repo_path, ai_enabled, ctx)
                 .map(|terminal_view| terminal_view.id())
         });
+        let discovery_parent = selected_repo_path
+            .as_ref()
+            .and_then(|repo_path| self.review_discovery_parent(pane_group_id, repo_path, ctx));
 
         log::info!(
             "Review comment send status for active tab: pane_group_id={pane_group_id}, selected_repo_path={}, ai_enabled={}, focused_pane_id={focused_pane_id}, preferred_terminal_id={preferred_terminal_id:?}, chosen_terminal_id={chosen_terminal_id:?}, visible_pane_count={}",
@@ -1969,6 +1979,7 @@ impl RightPanelView {
             let terminal_status = Self::review_terminal_status(
                 &terminal_view,
                 selected_repo_path.as_ref(),
+                discovery_parent.as_deref(),
                 ai_enabled,
                 ctx,
             );
@@ -2011,10 +2022,12 @@ impl RightPanelView {
     fn is_terminal_available_for_review(
         tv: &ViewHandle<TerminalView>,
         repo_path: &LocalOrRemotePath,
+        discovery_parent: Option<&Path>,
         ai_enabled: bool,
         ctx: &AppContext,
     ) -> bool {
-        Self::review_terminal_status(tv, Some(repo_path), ai_enabled, ctx).is_available()
+        Self::review_terminal_status(tv, Some(repo_path), discovery_parent, ai_enabled, ctx)
+            .is_available()
     }
 
     /// Finds the best terminal to send review comments to.
@@ -2025,11 +2038,12 @@ impl RightPanelView {
         focused_terminal: Option<&ViewHandle<TerminalView>>,
         preferred_terminal_id: Option<EntityId>,
         repo_path: &LocalOrRemotePath,
+        discovery_parent: Option<&Path>,
         ai_enabled: bool,
         ctx: &AppContext,
     ) -> Option<ViewHandle<TerminalView>> {
         let is_available = |tv: &ViewHandle<TerminalView>| {
-            Self::is_terminal_available_for_review(tv, repo_path, ai_enabled, ctx)
+            Self::is_terminal_available_for_review(tv, repo_path, discovery_parent, ai_enabled, ctx)
         };
 
         // Try the focused terminal first.
@@ -2068,15 +2082,37 @@ impl RightPanelView {
             .working_directories_model
             .as_ref(ctx)
             .get_terminal_id_for_root_path(pane_group_id, repo_path);
+        let discovery_parent = self.review_discovery_parent(pane_group_id, repo_path, ctx);
 
         Self::find_available_terminal_for_review(
             &terminal_views,
             focused_terminal.as_ref(),
             preferred_terminal_id,
             repo_path,
+            discovery_parent.as_deref(),
             ai_enabled,
             ctx,
         )
+    }
+
+    /// The folder `repo_path` was discovered under, whose terminals can also take its review
+    /// comments.
+    fn review_discovery_parent(
+        &self,
+        pane_group_id: EntityId,
+        repo_path: &LocalOrRemotePath,
+        ctx: &AppContext,
+    ) -> Option<PathBuf> {
+        if !FeatureFlag::MultiRepoCodeReview.is_enabled() {
+            return None;
+        }
+        let LocalOrRemotePath::Local(root) = repo_path else {
+            return None;
+        };
+        self.working_directories_model
+            .as_ref(ctx)
+            .discovered_repo_info(pane_group_id, root)
+            .map(|info| info.parent)
     }
 
     /// Checks whether any terminal in the pane group is available for input in
