@@ -89,22 +89,58 @@ pub fn selection_after_change<T: PartialEq + Clone>(
 }
 
 /// Combines the pin/hide prefs of every discovery parent into one, keeping only entries for
-/// `discovered` repos so a repo a pane sits inside is never pinned or hidden.
+/// `discovered` repos so a repo a pane sits inside is never pinned or hidden. Parents are
+/// merged in path order so the result doesn't depend on input order, and a repo stored under
+/// more than one parent keeps only its first entry.
 pub fn merge_prefs<'a>(
-    per_parent: impl IntoIterator<Item = &'a RepoListPrefs>,
+    per_parent: impl IntoIterator<Item = (&'a Path, &'a RepoListPrefs)>,
     discovered: &[&Path],
 ) -> RepoListPrefs {
     let is_discovered = |stored: &String| discovered.iter().any(|path| Path::new(stored) == *path);
+    let mut per_parent: Vec<_> = per_parent.into_iter().collect();
+    per_parent.sort_by_key(|(parent, _)| *parent);
     let mut merged = RepoListPrefs::default();
-    for prefs in per_parent {
-        merged
-            .pinned
-            .extend(prefs.pinned.iter().filter(|p| is_discovered(p)).cloned());
-        merged
-            .hidden
-            .extend(prefs.hidden.iter().filter(|p| is_discovered(p)).cloned());
+    for (_, prefs) in per_parent {
+        extend_unique(
+            &mut merged.pinned,
+            prefs.pinned.iter().filter(|p| is_discovered(p)),
+        );
+        extend_unique(
+            &mut merged.hidden,
+            prefs.hidden.iter().filter(|p| is_discovered(p)),
+        );
     }
     merged
+}
+
+/// Appends each of `paths` to `list` unless an equal path is already there.
+fn extend_unique<'a>(list: &mut Vec<String>, paths: impl IntoIterator<Item = &'a String>) {
+    for path in paths {
+        if !list
+            .iter()
+            .any(|existing| Path::new(existing) == Path::new(path))
+        {
+            list.push(path.clone());
+        }
+    }
+}
+
+/// Most repos the changes chip watches at once, bounding file watchers in large workspaces.
+pub const MAX_CHIP_WATCHED_REPOS: usize = 48;
+
+/// Picks the repos the changes chip watches: the first [`MAX_CHIP_WATCHED_REPOS`] rows that
+/// `watchable` maps to a target, in list order (pinned and most recent first), skipping the
+/// selected row since its changes already show in the panel.
+pub fn chip_watch_targets<T, W>(
+    rows: &[T],
+    is_selected: impl Fn(&T) -> bool,
+    watchable: impl FnMut(&T) -> Option<W>,
+) -> Vec<W> {
+    rows.iter()
+        .filter(|row| !is_selected(row))
+        .filter_map(watchable)
+        .take(MAX_CHIP_WATCHED_REPOS)
+        .collect()
 }
 
 /// Keeps still-visible repos in the `frozen` order captured when the dropdown opened, so rows

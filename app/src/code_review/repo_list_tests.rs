@@ -192,9 +192,62 @@ fn merge_prefs_keeps_only_discovered_repos_across_parents() {
     let first = prefs(&["/p1/a", "/p1/cwd_repo"], &["/p1/b"]);
     let second = prefs(&["/p2/c"], &["/p2/gone"]);
     let discovered = [Path::new("/p1/a"), Path::new("/p1/b"), Path::new("/p2/c")];
-    let merged = merge_prefs([&first, &second], &discovered);
+    let merged = merge_prefs(
+        [(Path::new("/p1"), &first), (Path::new("/p2"), &second)],
+        &discovered,
+    );
     assert_eq!(merged.pinned, ["/p1/a", "/p2/c"]);
     assert_eq!(merged.hidden, ["/p1/b"]);
+}
+
+#[test]
+fn merge_prefs_pin_order_does_not_depend_on_parent_order() {
+    let first = prefs(&["/p1/a"], &[]);
+    let second = prefs(&["/p2/b"], &[]);
+    let discovered = [Path::new("/p1/a"), Path::new("/p2/b")];
+    let forward = merge_prefs(
+        [(Path::new("/p1"), &first), (Path::new("/p2"), &second)],
+        &discovered,
+    );
+    let reversed = merge_prefs(
+        [(Path::new("/p2"), &second), (Path::new("/p1"), &first)],
+        &discovered,
+    );
+    assert_eq!(forward.pinned, ["/p1/a", "/p2/b"]);
+    assert_eq!(reversed.pinned, forward.pinned);
+}
+
+#[test]
+fn merge_prefs_lists_repo_pinned_under_two_parents_once() {
+    let outer = prefs(&["/w/inner/repo"], &["/w/inner/old"]);
+    let inner = prefs(&["/w/inner/repo/"], &["/w/inner/old"]);
+    let discovered = [Path::new("/w/inner/repo"), Path::new("/w/inner/old")];
+    let merged = merge_prefs(
+        [(Path::new("/w"), &outer), (Path::new("/w/inner"), &inner)],
+        &discovered,
+    );
+    assert_eq!(merged.pinned, ["/w/inner/repo"]);
+    assert_eq!(merged.hidden, ["/w/inner/old"]);
+}
+
+#[test]
+fn chip_watch_targets_skip_selected_and_unwatchable_rows() {
+    let rows = ["a", "remote", "b", "c"];
+    let watched = chip_watch_targets(
+        &rows,
+        |row| *row == "b",
+        |row| (*row != "remote").then_some(*row),
+    );
+    assert_eq!(watched, ["a", "c"]);
+}
+
+#[test]
+fn chip_watch_targets_cap_keeps_first_rows_in_list_order() {
+    let rows: Vec<usize> = (0..MAX_CHIP_WATCHED_REPOS + 10).collect();
+    let watched = chip_watch_targets(&rows, |row| *row == 0, |row| Some(*row));
+    assert_eq!(watched.len(), MAX_CHIP_WATCHED_REPOS);
+    assert_eq!(watched.first(), Some(&1));
+    assert_eq!(watched.last(), Some(&MAX_CHIP_WATCHED_REPOS));
 }
 
 #[test]

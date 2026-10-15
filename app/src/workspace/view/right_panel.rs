@@ -40,8 +40,8 @@ use crate::code_review::repo_change_watcher::{
     RepoChangeWatcher, RepoChangeWatcherEvent, WatchedRepo,
 };
 use crate::code_review::repo_list::{
-    ChangesChip, ChipScope, RepoListEntry, RepoListState, changes_chip_text, cwd_can_review_repo,
-    keep_frozen_order, merge_prefs, order_repos, repo_label, repo_list_state,
+    self, ChangesChip, ChipScope, RepoListEntry, RepoListState, changes_chip_text,
+    cwd_can_review_repo, keep_frozen_order, merge_prefs, order_repos, repo_label, repo_list_state,
     selection_after_change, truncate_middle,
 };
 use crate::code_review::telemetry_event::CodeReviewContextDestination;
@@ -944,10 +944,13 @@ impl RightPanelView {
             .values()
             .map(|info| info.parent.as_path())
             .unique()
-            .map(|parent| settings.repo_list_prefs(parent))
+            .map(|parent| (parent, settings.repo_list_prefs(parent)))
             .collect();
         let discovered: Vec<&Path> = infos.keys().copied().collect();
-        let prefs = merge_prefs(&per_parent, &discovered);
+        let prefs = merge_prefs(
+            per_parent.iter().map(|(parent, prefs)| (*parent, prefs)),
+            &discovered,
+        );
 
         // Repos a pane sits inside have no cheap recency, so they sort after discovered repos.
         let change_recency = self.code_review_state.as_ref().map(|s| &s.change_recency);
@@ -1067,18 +1070,18 @@ impl RightPanelView {
             return Vec::new();
         };
         let model = self.working_directories_model.as_ref(ctx);
-        list.rows
-            .iter()
-            .filter(|row| state.selected_repo_path.as_ref() != Some(&row.path))
-            .filter_map(|row| {
+        repo_list::chip_watch_targets(
+            &list.rows,
+            |row| state.selected_repo_path.as_ref() == Some(&row.path),
+            |row| {
                 let root = row.path.to_local_path()?;
                 let info = model.discovered_repo_info(pane_group.id(), root)?;
                 Some(WatchedRepo {
                     root: root.to_path_buf(),
                     external_git_dir: info.external_git_dir,
                 })
-            })
-            .collect()
+            },
+        )
     }
 
     fn handle_repo_change(&mut self, event: &RepoChangeWatcherEvent, ctx: &mut ViewContext<Self>) {
