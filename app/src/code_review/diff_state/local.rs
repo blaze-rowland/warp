@@ -554,10 +554,6 @@ impl LocalDiffStateModel {
         }
     }
 
-    pub fn has_discovery_default_mode(&self) -> bool {
-        self.discovery_default_mode
-    }
-
     /// Returns a discovered repo's untouched main-branch default to `Head`, the default for a
     /// repo a terminal sits in.
     pub fn reset_discovery_default_mode(&mut self, ctx: &mut ModelContext<Self>) {

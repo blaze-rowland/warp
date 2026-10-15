@@ -317,23 +317,13 @@ fn review_cwd_parent_folder_is_rejected_for_repo_not_discovered_there() {
     ));
 }
 
-fn at(secs: u64) -> SystemTime {
-    SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
-}
-
 fn tracked(path: &str) -> TargetFile {
     TargetFile::new(PathBuf::from(path), false)
 }
 
-fn change(
-    chip: &mut ChangesChip,
-    repo: &str,
-    changed: &[&str],
-    scope: &ChipScope,
-    secs: u64,
-) -> bool {
+fn change(chip: &mut ChangesChip, repo: &str, changed: &[&str], scope: &ChipScope) -> bool {
     let files: Vec<TargetFile> = changed.iter().map(|path| tracked(path)).collect();
-    chip.on_repo_changed(Path::new(repo), &files, scope, at(secs))
+    chip.on_repo_changed(Path::new(repo), &files, scope)
 }
 
 #[test]
@@ -348,15 +338,13 @@ fn change_in_another_repo_raises_chip() {
         &mut chip,
         "/w/Desktop",
         &["/w/Desktop/src/main.rs"],
-        &scope,
-        1
+        &scope
     ));
 
     assert_eq!(
         chip.pending(),
         Some(&PendingChip {
             repo: PathBuf::from("/w/Desktop"),
-            changed_at: at(1),
         })
     );
     assert_eq!(changes_chip_text("Desktop"), "Changes in Desktop");
@@ -374,8 +362,7 @@ fn change_only_under_git_dir_raises_no_chip() {
         &mut chip,
         "/w/B",
         &["/w/B/.git/index", "/w/B/.git/refs/heads/main"],
-        &scope,
-        1
+        &scope
     ));
     assert_eq!(chip.pending(), None);
 }
@@ -389,7 +376,7 @@ fn gitignored_change_raises_no_chip() {
     };
 
     let ignored = TargetFile::new(PathBuf::from("/w/B/target/debug/app"), true);
-    let raised = chip.on_repo_changed(Path::new("/w/B"), [&ignored], &scope, at(1));
+    let raised = chip.on_repo_changed(Path::new("/w/B"), [&ignored], &scope);
 
     assert!(!raised);
     assert_eq!(chip.pending(), None);
@@ -403,8 +390,8 @@ fn newer_change_replaces_chip() {
         hidden: &[],
     };
 
-    change(&mut chip, "/w/B", &["/w/B/a.rs"], &scope, 1);
-    change(&mut chip, "/w/C", &["/w/C/b.rs"], &scope, 2);
+    change(&mut chip, "/w/B", &["/w/B/a.rs"], &scope);
+    change(&mut chip, "/w/C", &["/w/C/b.rs"], &scope);
 
     assert_eq!(
         chip.pending().map(|c| c.repo.as_path()),
@@ -425,8 +412,7 @@ fn hidden_repo_change_raises_no_chip() {
         &mut chip,
         "/w/Desktop-MT3-5509",
         &["/w/Desktop-MT3-5509/src/lib.rs"],
-        &scope,
-        1
+        &scope
     ));
     assert_eq!(chip.pending(), None);
 }
@@ -438,9 +424,9 @@ fn viewed_repo_change_raises_no_chip_and_keeps_pending() {
         viewed: Some(Path::new("/w/A")),
         hidden: &[],
     };
-    change(&mut chip, "/w/B", &["/w/B/a.rs"], &scope, 1);
+    change(&mut chip, "/w/B", &["/w/B/a.rs"], &scope);
 
-    assert!(!change(&mut chip, "/w/A", &["/w/A/a.rs"], &scope, 2));
+    assert!(!change(&mut chip, "/w/A", &["/w/A/a.rs"], &scope));
     assert_eq!(
         chip.pending().map(|c| c.repo.as_path()),
         Some(Path::new("/w/B"))
@@ -454,7 +440,7 @@ fn viewing_repo_clears_its_chip_only() {
         viewed: Some(Path::new("/w/A")),
         hidden: &[],
     };
-    change(&mut chip, "/w/B", &["/w/B/a.rs"], &scope, 1);
+    change(&mut chip, "/w/B", &["/w/B/a.rs"], &scope);
 
     chip.clear_for(Path::new("/w/C"));
     assert!(chip.pending().is_some());

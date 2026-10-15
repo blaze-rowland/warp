@@ -266,18 +266,25 @@ pub struct RepoDiscoveryState {
 struct DiscoveryEntry {
     /// The terminal whose cwd this is; discovered repos map to it.
     terminal_id: EntityId,
+    /// The latest scan result. Its `visited_dirs` move into [`Self::visited_dirs`].
     result: Option<RepoDiscovery>,
+    /// The folders the latest scan walked, for O(1) lookups on watch events.
+    visited_dirs: HashSet<PathBuf>,
+    /// The folders watched for this entry; see [`discovery_watch_dirs`].
+    watched_dirs: Vec<PathBuf>,
     scan: Option<SpawnedFutureHandle>,
     rescan_requested: bool,
 }
 
 #[cfg(feature = "local_fs")]
 impl DiscoveryEntry {
-    fn watched_dirs(&self) -> Vec<PathBuf> {
-        self.result
-            .as_ref()
-            .map(discovery_watch_dirs)
-            .unwrap_or_default()
+    /// Stores a finished scan's result and returns the previously watched folders.
+    fn set_result(&mut self, mut result: RepoDiscovery) -> Vec<PathBuf> {
+        let visited_dirs = std::mem::take(&mut result.visited_dirs);
+        let watched_dirs = discovery_watch_dirs(&visited_dirs);
+        self.visited_dirs = visited_dirs.into_iter().collect();
+        self.result = Some(result);
+        std::mem::replace(&mut self.watched_dirs, watched_dirs)
     }
 }
 
@@ -1142,6 +1149,8 @@ impl WorkingDirectoriesModel {
                         DiscoveryEntry {
                             terminal_id,
                             result: None,
+                            visited_dirs: HashSet::new(),
+                            watched_dirs: Vec::new(),
                             scan: None,
                             rescan_requested: false,
                         },
@@ -1204,13 +1213,14 @@ impl WorkingDirectoriesModel {
             return;
         };
         entry.scan = None;
-        let old_watches = entry.watched_dirs();
-        entry.result = Some(result);
-        let new_watches = entry.watched_dirs();
+        let old_watches = entry.set_result(result);
+        let new_watches = (old_watches != entry.watched_dirs).then(|| entry.watched_dirs.clone());
         let rescan = std::mem::take(&mut entry.rescan_requested);
 
-        self.watch_discovery_dirs(new_watches, ctx);
-        self.unwatch_discovery_dirs(old_watches, ctx);
+        if let Some(new_watches) = new_watches {
+            self.watch_discovery_dirs(new_watches, ctx);
+            self.unwatch_discovery_dirs(old_watches, ctx);
+        }
         if rescan {
             self.request_discovery_scan(pane_group_id, cwd, ctx);
         }
@@ -1267,9 +1277,7 @@ impl WorkingDirectoriesModel {
             .filter_map(|root| self.diff_state_models.get(root).cloned())
             .collect();
         for model in models {
-            if model.as_ref(ctx).has_discovery_default_mode(ctx) {
-                model.update(ctx, |model, ctx| model.reset_discovery_default_mode(ctx));
-            }
+            model.update(ctx, |model, ctx| model.reset_discovery_default_mode(ctx));
         }
     }
 
@@ -1277,7 +1285,7 @@ impl WorkingDirectoriesModel {
         if let Some(scan) = &entry.scan {
             scan.abort();
         }
-        self.unwatch_discovery_dirs(entry.watched_dirs(), ctx);
+        self.unwatch_discovery_dirs(entry.watched_dirs, ctx);
     }
 
     fn watch_discovery_dirs(&mut self, dirs: Vec<PathBuf>, ctx: &mut ModelContext<Self>) {
@@ -1334,20 +1342,20 @@ impl WorkingDirectoriesModel {
     }
 
     /// Rescans the discoveries that walked through a folder where a directory or `.git` entry
-    /// appeared or disappeared.
+    /// appeared, or where a walked folder, discovered repo or `.git` entry disappeared.
     fn handle_discovery_watch_event(
         &mut self,
         event: &BulkFilesystemWatcherEvent,
         ctx: &mut ModelContext<Self>,
     ) {
-        let appeared = event
+        let appeared: Vec<&PathBuf> = event
             .added
             .iter()
             .chain(event.moved.keys())
-            .filter(|path| path.is_dir() || is_dot_git(path));
-        let disappeared = event.deleted.iter().chain(event.moved.values());
-        let changed: Vec<&PathBuf> = appeared.chain(disappeared).collect();
-        if changed.is_empty() {
+            .filter(|path| path.is_dir() || is_dot_git(path))
+            .collect();
+        let disappeared: Vec<&PathBuf> = event.deleted.iter().chain(event.moved.values()).collect();
+        if appeared.is_empty() && disappeared.is_empty() {
             return;
         }
 
@@ -1357,10 +1365,19 @@ impl WorkingDirectoriesModel {
                 let Some(result) = &entry.result else {
                     continue;
                 };
-                let affected = changed.iter().any(|path| {
+                let in_walked_dir = |path: &Path| {
                     path.parent()
-                        .is_some_and(|parent| result.visited_dirs.iter().any(|dir| dir == parent))
-                });
+                        .is_some_and(|parent| entry.visited_dirs.contains(parent))
+                };
+                let was_discovery_input = |path: &Path| {
+                    is_dot_git(path)
+                        || entry.visited_dirs.contains(path)
+                        || result.repos.iter().any(|repo| repo.root == path)
+                };
+                let affected = appeared.iter().any(|path| in_walked_dir(path))
+                    || disappeared
+                        .iter()
+                        .any(|path| in_walked_dir(path) && was_discovery_input(path));
                 if affected {
                     to_rescan.push((*pane_group_id, cwd.clone()));
                 }
@@ -1643,11 +1660,13 @@ fn discover_repos_outside_repo(cwd: &Path) -> RepoDiscovery {
 
 /// The folders a discovery watches: the walked non-repo folders, shallowest first, capped.
 #[cfg(feature = "local_fs")]
-fn discovery_watch_dirs(result: &RepoDiscovery) -> Vec<PathBuf> {
-    let mut dirs = result.visited_dirs.clone();
+fn discovery_watch_dirs(visited_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut dirs: Vec<&PathBuf> = visited_dirs.iter().collect();
     dirs.sort_by_key(|dir| dir.components().count());
-    dirs.truncate(MAX_DISCOVERY_WATCHES);
-    dirs
+    dirs.into_iter()
+        .take(MAX_DISCOVERY_WATCHES)
+        .cloned()
+        .collect()
 }
 
 #[cfg(feature = "local_fs")]

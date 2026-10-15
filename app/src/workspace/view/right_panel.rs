@@ -220,9 +220,7 @@ struct DiscoveredRepoList {
 
 impl DiscoveredRepoList {
     fn shows_dropdown(&self) -> bool {
-        self.rows.len() > 1
-            || !self.hidden_rows.is_empty()
-            || self.state == (RepoListState::Listed { truncated: true })
+        self.rows.len() > 1 || !self.hidden_rows.is_empty() || self.state.is_truncated()
     }
 }
 
@@ -478,7 +476,7 @@ impl CodeReviewState {
             }
         }
 
-        if list.state == (RepoListState::Listed { truncated: true }) {
+        if list.state.is_truncated() {
             items.push(
                 MenuItemFields::new("Showing partial results")
                     .with_disabled(true)
@@ -859,7 +857,6 @@ impl RightPanelView {
             .as_ref()
             .and_then(|s| s.selected_repo_path.clone());
 
-        // Only close the old view if the selection actually changed.
         if old_selected != new_selected
             && let Some(old_path) = &old_selected
         {
@@ -973,7 +970,7 @@ impl RightPanelView {
 
         let row = |entry: RepoListEntry| {
             let info = infos.get(entry.path.as_path());
-            let pinned = prefs.pinned.iter().any(|p| Path::new(p) == entry.path);
+            let pinned = prefs.is_pinned_path(&entry.path);
             let label = info.map(|info| repo_label(&entry.path, info.main_repo_name.as_deref()));
             let path = LocalOrRemotePath::Local(entry.path);
             let label = label.unwrap_or_else(|| display_name_with_host(&path, ctx));
@@ -1097,12 +1094,6 @@ impl RightPanelView {
             .iter()
             .filter_map(|row| row.path.to_local_path().map(Path::to_path_buf))
             .collect();
-        let label = list
-            .rows
-            .iter()
-            .find(|row| row.path.to_local_path() == Some(repo.as_path()))
-            .map(|row| row.label.clone())
-            .unwrap_or_else(|| repo_label(repo, None));
         let viewed = state
             .selected_repo_path
             .as_ref()
@@ -1112,13 +1103,26 @@ impl RightPanelView {
             viewed: viewed.as_deref(),
             hidden: &hidden,
         };
-        let now = SystemTime::now();
-        if !state.changes_chip.on_repo_changed(repo, files, &scope, now) {
+        let already_pending = state
+            .changes_chip
+            .pending()
+            .is_some_and(|chip| chip.repo == *repo);
+        if !state.changes_chip.on_repo_changed(repo, files, &scope) {
             return;
         }
-        state.change_recency.insert(repo.clone(), now);
+        state.change_recency.insert(repo.clone(), SystemTime::now());
         state.recency_changed = true;
+        // The chip already names this repo, so its button is up to date.
+        if already_pending {
+            return;
+        }
 
+        let label = list
+            .rows
+            .iter()
+            .find(|row| row.path.to_local_path() == Some(repo.as_path()))
+            .map(|row| row.label.clone())
+            .unwrap_or_else(|| repo_label(repo, None));
         let repo_path = LocalOrRemotePath::Local(repo.clone());
         self.changes_chip_button.update(ctx, |button, ctx| {
             button.set_label(

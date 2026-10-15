@@ -1,6 +1,6 @@
 #![cfg(feature = "local_fs")]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -1033,6 +1033,43 @@ fn discovery_ignores_file_changes_in_parent() {
                 &BulkFilesystemWatcherEvent {
                     added: HashSet::from_iter([notes.clone()]),
                     modified: HashSet::from_iter([notes.clone()]),
+                    ..Default::default()
+                },
+                ctx,
+            );
+        });
+
+        assert_eq!(scans_started(&app, &working_directories), 0);
+    });
+}
+
+#[test]
+fn discovery_ignores_file_deletions_in_parent() {
+    let _flag = FeatureFlag::MultiRepoCodeReview.override_enabled(true);
+    App::test((), |mut app| async move {
+        let (_detected_repos, working_directories) = setup_discovery(&mut app);
+        let fixture = parent_with_two_repos();
+        let notes = fixture.parent.join("notes.md");
+        write(&notes, "notes");
+        let pane_group_id = EntityId::new();
+
+        refresh(
+            &mut app,
+            &working_directories,
+            pane_group_id,
+            &[(EntityId::new(), &fixture.parent)],
+        );
+        await_discovery_scans(&mut app, &working_directories).await;
+
+        fs::remove_file(&notes).expect("remove notes");
+        working_directories.update(&mut app, |model, ctx| {
+            model.handle_discovery_watch_event(
+                &BulkFilesystemWatcherEvent {
+                    deleted: HashSet::from_iter([notes.clone()]),
+                    moved: HashMap::from_iter([(
+                        fixture.parent.join("renamed.md"),
+                        fixture.parent.join("old.md"),
+                    )]),
                     ..Default::default()
                 },
                 ctx,

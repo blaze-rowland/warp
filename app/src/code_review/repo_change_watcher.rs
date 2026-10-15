@@ -14,6 +14,8 @@ use repo_metadata::{
 use warp_util::standardized_path::StandardizedPath;
 use warpui::{Entity, ModelContext, ModelHandle, SingletonEntity};
 
+use crate::code_review::repo_list::is_reviewable_change;
+
 /// A repo to watch for chip-worthy changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchedRepo {
@@ -154,6 +156,7 @@ impl RepositorySubscriber for ChangeSubscriber {
             .added_or_modified()
             .chain(&update.deleted)
             .chain(update.moved.iter().flat_map(|(to, from)| [to, from]))
+            .filter(|file| is_reviewable_change(&self.repo, file))
             .cloned()
             .collect();
         if files.is_empty() {

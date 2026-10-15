@@ -28,13 +28,12 @@ pub struct OrderedRepos {
 /// go to [`OrderedRepos::hidden`]. Prefs entries with no matching repo are ignored, so a
 /// pin survives its worktree being deleted and recreated.
 pub fn order_repos(entries: &[RepoListEntry], prefs: &RepoListPrefs) -> OrderedRepos {
-    let matches = |stored: &str, entry: &RepoListEntry| Path::new(stored) == entry.path;
-    let is_hidden = |entry: &RepoListEntry| prefs.hidden.iter().any(|h| matches(h, entry));
+    let is_hidden = |entry: &RepoListEntry| prefs.is_hidden_path(&entry.path);
 
     let mut visible: Vec<RepoListEntry> = prefs
         .pinned
         .iter()
-        .filter_map(|pinned| entries.iter().find(|entry| matches(pinned, entry)))
+        .filter_map(|pinned| entries.iter().find(|entry| Path::new(pinned) == entry.path))
         .filter(|entry| !is_hidden(entry))
         .cloned()
         .collect();
@@ -139,6 +138,12 @@ pub enum RepoListState {
     },
 }
 
+impl RepoListState {
+    pub fn is_truncated(self) -> bool {
+        self == (Self::Listed { truncated: true })
+    }
+}
+
 pub fn repo_list_state(ordered: &OrderedRepos, discovery: RepoDiscoveryState) -> RepoListState {
     if !ordered.visible.is_empty() {
         RepoListState::Listed {
@@ -169,7 +174,6 @@ pub struct ChangesChip {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingChip {
     pub repo: PathBuf,
-    pub changed_at: SystemTime,
 }
 
 /// The panel state a repo change is judged against.
@@ -191,22 +195,16 @@ impl ChangesChip {
         repo: &Path,
         changed: impl IntoIterator<Item = &'a TargetFile>,
         scope: &ChipScope,
-        changed_at: SystemTime,
     ) -> bool {
         if scope.viewed == Some(repo) || scope.hidden.iter().any(|hidden| hidden == repo) {
             return false;
         }
-        let has_reviewable_change = changed.into_iter().any(|file| {
-            !file.is_ignored
-                && file
-                    .path
-                    .strip_prefix(repo)
-                    .is_ok_and(|relative| !relative.components().any(|c| c.as_os_str() == ".git"))
-        });
+        let has_reviewable_change = changed
+            .into_iter()
+            .any(|file| is_reviewable_change(repo, file));
         if has_reviewable_change {
             self.pending = Some(PendingChip {
                 repo: repo.to_path_buf(),
-                changed_at,
             });
         }
         has_reviewable_change
@@ -222,6 +220,16 @@ impl ChangesChip {
     pub fn clear(&mut self) {
         self.pending = None;
     }
+}
+
+/// Whether `file` is worth a chip for the repo at `repo`: inside the repo, outside any `.git`
+/// dir and not gitignored.
+pub fn is_reviewable_change(repo: &Path, file: &TargetFile) -> bool {
+    !file.is_ignored
+        && file
+            .path
+            .strip_prefix(repo)
+            .is_ok_and(|relative| !relative.components().any(|c| c.as_os_str() == ".git"))
 }
 
 pub fn changes_chip_text(label: &str) -> String {

@@ -7,6 +7,8 @@ use settings::{RespectUserSyncSetting, Setting as _, SupportedPlatforms, SyncToC
 use warp_errors::report_if_error;
 use warpui::ModelContext;
 
+use crate::workspace::tab_settings::canonical_directory_key;
+
 /// Code review dropdown pin/hide preferences for the repos under one parent folder.
 /// Repo paths are stored canonicalized (see [`canonical_repo_list_key`]).
 #[derive(
@@ -37,6 +39,16 @@ impl RepoListPrefs {
 
     pub fn is_hidden(&self, repo: &str) -> bool {
         self.hidden.iter().any(|p| p == repo)
+    }
+
+    /// Like [`Self::is_pinned`], but compares as paths rather than strings.
+    pub fn is_pinned_path(&self, repo: &Path) -> bool {
+        self.pinned.iter().any(|p| Path::new(p) == repo)
+    }
+
+    /// Like [`Self::is_hidden`], but compares as paths rather than strings.
+    pub fn is_hidden_path(&self, repo: &Path) -> bool {
+        self.hidden.iter().any(|p| Path::new(p) == repo)
     }
 
     /// Appends `repo` to the pin order. A hidden repo is unhidden, since pinning is an
@@ -74,10 +86,7 @@ impl RepoListPrefs {
 /// symlinked spellings (`/tmp` vs `/private/tmp`) agree. Falls back to the given path when
 /// it can't be resolved (e.g. it no longer exists).
 pub fn canonical_repo_list_key(path: &Path) -> String {
-    dunce::canonicalize(path)
-        .unwrap_or_else(|_| path.to_path_buf())
-        .to_string_lossy()
-        .into_owned()
+    canonical_directory_key(path)
 }
 
 define_settings_group!(CodeSettings, settings: [

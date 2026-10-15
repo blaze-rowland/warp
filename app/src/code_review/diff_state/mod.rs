@@ -865,13 +865,6 @@ impl DiffStateModel {
         }
     }
 
-    pub(crate) fn has_discovery_default_mode(&self, ctx: &AppContext) -> bool {
-        match self {
-            Self::Local(local) => local.as_ref(ctx).has_discovery_default_mode(),
-            Self::Remote(_) => false,
-        }
-    }
-
     pub(crate) fn reset_discovery_default_mode(&self, ctx: &mut ModelContext<Self>) {
         match self {
             Self::Local(local) => {
