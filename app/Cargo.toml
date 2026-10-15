@@ -784,6 +784,9 @@ trim_trailing_blank_lines = []
 # Native tmux integration via tmux control mode. Enabled by default on dogfood
 # channels through DOGFOOD_FLAGS; this feature opts other builds in.
 tmux_control_mode = []
+# Lists nested repos in the code review panel when the cwd isn't a repo. Off unless built
+# with this feature; deliberately not in DOGFOOD_FLAGS.
+multi_repo_code_review = []
 cli_agent_rich_input = []
 list_skills = []
 # This feature is enabled in build.rs when compiling for platforms which

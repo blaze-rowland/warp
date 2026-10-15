@@ -1004,6 +1004,10 @@ pub enum FeatureFlag {
     /// `terminal.tmux_control_mode` setting; with either off, Warp behaves as
     /// it does today.
     TmuxControlMode,
+
+    /// Lists the git repos and worktrees nested under a non-repo working directory in the code
+    /// review panel, with pin/hide and a changes chip.
+    MultiRepoCodeReview,
 }
 
 static FLAG_STATES: [AtomicBool; cardinality::<FeatureFlag>()] =

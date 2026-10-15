@@ -535,6 +535,8 @@ fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::CloudAgentShellRespawn,
         #[cfg(feature = "tmux_control_mode")]
         FeatureFlag::TmuxControlMode,
+        #[cfg(feature = "multi_repo_code_review")]
+        FeatureFlag::MultiRepoCodeReview,
     ]);
 
     flags
