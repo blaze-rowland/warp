@@ -1239,3 +1239,51 @@ fn discovered_default_resets_to_head_when_a_pane_enters_the_repo() {
         );
     });
 }
+
+#[test]
+fn reselecting_main_branch_keeps_it_when_a_pane_enters_the_discovered_repo() {
+    let _flag = FeatureFlag::MultiRepoCodeReview.override_enabled(true);
+    App::test((), |mut app| async move {
+        let (detected_repos, working_directories) = setup_discovery(&mut app);
+        let fixture = parent_with_two_repos();
+        let pane_group_id = EntityId::new();
+        let parent_terminal = EntityId::new();
+
+        refresh(
+            &mut app,
+            &working_directories,
+            pane_group_id,
+            &[(parent_terminal, &fixture.parent)],
+        );
+        await_discovery_scans(&mut app, &working_directories).await;
+        assert_eq!(
+            diff_mode(&mut app, &working_directories, &fixture.repo_a),
+            DiffMode::MainBranch
+        );
+
+        let model_a = working_directories.update(&mut app, |model, ctx| {
+            model
+                .get_or_create_diff_state_model(local(&fixture.repo_a), None, ctx)
+                .expect("model a")
+        });
+        model_a.update(&mut app, |model, ctx| {
+            model.set_diff_mode(DiffMode::MainBranch, false, false, None, ctx);
+        });
+
+        seed_detected_repo(&mut app, &detected_repos, &fixture.repo_a);
+        refresh(
+            &mut app,
+            &working_directories,
+            pane_group_id,
+            &[
+                (parent_terminal, &fixture.parent),
+                (EntityId::new(), &fixture.repo_a),
+            ],
+        );
+
+        assert_eq!(
+            diff_mode(&mut app, &working_directories, &fixture.repo_a),
+            DiffMode::MainBranch
+        );
+    });
+}

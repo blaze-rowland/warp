@@ -1609,6 +1609,8 @@ impl CodeReviewView {
             .read(ctx, |model, ctx| model.diff_mode(ctx))
             == mode
         {
+            self.diff_state_model
+                .update(ctx, |model, ctx| model.keep_current_diff_mode(ctx));
             return;
         }
 

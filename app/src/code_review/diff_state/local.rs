@@ -547,11 +547,19 @@ impl LocalDiffStateModel {
         track_load_duration: bool,
         ctx: &mut ModelContext<Self>,
     ) {
+        // Every caller picks a mode explicitly, so even re-selecting the current mode keeps it
+        // from being reset when a pane later enters a discovered repo.
+        self.discovery_default_mode = false;
         if self.mode != mode {
             self.mode = mode;
-            self.discovery_default_mode = false;
             self.load_diffs_for_current_repo(should_fetch_base, track_load_duration, ctx);
         }
+    }
+
+    /// Records that the user explicitly kept the current mode, so a discovered repo's default is
+    /// no longer treated as untouched.
+    pub fn keep_current_diff_mode(&mut self) {
+        self.discovery_default_mode = false;
     }
 
     /// Returns a discovered repo's untouched main-branch default to `Head`, the default for a

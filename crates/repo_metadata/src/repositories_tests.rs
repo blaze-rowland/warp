@@ -210,3 +210,25 @@ fn test_find_git_repo_with_worktree() {
         });
     });
 }
+
+#[test]
+fn only_discovered_repo_review_skips_indexing() {
+    let all_sources = [
+        RepoDetectionSource::TerminalNavigation,
+        RepoDetectionSource::ProjectRulesIndexing,
+        RepoDetectionSource::CodeReviewInitialization,
+        RepoDetectionSource::CloudEnvironmentPrep,
+        RepoDetectionSource::DiscoveredRepoReview,
+    ];
+    for source in all_sources {
+        // Exhaustive so a new source fails to compile until it is added to `all_sources`.
+        let expected = match source {
+            RepoDetectionSource::TerminalNavigation
+            | RepoDetectionSource::ProjectRulesIndexing
+            | RepoDetectionSource::CodeReviewInitialization
+            | RepoDetectionSource::CloudEnvironmentPrep => true,
+            RepoDetectionSource::DiscoveredRepoReview => false,
+        };
+        assert_eq!(source.triggers_indexing(), expected, "{source:?}");
+    }
+}

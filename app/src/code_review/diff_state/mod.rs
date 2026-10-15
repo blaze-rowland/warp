@@ -865,6 +865,13 @@ impl DiffStateModel {
         }
     }
 
+    pub(crate) fn keep_current_diff_mode(&self, ctx: &mut ModelContext<Self>) {
+        match self {
+            Self::Local(local) => local.update(ctx, |local, _| local.keep_current_diff_mode()),
+            Self::Remote(_) => {}
+        }
+    }
+
     pub(crate) fn reset_discovery_default_mode(&self, ctx: &mut ModelContext<Self>) {
         match self {
             Self::Local(local) => {

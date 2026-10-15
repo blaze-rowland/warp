@@ -30,6 +30,8 @@ use crate::local_model::{
     LocalRepoMetadataModel, RepoUpdate, RepositoryMetadataEvent, RootWatchMode,
 };
 use crate::repositories::DetectedRepositories;
+#[cfg(feature = "local_fs")]
+use crate::repositories::{RepoDetectionSource, stub_git_repository};
 use crate::watcher::DirectoryWatcher;
 use crate::{RepoMetadataError, StandingQueryContent, StandingQueryDefinitions};
 
@@ -3684,4 +3686,56 @@ fn lazy_root_created_directory_inserted_as_placeholder() {
             "eager root should materialize the subtree"
         );
     });
+}
+
+/// Detects a stubbed git repo with `source` and reports whether the detection started indexing it.
+#[cfg(feature = "local_fs")]
+fn detection_indexes_repo(source: RepoDetectionSource) -> bool {
+    let indexed = Rc::new(RefCell::new(None));
+    let indexed_for_test = indexed.clone();
+    VirtualFS::test("detection_source_indexing", |dirs, mut vfs| {
+        stub_git_repository(&mut vfs, "repo");
+        let repo_root = dirs.tests().join("repo");
+
+        App::test((), |mut app| async move {
+            app.add_singleton_model(DirectoryWatcher::new_for_testing);
+            let detected_repos = app.add_singleton_model(|_| DetectedRepositories::default());
+            let model_handle = app.add_model(LocalRepoMetadataModel::new);
+
+            detected_repos
+                .update(&mut app, |repos, ctx| {
+                    std::mem::drop(repos.detect_possible_local_git_repo(
+                        &repo_root.to_string_lossy(),
+                        source,
+                        ctx,
+                    ));
+                    let future_id = *repos.spawned_futures().last().unwrap();
+                    ctx.await_spawned_future(future_id)
+                })
+                .await;
+
+            let repo_path = StandardizedPath::from_local_canonicalized(&repo_root).unwrap();
+            let is_indexed = model_handle.read(&app, |model, _ctx| {
+                model.repository_state(&repo_path).is_some()
+            });
+            *indexed_for_test.borrow_mut() = Some(is_indexed);
+        });
+    });
+    indexed.take().expect("detection test did not run")
+}
+
+#[cfg(feature = "local_fs")]
+#[test]
+fn discovered_repo_review_detection_skips_indexing() {
+    assert!(!detection_indexes_repo(
+        RepoDetectionSource::DiscoveredRepoReview
+    ));
+}
+
+#[cfg(feature = "local_fs")]
+#[test]
+fn terminal_navigation_detection_indexes_repo() {
+    assert!(detection_indexes_repo(
+        RepoDetectionSource::TerminalNavigation
+    ));
 }
