@@ -33,6 +33,7 @@ pub enum RepoMetadataError {
     RepositoryIndexingFailed,
 }
 // Re-export the modules
+pub mod discovery;
 pub mod entry;
 pub mod file_tree_store;
 pub mod file_tree_update;
