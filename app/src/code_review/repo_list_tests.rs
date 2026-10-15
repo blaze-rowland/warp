@@ -137,7 +137,7 @@ fn repo_list_key_falls_back_for_missing_path() {
 fn selection_keeps_saved_when_listed() {
     let visible = [PathBuf::from("/w/a"), PathBuf::from("/w/b")];
     assert_eq!(
-        selection_after_change(Some(Path::new("/w/b")), &visible),
+        selection_after_change(Some(&PathBuf::from("/w/b")), &visible),
         Some(PathBuf::from("/w/b"))
     );
 }
@@ -146,7 +146,7 @@ fn selection_keeps_saved_when_listed() {
 fn selection_falls_back_to_first_when_saved_missing_or_hidden() {
     let visible = [PathBuf::from("/w/a"), PathBuf::from("/w/b")];
     assert_eq!(
-        selection_after_change(Some(Path::new("/w/hidden")), &visible),
+        selection_after_change(Some(&PathBuf::from("/w/hidden")), &visible),
         Some(PathBuf::from("/w/a"))
     );
     assert_eq!(
@@ -157,5 +157,113 @@ fn selection_falls_back_to_first_when_saved_missing_or_hidden() {
 
 #[test]
 fn selection_is_none_when_list_empty() {
-    assert_eq!(selection_after_change(Some(Path::new("/w/a")), &[]), None);
+    assert_eq!(
+        selection_after_change(Some(&PathBuf::from("/w/a")), &[]),
+        None
+    );
+}
+
+#[test]
+fn hiding_the_selected_repo_falls_back_to_first_visible() {
+    let entries = [entry("/w/a", Some(10)), entry("/w/b", Some(20))];
+    let ordered = order_repos(&entries, &prefs(&[], &["/w/b"]));
+    let visible: Vec<PathBuf> = ordered.visible.iter().map(|e| e.path.clone()).collect();
+    assert_eq!(
+        selection_after_change(Some(&PathBuf::from("/w/b")), &visible),
+        Some(PathBuf::from("/w/a"))
+    );
+}
+
+#[test]
+fn selection_kept_when_still_listed_after_reorder() {
+    let entries = [entry("/w/a", Some(10)), entry("/w/b", Some(20))];
+    let ordered = order_repos(&entries, &prefs(&["/w/a"], &[]));
+    let visible: Vec<PathBuf> = ordered.visible.iter().map(|e| e.path.clone()).collect();
+    assert_eq!(
+        selection_after_change(Some(&PathBuf::from("/w/b")), &visible),
+        Some(PathBuf::from("/w/b"))
+    );
+}
+
+#[test]
+fn merge_prefs_keeps_only_discovered_repos_across_parents() {
+    let first = prefs(&["/p1/a", "/p1/cwd_repo"], &["/p1/b"]);
+    let second = prefs(&["/p2/c"], &["/p2/gone"]);
+    let discovered = [Path::new("/p1/a"), Path::new("/p1/b"), Path::new("/p2/c")];
+    let merged = merge_prefs([&first, &second], &discovered);
+    assert_eq!(merged.pinned, ["/p1/a", "/p2/c"]);
+    assert_eq!(merged.hidden, ["/p1/b"]);
+}
+
+#[test]
+fn frozen_order_keeps_rows_in_place_and_appends_new_ones() {
+    let frozen = [
+        PathBuf::from("/w/a"),
+        PathBuf::from("/w/b"),
+        PathBuf::from("/w/c"),
+    ];
+    // `c` was pinned and `b` hidden while the dropdown was open, and `d` appeared.
+    let entries = [
+        entry("/w/a", Some(30)),
+        entry("/w/b", Some(20)),
+        entry("/w/c", Some(10)),
+        entry("/w/d", Some(40)),
+    ];
+    let fresh = order_repos(&entries, &prefs(&["/w/c"], &["/w/b"]));
+    assert_eq!(paths(&fresh.visible), ["/w/c", "/w/d", "/w/a"]);
+
+    let frozen_view = keep_frozen_order(fresh, &frozen);
+    assert_eq!(paths(&frozen_view.visible), ["/w/a", "/w/c", "/w/d"]);
+    assert_eq!(paths(&frozen_view.hidden), ["/w/b"]);
+}
+
+fn discovery(scanning: bool, truncated: bool) -> RepoDiscoveryState {
+    RepoDiscoveryState {
+        scanning,
+        truncated,
+    }
+}
+
+#[test]
+fn list_state_scanning_only_while_nothing_is_listed() {
+    let empty = OrderedRepos::default();
+    assert_eq!(
+        repo_list_state(&empty, discovery(true, false)),
+        RepoListState::Scanning
+    );
+
+    let listed = order_repos(&[entry("/w/a", None)], &prefs(&[], &[]));
+    assert_eq!(
+        repo_list_state(&listed, discovery(true, false)),
+        RepoListState::Listed { truncated: false }
+    );
+}
+
+#[test]
+fn list_state_empty_when_walk_found_nothing() {
+    assert_eq!(
+        repo_list_state(&OrderedRepos::default(), discovery(false, false)),
+        RepoListState::Empty
+    );
+}
+
+#[test]
+fn list_state_all_hidden_when_every_repo_is_hidden() {
+    let ordered = order_repos(
+        &[entry("/w/a", None), entry("/w/b", None)],
+        &prefs(&[], &["/w/a", "/w/b"]),
+    );
+    assert_eq!(
+        repo_list_state(&ordered, discovery(true, false)),
+        RepoListState::AllHidden
+    );
+}
+
+#[test]
+fn list_state_notes_truncated_walk() {
+    let ordered = order_repos(&[entry("/w/a", None)], &prefs(&[], &["/w/b"]));
+    assert_eq!(
+        repo_list_state(&ordered, discovery(false, true)),
+        RepoListState::Listed { truncated: true }
+    );
 }

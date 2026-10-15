@@ -12,8 +12,6 @@ pub mod git_repo_model;
 mod git_repo_models;
 pub mod github_repo_model;
 mod hidden_lines;
-// TODO(multi-repo code review U5): drop once the repo dropdown consumes this.
-#[allow(dead_code)]
 pub mod repo_list;
 pub mod telemetry_event;
 #[cfg_attr(not(feature = "local_fs"), allow(unused_imports))]

@@ -241,6 +241,8 @@ pub enum DropdownAction {
     Focus(usize),
     Close,
     SelectActionAndClose(Box<dyn DropdownItemAction>),
+    /// Dispatches the item action and leaves the menu open, e.g. for a row's secondary icon.
+    DispatchAction(Box<dyn DropdownItemAction>),
     ToggleExpanded,
 }
 
@@ -256,6 +258,13 @@ impl DropdownAction {
         A: DropdownItemAction,
     {
         Self::SelectActionAndClose(Box::new(action))
+    }
+
+    pub fn dispatch_action<A>(action: A) -> Self
+    where
+        A: DropdownItemAction,
+    {
+        Self::DispatchAction(Box::new(action))
     }
 }
 
@@ -748,6 +757,7 @@ where
             DropdownAction::SelectActionAndClose(action) => {
                 self.select_action_and_close(action.as_ref(), ctx)
             }
+            DropdownAction::DispatchAction(action) => ctx.dispatch_typed_action(action.as_ref()),
             DropdownAction::ToggleExpanded => self.toggle_expanded(ctx),
         }
     }

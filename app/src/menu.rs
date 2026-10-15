@@ -459,7 +459,10 @@ pub struct MenuItemFields<A: Action + Clone> {
     tooltip: Option<String>,
     tooltip_position: MenuTooltipPosition,
     right_side_label: Option<RightSideLabel>,
-    right_side_icon: Option<RightSideIconConfig<A>>,
+    /// Boxed, like `secondary_right_side_icon`, to keep `MenuItem` variants close in size.
+    right_side_icon: Option<Box<RightSideIconConfig<A>>>,
+    /// A second clickable icon rendered after `right_side_icon`, for rows with two actions.
+    secondary_right_side_icon: Option<Box<RightSideIconConfig<A>>>,
     /// Optional override for the background color
     /// hovered or selected. When `None`, the default hover/selected background
     /// from the theme is used (accent or dark overlay, depending on
@@ -511,6 +514,7 @@ impl<A: Action + Clone> MenuItemFields<A> {
             tooltip_position: MenuTooltipPosition::default(),
             right_side_label: None,
             right_side_icon: None,
+            secondary_right_side_icon: None,
             override_hover_background_color: None,
             icon_size_override: None,
             clip_config: None,
@@ -541,6 +545,7 @@ impl<A: Action + Clone> MenuItemFields<A> {
             tooltip_position: MenuTooltipPosition::default(),
             right_side_label: None,
             right_side_icon: None,
+            secondary_right_side_icon: None,
             override_hover_background_color: None,
             icon_size_override: None,
             clip_config: None,
@@ -574,6 +579,7 @@ impl<A: Action + Clone> MenuItemFields<A> {
             tooltip_position: MenuTooltipPosition::default(),
             right_side_label: None,
             right_side_icon: None,
+            secondary_right_side_icon: None,
             override_hover_background_color: None,
             icon_size_override: None,
             clip_config: None,
@@ -610,6 +616,7 @@ impl<A: Action + Clone> MenuItemFields<A> {
             tooltip_position: MenuTooltipPosition::default(),
             right_side_label: None,
             right_side_icon: None,
+            secondary_right_side_icon: None,
             override_hover_background_color: None,
             icon_size_override: None,
             clip_config: None,
@@ -644,6 +651,7 @@ impl<A: Action + Clone> MenuItemFields<A> {
             tooltip_position: MenuTooltipPosition::default(),
             right_side_label: None,
             right_side_icon: None,
+            secondary_right_side_icon: None,
             override_hover_background_color: None,
             icon_size_override: None,
             clip_config: None,
@@ -677,6 +685,7 @@ impl<A: Action + Clone> MenuItemFields<A> {
             tooltip_position: MenuTooltipPosition::default(),
             right_side_label: None,
             right_side_icon: None,
+            secondary_right_side_icon: None,
             override_hover_background_color: None,
             icon_size_override: None,
             clip_config: None,
@@ -707,6 +716,7 @@ impl<A: Action + Clone> MenuItemFields<A> {
             tooltip_position: MenuTooltipPosition::default(),
             right_side_label: None,
             right_side_icon: None,
+            secondary_right_side_icon: None,
             override_hover_background_color: None,
             icon_size_override: None,
             clip_config: None,
@@ -758,7 +768,10 @@ impl<A: Action + Clone> MenuItemFields<A> {
             // after conversion.
             right_side_icon: self
                 .right_side_icon
-                .map(RightSideIconConfig::without_action),
+                .map(|config| Box::new(config.without_action())),
+            secondary_right_side_icon: self
+                .secondary_right_side_icon
+                .map(|config| Box::new(config.without_action())),
             override_hover_background_color: self.override_hover_background_color,
             icon_size_override: self.icon_size_override,
             clip_config: self.clip_config,
@@ -894,7 +907,7 @@ impl<A: Action + Clone> MenuItemFields<A> {
     }
 
     pub fn with_right_side_icon(mut self, icon: icons::Icon) -> Self {
-        self.right_side_icon = Some(RightSideIconConfig::new(icon));
+        self.right_side_icon = Some(Box::new(RightSideIconConfig::new(icon)));
         self
     }
 
@@ -920,6 +933,22 @@ impl<A: Action + Clone> MenuItemFields<A> {
         if let Some(config) = &mut self.right_side_icon {
             config.disabled = disabled;
         }
+        self
+    }
+
+    /// Adds a second clickable icon after the right-side icon. Like
+    /// `with_right_side_icon_action`, clicking it dispatches `action` without
+    /// firing the row's own `on_select_action`.
+    pub fn with_secondary_right_side_icon(
+        mut self,
+        icon: icons::Icon,
+        action: A,
+        a11y_label: impl Into<String>,
+    ) -> Self {
+        let mut config = RightSideIconConfig::new(icon);
+        config.action = Some(action);
+        config.a11y_label = Some(a11y_label.into());
+        self.secondary_right_side_icon = Some(Box::new(config));
         self
     }
 
@@ -1061,7 +1090,32 @@ impl<A: Action + Clone> MenuItemFields<A> {
         color: Fill,
         dispatch_item_actions: bool,
     ) -> Option<Box<dyn Element>> {
-        let config = self.right_side_icon.as_ref()?;
+        let icons: Vec<Box<dyn Element>> = self
+            .right_side_icon
+            .as_deref()
+            .into_iter()
+            .chain(self.secondary_right_side_icon.as_deref())
+            .map(|config| {
+                self.render_right_side_icon_config(config, appearance, color, dispatch_item_actions)
+            })
+            .collect();
+        if icons.is_empty() {
+            return None;
+        }
+        let row = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_children(icons)
+            .finish();
+        Some(Shrinkable::new(1., Align::new(row).right().finish()).finish())
+    }
+
+    fn render_right_side_icon_config(
+        &self,
+        config: &RightSideIconConfig<A>,
+        appearance: &Appearance,
+        color: Fill,
+        dispatch_item_actions: bool,
+    ) -> Box<dyn Element> {
         let icon_size = self
             .icon_size_override
             .unwrap_or_else(|| appearance.ui_font_size());
@@ -1097,19 +1151,17 @@ impl<A: Action + Clone> MenuItemFields<A> {
             } else {
                 hoverable.finish()
             };
-            let element = Container::new(button_element)
+            return Container::new(button_element)
                 .with_margin_left(icon_size / 2.)
                 .finish();
-            return Some(Shrinkable::new(1., Align::new(element).right().finish()).finish());
         }
         let icon_element = ConstrainedBox::new(config.icon.to_warpui_icon(icon_color).finish())
             .with_width(icon_size)
             .with_height(icon_size)
             .finish();
-        let container = Container::new(icon_element)
+        Container::new(icon_element)
             .with_margin_left(icon_size / 2.)
-            .finish();
-        Some(Shrinkable::new(1., Align::new(container).right().finish()).finish())
+            .finish()
     }
 
     fn render_right_aligned_chevron(

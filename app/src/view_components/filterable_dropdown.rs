@@ -815,6 +815,7 @@ where
             DropdownAction::SelectActionAndClose(action) => {
                 self.select_action_and_close(action.as_ref(), ctx)
             }
+            DropdownAction::DispatchAction(action) => ctx.dispatch_typed_action(action.as_ref()),
             DropdownAction::ToggleExpanded => self.toggle_expanded(ctx),
         }
     }

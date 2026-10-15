@@ -4,6 +4,7 @@ use std::cmp::Reverse;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use crate::pane_group::RepoDiscoveryState;
 use crate::settings::RepoListPrefs;
 
 /// A repo that can appear in the dropdown.
@@ -76,14 +77,78 @@ pub fn repo_label(path: &Path, main_repo_name: Option<&str>) -> String {
 
 /// Keeps the saved selection while it is still listed, otherwise falls back to the first
 /// visible repo.
-pub fn selection_after_change(
-    saved: Option<&Path>,
-    ordered_visible: &[PathBuf],
-) -> Option<PathBuf> {
+pub fn selection_after_change<T: PartialEq + Clone>(
+    saved: Option<&T>,
+    ordered_visible: &[T],
+) -> Option<T> {
     saved
-        .filter(|saved| ordered_visible.iter().any(|path| path == saved))
-        .map(Path::to_path_buf)
+        .filter(|saved| ordered_visible.contains(saved))
+        .cloned()
         .or_else(|| ordered_visible.first().cloned())
+}
+
+/// Combines the pin/hide prefs of every discovery parent into one, keeping only entries for
+/// `discovered` repos so a repo a pane sits inside is never pinned or hidden.
+pub fn merge_prefs<'a>(
+    per_parent: impl IntoIterator<Item = &'a RepoListPrefs>,
+    discovered: &[&Path],
+) -> RepoListPrefs {
+    let is_discovered = |stored: &String| discovered.iter().any(|path| Path::new(stored) == *path);
+    let mut merged = RepoListPrefs::default();
+    for prefs in per_parent {
+        merged
+            .pinned
+            .extend(prefs.pinned.iter().filter(|p| is_discovered(p)).cloned());
+        merged
+            .hidden
+            .extend(prefs.hidden.iter().filter(|p| is_discovered(p)).cloned());
+    }
+    merged
+}
+
+/// Keeps still-visible repos in the `frozen` order captured when the dropdown opened, so rows
+/// don't move under the pointer. Repos that became visible since go after them, in `ordered`'s
+/// order.
+pub fn keep_frozen_order(ordered: OrderedRepos, frozen: &[PathBuf]) -> OrderedRepos {
+    let (mut kept, added): (Vec<RepoListEntry>, Vec<RepoListEntry>) = ordered
+        .visible
+        .into_iter()
+        .partition(|entry| frozen.contains(&entry.path));
+    kept.sort_by_key(|entry| frozen.iter().position(|path| *path == entry.path));
+    kept.extend(added);
+    OrderedRepos {
+        visible: kept,
+        hidden: ordered.hidden,
+    }
+}
+
+/// What the code review panel shows for a tab's repo list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoListState {
+    /// The first discovery walk is still running and nothing is listed yet.
+    Scanning,
+    /// No repos were found.
+    Empty,
+    /// Every repo is hidden.
+    AllHidden,
+    Listed {
+        /// A walk stopped at its size bound, so the list may be incomplete.
+        truncated: bool,
+    },
+}
+
+pub fn repo_list_state(ordered: &OrderedRepos, discovery: RepoDiscoveryState) -> RepoListState {
+    if !ordered.visible.is_empty() {
+        RepoListState::Listed {
+            truncated: discovery.truncated,
+        }
+    } else if !ordered.hidden.is_empty() {
+        RepoListState::AllHidden
+    } else if discovery.scanning {
+        RepoListState::Scanning
+    } else {
+        RepoListState::Empty
+    }
 }
 
 #[cfg(test)]

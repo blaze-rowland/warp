@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -34,14 +35,20 @@ use crate::code_review::code_review_view::{
     CodeReviewViewEvent, ReviewActionTargetProvider, render_file_navigation_button,
 };
 use crate::code_review::diff_state::DiffStateModel;
+use crate::code_review::repo_list::{
+    RepoListEntry, RepoListState, keep_frozen_order, merge_prefs, order_repos, repo_label,
+    repo_list_state, selection_after_change,
+};
 use crate::code_review::telemetry_event::CodeReviewContextDestination;
 use crate::drive::panel::{MAX_SIDEBAR_WIDTH_RATIO, MIN_SIDEBAR_WIDTH};
+use crate::menu::{self, MenuItem, MenuItemFields};
 use crate::pane_group::pane::view::header::PANE_HEADER_HEIGHT;
 use crate::pane_group::pane::view::header::components::HEADER_EDGE_PADDING;
 use crate::pane_group::{
-    Event as PaneGroupEvent, PaneGroup, WorkingDirectoriesEvent, WorkingDirectoriesModel,
+    DiscoveredRepoInfo, Event as PaneGroupEvent, PaneGroup, WorkingDirectoriesEvent,
+    WorkingDirectoriesModel,
 };
-use crate::settings::{AISettings, AISettingsChangedEvent};
+use crate::settings::{AISettings, AISettingsChangedEvent, CodeSettings, CodeSettingsChangedEvent};
 use crate::terminal::CLIAgent;
 use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
 use crate::terminal::input::MenuPositioning;
@@ -56,7 +63,7 @@ use crate::util::path::{display_name_with_host, display_path_with_host};
 use crate::view_components::action_button::{ActionButton, PaneHeaderTheme};
 #[cfg(feature = "local_fs")]
 use crate::view_components::action_button::{NakedTheme, TooltipAlignment};
-use crate::view_components::{Dropdown, DropdownItem};
+use crate::view_components::{Dropdown, DropdownAction, DropdownEvent, DropdownItem};
 use crate::workspace::WorkspaceAction;
 use crate::workspace::view::TOGGLE_RIGHT_PANEL_BINDING_NAME;
 
@@ -186,7 +193,39 @@ struct CodeReviewState {
     selected_repo_path: Option<LocalOrRemotePath>,
     /// Avoid showing the jump-to-repo button if the focused repo has not changed
     did_focused_repo_change: bool,
+    /// Set when the tab's repos include ones discovered beneath a non-repo working directory.
+    discovered_list: Option<DiscoveredRepoList>,
+    /// Visible repo order captured when the dropdown opened; `Some` while it is open.
+    frozen_order: Option<Vec<PathBuf>>,
+    hidden_group_expanded: bool,
 }
+
+/// The repo dropdown's contents for a tab with discovered repos, in display order.
+struct DiscoveredRepoList {
+    rows: Vec<RepoRow>,
+    hidden_rows: Vec<RepoRow>,
+    state: RepoListState,
+}
+
+impl DiscoveredRepoList {
+    fn shows_dropdown(&self) -> bool {
+        self.rows.len() > 1
+            || !self.hidden_rows.is_empty()
+            || self.state == (RepoListState::Listed { truncated: true })
+    }
+}
+
+struct RepoRow {
+    path: LocalOrRemotePath,
+    label: String,
+    /// The folder the repo was discovered under; `None` for a repo a pane sits inside, which
+    /// can't be pinned or hidden.
+    parent: Option<PathBuf>,
+    pinned: bool,
+}
+
+const REPO_DROPDOWN_MENU_WIDTH: f32 = 320.;
+const ALL_REPOS_HIDDEN_LABEL: &str = "All repos hidden";
 
 #[cfg(feature = "local_fs")]
 struct CodeReviewSessionEnv {
@@ -206,46 +245,53 @@ fn repo_dropdown_font_color(appearance: &Appearance) -> ColorU {
 
 impl CodeReviewState {
     pub fn new(ctx: &mut ViewContext<RightPanelView>) -> Self {
+        let dropdown = ctx.add_typed_action_view(|ctx| {
+            let (font_color, ui_font_size) = {
+                let appearance = Appearance::as_ref(ctx);
+                (
+                    repo_dropdown_font_color(appearance),
+                    appearance.ui_font_size(),
+                )
+            };
+            let mut dropdown = Dropdown::new(ctx);
+            dropdown.set_menu_position(
+                PositionedElementAnchor::BottomRight,
+                ChildAnchor::TopRight,
+                ctx,
+            );
+            dropdown.set_main_axis_size(MainAxisSize::Min, ctx);
+            dropdown.set_font_color(font_color, ctx);
+            dropdown.set_font_size(ui_font_size, ctx);
+            dropdown.set_vertical_margin(0., ctx);
+            dropdown.set_top_bar_height(warp_core::ui::icons::ICON_DIMENSIONS, ctx);
+            dropdown.set_padding(HEADER_BUTTON_PADDING, ctx);
+
+            // The font color above is derived from the active theme and
+            // cached inside the dropdown. Without this subscription, the
+            // cached value goes stale across light/dark switches and the
+            // header label becomes unreadable on the new background
+            // (e.g. white-on-white in light mode after starting in dark).
+            ctx.subscribe_to_model(&Appearance::handle(ctx), |dropdown, _, event, ctx| {
+                if matches!(event, AppearanceEvent::ThemeChanged) {
+                    let font_color = repo_dropdown_font_color(Appearance::as_ref(ctx));
+                    dropdown.set_font_color(font_color, ctx);
+                }
+            });
+
+            dropdown
+        });
+        ctx.subscribe_to_view(&dropdown, |me, _, event, ctx| {
+            me.handle_repo_dropdown_event(event, ctx);
+        });
         CodeReviewState {
-            dropdown: ctx.add_typed_action_view(|ctx| {
-                let (font_color, ui_font_size) = {
-                    let appearance = Appearance::as_ref(ctx);
-                    (
-                        repo_dropdown_font_color(appearance),
-                        appearance.ui_font_size(),
-                    )
-                };
-                let mut dropdown = Dropdown::new(ctx);
-                dropdown.set_menu_position(
-                    PositionedElementAnchor::BottomRight,
-                    ChildAnchor::TopRight,
-                    ctx,
-                );
-                dropdown.set_main_axis_size(MainAxisSize::Min, ctx);
-                dropdown.set_font_color(font_color, ctx);
-                dropdown.set_font_size(ui_font_size, ctx);
-                dropdown.set_vertical_margin(0., ctx);
-                dropdown.set_top_bar_height(warp_core::ui::icons::ICON_DIMENSIONS, ctx);
-                dropdown.set_padding(HEADER_BUTTON_PADDING, ctx);
-
-                // The font color above is derived from the active theme and
-                // cached inside the dropdown. Without this subscription, the
-                // cached value goes stale across light/dark switches and the
-                // header label becomes unreadable on the new background
-                // (e.g. white-on-white in light mode after starting in dark).
-                ctx.subscribe_to_model(&Appearance::handle(ctx), |dropdown, _, event, ctx| {
-                    if matches!(event, AppearanceEvent::ThemeChanged) {
-                        let font_color = repo_dropdown_font_color(Appearance::as_ref(ctx));
-                        dropdown.set_font_color(font_color, ctx);
-                    }
-                });
-
-                dropdown
-            }),
+            dropdown,
             available_repos: vec![],
             selected_repo_path: None,
             focused_repo_path: None,
             did_focused_repo_change: false,
+            discovered_list: None,
+            frozen_order: None,
+            hidden_group_expanded: false,
         }
     }
 
@@ -253,6 +299,7 @@ impl CodeReviewState {
     fn set_available_repos(
         &mut self,
         _repos: Vec<LocalOrRemotePath>,
+        _discovered_list: Option<DiscoveredRepoList>,
         _ctx: &mut ViewContext<RightPanelView>,
     ) {
     }
@@ -261,8 +308,23 @@ impl CodeReviewState {
     fn set_available_repos(
         &mut self,
         repos: Vec<LocalOrRemotePath>,
+        discovered_list: Option<DiscoveredRepoList>,
         ctx: &mut ViewContext<RightPanelView>,
     ) {
+        self.discovered_list = discovered_list;
+        if let Some(list) = &self.discovered_list {
+            self.available_repos = repos;
+            let visible: Vec<LocalOrRemotePath> =
+                list.rows.iter().map(|row| row.path.clone()).collect();
+            match selection_after_change(self.selected_repo_path.as_ref(), &visible) {
+                Some(selection) => self.set_selected_repo_internal(selection, false, ctx),
+                None => self.selected_repo_path = None,
+            }
+            self.update_repo_dropdown(ctx);
+            ctx.notify();
+            return;
+        }
+
         let should_clear = self
             .selected_repo_path
             .as_ref()
@@ -350,43 +412,161 @@ impl CodeReviewState {
 
     #[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
     fn update_repo_dropdown(&mut self, ctx: &mut ViewContext<RightPanelView>) {
-        // Collect data before borrowing mutably
-        let (items, selected_display_name) = {
-            let items: Vec<DropdownItem<RightPanelAction>> = self
-                .available_repos
-                .iter()
-                .map(|repo_path| {
-                    let display_name = self
-                        .get_repo_display_name(repo_path, ctx)
-                        .unwrap_or_else(|| "Unknown".to_string());
-                    DropdownItem::new(
-                        display_name,
-                        RightPanelAction::SelectRepo {
-                            repo_path: repo_path.clone(),
-                            from_dropdown: true,
-                        },
-                    )
-                })
-                .collect();
+        if self.discovered_list.is_some() {
+            self.update_discovered_repo_dropdown(ctx);
+            return;
+        }
 
-            let selected_display_name = self
-                .selected_repo_path
-                .as_ref()
-                .and_then(|selected| self.get_repo_display_name(selected, ctx));
+        let items: Vec<DropdownItem<RightPanelAction>> = self
+            .available_repos
+            .iter()
+            .map(|repo_path| {
+                let display_name = self
+                    .get_repo_display_name(repo_path, ctx)
+                    .unwrap_or_else(|| "Unknown".to_string());
+                DropdownItem::new(display_name, select_repo_from_dropdown(repo_path.clone()))
+            })
+            .collect();
 
-            (items, selected_display_name)
-        };
-
-        // Now update the dropdown
         if !items.is_empty() {
+            let selected = self.selected_repo_path.clone();
             self.dropdown.update(ctx, |dropdown, ctx| {
                 dropdown.set_items(items, ctx);
-                if let Some(display_name) = selected_display_name {
-                    dropdown.set_selected_by_name(display_name, ctx);
+                dropdown.set_menu_width(menu::DEFAULT_WIDTH, ctx);
+                if let Some(selected) = selected {
+                    dropdown.set_selected_by_action(select_repo_from_dropdown(selected), ctx);
                 }
             });
         }
     }
+
+    #[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
+    fn update_discovered_repo_dropdown(&mut self, ctx: &mut ViewContext<RightPanelView>) {
+        let Some(list) = &self.discovered_list else {
+            return;
+        };
+        let mut items: Vec<MenuItem<DropdownAction>> = Vec::new();
+        if list.state == RepoListState::AllHidden {
+            items.push(
+                MenuItemFields::new(ALL_REPOS_HIDDEN_LABEL)
+                    .with_disabled(true)
+                    .into_item(),
+            );
+        }
+        items.extend(list.rows.iter().map(discovered_repo_row_item));
+
+        if !list.hidden_rows.is_empty() {
+            let (chevron, toggle_label) = if self.hidden_group_expanded {
+                (Icon::ChevronDown, "Collapse hidden repos")
+            } else {
+                (Icon::ChevronRight, "Show hidden repos")
+            };
+            items.push(MenuItem::Header {
+                fields: MenuItemFields::new(format!("Hidden ({})", list.hidden_rows.len()))
+                    .with_right_side_icon(chevron)
+                    .with_right_side_icon_action(DropdownAction::dispatch_action(
+                        RightPanelAction::ToggleHiddenRepos,
+                    ))
+                    .with_right_side_icon_a11y_label(toggle_label),
+                clickable: false,
+                right_side_fields: None,
+            });
+            if self.hidden_group_expanded {
+                items.extend(list.hidden_rows.iter().filter_map(hidden_repo_row_item));
+            }
+        }
+
+        if list.state == (RepoListState::Listed { truncated: true }) {
+            items.push(
+                MenuItemFields::new("Showing partial results")
+                    .with_disabled(true)
+                    .into_item(),
+            );
+        }
+
+        let selected = self.selected_repo_path.clone();
+        let all_hidden = list.state == RepoListState::AllHidden;
+        self.dropdown.update(ctx, |dropdown, ctx| {
+            dropdown.set_rich_items(items, ctx);
+            dropdown.set_menu_width(REPO_DROPDOWN_MENU_WIDTH, ctx);
+            match selected {
+                Some(selected) => {
+                    dropdown.set_selected_by_action(select_repo_from_dropdown(selected), ctx)
+                }
+                None if all_hidden => dropdown.set_selected_by_index(0, ctx),
+                None => dropdown.set_selected_to_none(ctx),
+            }
+        });
+    }
+}
+
+#[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
+fn select_repo_from_dropdown(repo_path: LocalOrRemotePath) -> RightPanelAction {
+    RightPanelAction::SelectRepo {
+        repo_path,
+        from_dropdown: true,
+    }
+}
+
+#[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
+fn discovered_repo_row_item(row: &RepoRow) -> MenuItem<DropdownAction> {
+    let fields = MenuItemFields::new(row.label.clone()).with_on_select_action(
+        DropdownAction::select_action_and_close(select_repo_from_dropdown(row.path.clone())),
+    );
+    let (Some(parent), Some(repo)) = (&row.parent, row.path.to_local_path()) else {
+        return fields.into_item();
+    };
+    let label = &row.label;
+    let (pin_icon, pin_action, pin_label) = if row.pinned {
+        (
+            Icon::PinFilled,
+            RightPanelAction::UnpinRepo {
+                parent: parent.clone(),
+                repo: repo.to_path_buf(),
+            },
+            format!("Unpin {label}"),
+        )
+    } else {
+        (
+            Icon::Pin,
+            RightPanelAction::PinRepo {
+                parent: parent.clone(),
+                repo: repo.to_path_buf(),
+            },
+            format!("Pin {label}"),
+        )
+    };
+    fields
+        .with_right_side_icon(pin_icon)
+        .with_right_side_icon_action(DropdownAction::dispatch_action(pin_action))
+        .with_right_side_icon_a11y_label(pin_label)
+        .with_secondary_right_side_icon(
+            Icon::Minus,
+            DropdownAction::dispatch_action(RightPanelAction::HideRepo {
+                parent: parent.clone(),
+                repo: repo.to_path_buf(),
+            }),
+            format!("Hide {label}"),
+        )
+        .into_item()
+}
+
+#[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
+fn hidden_repo_row_item(row: &RepoRow) -> Option<MenuItem<DropdownAction>> {
+    let parent = row.parent.clone()?;
+    let repo = row.path.to_local_path()?.to_path_buf();
+    let label = &row.label;
+    Some(
+        MenuItemFields::new(row.label.clone())
+            .with_indent()
+            .with_no_interaction_on_hover()
+            .with_right_side_icon(Icon::Eye)
+            .with_right_side_icon_action(DropdownAction::dispatch_action(
+                RightPanelAction::UnhideRepo { parent, repo },
+            ))
+            .with_right_side_icon_a11y_label(format!("Unhide {label}"))
+            .into_item(),
+    )
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -399,6 +579,23 @@ pub enum RightPanelAction {
     },
     OpenRepository,
     ToggleMaximize,
+    PinRepo {
+        parent: PathBuf,
+        repo: PathBuf,
+    },
+    UnpinRepo {
+        parent: PathBuf,
+        repo: PathBuf,
+    },
+    HideRepo {
+        parent: PathBuf,
+        repo: PathBuf,
+    },
+    UnhideRepo {
+        parent: PathBuf,
+        repo: PathBuf,
+    },
+    ToggleHiddenRepos,
 }
 
 #[derive(Clone, Debug)]
@@ -481,6 +678,15 @@ impl RightPanelView {
         // Recompute terminal availability when CLI agent sessions start or end.
         ctx.subscribe_to_model(&CLIAgentSessionsModel::handle(ctx), |me, _, _, ctx| {
             me.recompute_terminal_availability(ctx);
+        });
+
+        ctx.subscribe_to_model(&CodeSettings::handle(ctx), |me, _, event, ctx| {
+            if matches!(
+                event,
+                CodeSettingsChangedEvent::CodeReviewRepoListPrefs { .. }
+            ) {
+                me.refresh_repo_list(ctx);
+            }
         });
 
         // Recompute terminal availability when AI is toggled on or off, so the
@@ -588,33 +794,7 @@ impl RightPanelView {
                 if active_pane_group.id() != *pane_group_id {
                     return;
                 }
-                let old_selected = self
-                    .code_review_state
-                    .as_ref()
-                    .and_then(|s| s.selected_repo_path.clone());
-
-                if let Some(state) = self.code_review_state.as_mut() {
-                    state.set_available_repos(repositories.clone(), ctx);
-                }
-
-                let new_selected = self
-                    .code_review_state
-                    .as_ref()
-                    .and_then(|s| s.selected_repo_path.clone());
-
-                // Only close the old view if the selection actually changed.
-                if old_selected != new_selected
-                    && let Some(old_path) = &old_selected
-                {
-                    self.close_code_review_view(*pane_group_id, old_path, ctx);
-                }
-
-                if let Some(path) = &new_selected {
-                    self.ensure_code_review_view_exists(path, ctx);
-                }
-
-                self.recompute_terminal_availability(ctx);
-                ctx.notify();
+                self.apply_available_repos(repositories.clone(), ctx);
             }
             WorkingDirectoriesEvent::FocusedRepoChanged {
                 pane_group_id,
@@ -641,6 +821,200 @@ impl RightPanelView {
         }
     }
 
+    /// Replaces the dropdown's repos, reconciles the selection and swaps the visible review
+    /// view when the selection changed.
+    fn apply_available_repos(
+        &mut self,
+        repos: Vec<LocalOrRemotePath>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(pane_group_id) = self.active_pane_group.as_ref().map(|pg| pg.id()) else {
+            return;
+        };
+        let frozen_order = self
+            .code_review_state
+            .as_ref()
+            .and_then(|s| s.frozen_order.clone());
+        let discovered_list = self.discovered_repo_list(&repos, frozen_order.as_deref(), ctx);
+        let old_selected = self
+            .code_review_state
+            .as_ref()
+            .and_then(|s| s.selected_repo_path.clone());
+
+        if let Some(state) = self.code_review_state.as_mut() {
+            state.set_available_repos(repos, discovered_list, ctx);
+        }
+
+        let new_selected = self
+            .code_review_state
+            .as_ref()
+            .and_then(|s| s.selected_repo_path.clone());
+
+        // Only close the old view if the selection actually changed.
+        if old_selected != new_selected
+            && let Some(old_path) = &old_selected
+        {
+            self.close_code_review_view(pane_group_id, old_path, ctx);
+        }
+
+        if let Some(path) = &new_selected {
+            self.ensure_code_review_view_exists(path, ctx);
+        }
+
+        self.recompute_terminal_availability(ctx);
+        ctx.notify();
+    }
+
+    /// Rebuilds the dropdown from the current repos, e.g. after pin/hide prefs change.
+    fn refresh_repo_list(&mut self, ctx: &mut ViewContext<Self>) {
+        let Some(repos) = self
+            .code_review_state
+            .as_ref()
+            .map(|s| s.available_repos.clone())
+        else {
+            return;
+        };
+        self.apply_available_repos(repos, ctx);
+    }
+
+    fn handle_repo_dropdown_event(&mut self, event: &DropdownEvent, ctx: &mut ViewContext<Self>) {
+        let Some(state) = self.code_review_state.as_mut() else {
+            return;
+        };
+        match event {
+            DropdownEvent::ToggleExpanded => {
+                state.frozen_order = state.discovered_list.as_ref().map(|list| {
+                    list.rows
+                        .iter()
+                        .filter_map(|row| row.path.to_local_path().map(Path::to_path_buf))
+                        .collect()
+                });
+            }
+            DropdownEvent::Close => {
+                if state.frozen_order.take().is_some() {
+                    self.refresh_repo_list(ctx);
+                }
+            }
+        }
+    }
+
+    /// Orders and labels `repos` when the tab's list includes repos discovered beneath a non-repo
+    /// working directory, or while the first discovery walk runs with nothing listed. `None`
+    /// keeps the plain dropdown.
+    fn discovered_repo_list(
+        &self,
+        repos: &[LocalOrRemotePath],
+        frozen_order: Option<&[PathBuf]>,
+        ctx: &AppContext,
+    ) -> Option<DiscoveredRepoList> {
+        if !FeatureFlag::MultiRepoCodeReview.is_enabled() {
+            return None;
+        }
+        let pane_group_id = self.active_pane_group.as_ref()?.id();
+        let model = self.working_directories_model.as_ref(ctx);
+        let discovery = model.discovery_state(pane_group_id);
+        let infos: HashMap<&Path, DiscoveredRepoInfo> = repos
+            .iter()
+            .filter_map(|repo| {
+                let path = repo.to_local_path()?;
+                Some((path, model.discovered_repo_info(pane_group_id, path)?))
+            })
+            .collect();
+        if infos.is_empty() && !(repos.is_empty() && discovery.scanning) {
+            return None;
+        }
+
+        let settings = CodeSettings::as_ref(ctx);
+        let per_parent: Vec<_> = infos
+            .values()
+            .map(|info| info.parent.as_path())
+            .unique()
+            .map(|parent| settings.repo_list_prefs(parent))
+            .collect();
+        let discovered: Vec<&Path> = infos.keys().copied().collect();
+        let prefs = merge_prefs(&per_parent, &discovered);
+
+        // Repos a pane sits inside have no cheap recency, so they sort after discovered repos.
+        let entries: Vec<RepoListEntry> = repos
+            .iter()
+            .filter_map(LocalOrRemotePath::to_local_path)
+            .map(|path| RepoListEntry {
+                path: path.to_path_buf(),
+                recency: infos.get(path).and_then(|info| info.recency),
+            })
+            .collect();
+        let mut ordered = order_repos(&entries, &prefs);
+        if let Some(frozen_order) = frozen_order {
+            ordered = keep_frozen_order(ordered, frozen_order);
+        }
+        let mut state = repo_list_state(&ordered, discovery);
+
+        let row = |entry: RepoListEntry| {
+            let info = infos.get(entry.path.as_path());
+            let pinned = prefs.pinned.iter().any(|p| Path::new(p) == entry.path);
+            let label = info.map(|info| repo_label(&entry.path, info.main_repo_name.as_deref()));
+            let path = LocalOrRemotePath::Local(entry.path);
+            let label = label.unwrap_or_else(|| display_name_with_host(&path, ctx));
+            RepoRow {
+                path,
+                label,
+                parent: info.map(|info| info.parent.clone()),
+                pinned,
+            }
+        };
+        let mut rows: Vec<RepoRow> = ordered.visible.into_iter().map(row).collect();
+        let hidden_rows = ordered.hidden.into_iter().map(row).collect();
+
+        let remote_rows = repos
+            .iter()
+            .filter(|repo| repo.is_remote())
+            .map(|path| RepoRow {
+                path: path.clone(),
+                label: display_name_with_host(path, ctx),
+                parent: None,
+                pinned: false,
+            });
+        rows.extend(remote_rows);
+        if !rows.is_empty() {
+            state = RepoListState::Listed {
+                truncated: discovery.truncated,
+            };
+        }
+
+        Some(DiscoveredRepoList {
+            rows,
+            hidden_rows,
+            state,
+        })
+    }
+
+    /// Rescans discovered repos and restores the tab's remembered repo, which the open path
+    /// clears when the active pane isn't inside a repo.
+    pub fn on_panel_opened(&mut self, ctx: &mut ViewContext<Self>) {
+        if !FeatureFlag::MultiRepoCodeReview.is_enabled() {
+            return;
+        }
+        let Some(pane_group_id) = self.active_pane_group.as_ref().map(|pg| pg.id()) else {
+            return;
+        };
+        self.working_directories_model.update(ctx, |model, ctx| {
+            model.rescan_discovered_repos(pane_group_id, ctx);
+        });
+        let saved = self
+            .working_directories_model
+            .as_ref(ctx)
+            .get_selected_review_repo(pane_group_id)
+            .cloned();
+        let Some(state) = self.code_review_state.as_mut() else {
+            return;
+        };
+        if state.discovered_list.is_none() || state.selected_repo_path.is_some() {
+            return;
+        }
+        state.selected_repo_path = saved;
+        self.refresh_repo_list(ctx);
+    }
+
     pub fn set_active_pane_group(
         &mut self,
         pane_group: ViewHandle<PaneGroup>,
@@ -657,6 +1031,13 @@ impl RightPanelView {
                 me.recompute_terminal_availability(ctx);
             }
         });
+
+        if FeatureFlag::MultiRepoCodeReview.is_enabled() && pane_group.as_ref(ctx).right_panel_open
+        {
+            self.working_directories_model.update(ctx, |model, ctx| {
+                model.rescan_discovered_repos(pane_group_id, ctx);
+            });
+        }
 
         self.active_pane_group = Some(pane_group);
 
@@ -677,7 +1058,11 @@ impl RightPanelView {
             // (when it's still in the repo list) or falls back to auto-selecting
             // the first repo, instead of preserving the previous tab's repo.
             state.selected_repo_path = saved_selection;
-            state.set_available_repos(active_repositories, ctx);
+            state.frozen_order = None;
+            let discovered_list = self.discovered_repo_list(&active_repositories, None, ctx);
+            if let Some(state) = self.code_review_state.as_mut() {
+                state.set_available_repos(active_repositories, discovered_list, ctx);
+            }
         }
 
         let selected = self
@@ -786,7 +1171,11 @@ impl RightPanelView {
         let Some(state) = &self.code_review_state else {
             return None;
         };
-        if state.available_repos.len() <= 1 {
+        let shows_dropdown = match &state.discovered_list {
+            Some(list) => list.shows_dropdown(),
+            None => state.available_repos.len() > 1,
+        };
+        if !shows_dropdown {
             return None;
         }
         Some(
@@ -836,13 +1225,18 @@ impl RightPanelView {
         .finish()
     }
 
-    fn render_simple_header(&self, close_button: Box<dyn Element>) -> Box<dyn Element> {
+    fn render_simple_header(
+        &self,
+        repo_dropdown: Option<Box<dyn Element>>,
+        close_button: Box<dyn Element>,
+    ) -> Box<dyn Element> {
         let left_spacer = Box::new(Shrinkable::new(1.0, Empty::new().finish()));
         Container::new(
             ConstrainedBox::new(
                 Flex::row()
                     .with_child(left_spacer)
-                    .with_children(vec![close_button])
+                    .with_children(repo_dropdown)
+                    .with_child(close_button)
                     .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
                     .with_cross_axis_alignment(CrossAxisAlignment::Center)
                     .finish(),
@@ -860,7 +1254,7 @@ impl RightPanelView {
         let close_button = self.close_button(appearance, app);
 
         let Some(state) = &self.code_review_state else {
-            let simple_header = self.render_simple_header(close_button);
+            let simple_header = self.render_simple_header(None, close_button);
             return Flex::column()
                 .with_child(simple_header)
                 .with_child(
@@ -878,7 +1272,45 @@ impl RightPanelView {
         });
 
         let Some(selected_repo_path) = selected_repo_path else {
-            let simple_header = self.render_simple_header(close_button);
+            let discovered_state = state.discovered_list.as_ref().map(|list| list.state);
+            match discovered_state {
+                Some(RepoListState::Scanning) => {
+                    return Flex::column()
+                        .with_child(self.render_simple_header(None, close_button))
+                        .with_child(
+                            Shrinkable::new(
+                                1.0,
+                                render_repo_list_message(
+                                    "Scanning for repositories…",
+                                    None,
+                                    appearance,
+                                ),
+                            )
+                            .finish(),
+                        )
+                        .finish();
+                }
+                Some(RepoListState::AllHidden) => {
+                    return Flex::column()
+                        .with_child(
+                            self.render_simple_header(self.render_repo_dropdown(), close_button),
+                        )
+                        .with_child(
+                            Shrinkable::new(
+                                1.0,
+                                render_repo_list_message(
+                                    "All repositories are hidden",
+                                    Some("Unhide one from the Hidden group in the repo menu."),
+                                    appearance,
+                                ),
+                            )
+                            .finish(),
+                        )
+                        .finish();
+                }
+                Some(RepoListState::Empty | RepoListState::Listed { .. }) | None => {}
+            }
+            let simple_header = self.render_simple_header(None, close_button);
 
             #[cfg(feature = "local_fs")]
             let no_repo_body = {
@@ -930,7 +1362,7 @@ impl RightPanelView {
                 .with_child(code_review_content)
                 .finish()
         } else {
-            let simple_header = self.render_simple_header(close_button);
+            let simple_header = self.render_simple_header(None, close_button);
             Flex::column()
                 .with_child(simple_header)
                 .with_child(
@@ -1770,6 +2202,48 @@ impl RightPanelView {
     }
 }
 
+fn render_repo_list_message(
+    title: &'static str,
+    detail: Option<&'static str>,
+    appearance: &Appearance,
+) -> Box<dyn Element> {
+    let theme = appearance.theme();
+    let mut column = Flex::column()
+        .with_main_axis_size(MainAxisSize::Max)
+        .with_main_axis_alignment(MainAxisAlignment::Center)
+        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+        .with_child(
+            Text::new(
+                title,
+                appearance.ui_font_family(),
+                appearance.ui_font_size() + 2.,
+            )
+            .with_style(Properties::default().weight(Weight::Semibold))
+            .with_color(theme.sub_text_color(theme.background()).into())
+            .finish(),
+        );
+    if let Some(detail) = detail {
+        column.add_child(
+            Container::new(
+                Text::new(
+                    detail,
+                    appearance.ui_font_family(),
+                    appearance.ui_font_size() + 2.,
+                )
+                .with_color(theme.disabled_text_color(theme.background()).into())
+                .finish(),
+            )
+            .with_margin_top(4.)
+            .finish(),
+        );
+    }
+    Flex::row()
+        .with_main_axis_size(MainAxisSize::Max)
+        .with_main_axis_alignment(MainAxisAlignment::Center)
+        .with_child(column.finish())
+        .finish()
+}
+
 impl Entity for RightPanelView {
     type Event = RightPanelEvent;
 }
@@ -1839,6 +2313,32 @@ impl TypedActionView for RightPanelView {
             RightPanelAction::ToggleMaximize => {
                 ctx.emit(RightPanelEvent::ToggleMaximize);
                 ctx.notify();
+            }
+            RightPanelAction::PinRepo { parent, repo } => {
+                CodeSettings::handle(ctx).update(ctx, |settings, ctx| {
+                    settings.pin_repo(parent, repo, ctx);
+                });
+            }
+            RightPanelAction::UnpinRepo { parent, repo } => {
+                CodeSettings::handle(ctx).update(ctx, |settings, ctx| {
+                    settings.unpin_repo(parent, repo, ctx);
+                });
+            }
+            RightPanelAction::HideRepo { parent, repo } => {
+                CodeSettings::handle(ctx).update(ctx, |settings, ctx| {
+                    settings.hide_repo(parent, repo, ctx);
+                });
+            }
+            RightPanelAction::UnhideRepo { parent, repo } => {
+                CodeSettings::handle(ctx).update(ctx, |settings, ctx| {
+                    settings.unhide_repo(parent, repo, ctx);
+                });
+            }
+            RightPanelAction::ToggleHiddenRepos => {
+                if let Some(state) = self.code_review_state.as_mut() {
+                    state.hidden_group_expanded = !state.hidden_group_expanded;
+                    state.update_repo_dropdown(ctx);
+                }
             }
             RightPanelAction::OpenRepository => {
                 if let Some(active_pane_group) = &self.active_pane_group {
